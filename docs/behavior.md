@@ -44,7 +44,7 @@ Conventions:
 ## Architecture of the rewrite
 
 - One process, the ticker, runs a tokio runtime with three independent parts:
-  1. **Herdr state.** A socket subscription keeps an in-memory view of workspaces, panes and agents. Every Herdr request (start, prompt, keys, rename, close, create, notification, metadata) opens its own socket connection, sends one request and reads one response.
+  1. **Herdr state.** A socket subscription wakes the ticker; each pass reads the state with one `session.snapshot`. Every Herdr request (start, prompt, keys, rename, close, create, notification, metadata) opens its own socket connection, sends one request and reads one response.
   2. **Linear poll task.** It polls delegated issues and reads active runs on config-driven intervals, reads rate-limit and complexity headers, and backs off. It never waits on Herdr.
   3. **Run reconciliation.** Each run is reconciled in a pass whenever one of its inputs changes: a Herdr event that touches its panes, a Linear read result, a file an agent wrote (outbox, report, inbox), a routing agent finishing, or a timer that makes a time-based rule due.
 - The ticker is the only Linear writer. Agents and short-lived subcommands only write outbox requests and files in the run folder. No subcommand except `action login`, `action doctor` and the ticker reads the Keychain.
@@ -313,10 +313,12 @@ Git, the routing agent, `open`/`xdg-open` and `herdr session list --json` run as
 
 ### State view in the ticker
 
-- Bootstrap: subscribe (workspace created/closed, pane created/closed/updated, pane agent detected, and `pane.agent_status_changed` for every known pane), wait for the ack, buffer events, take `session.snapshot` on another connection, apply it, replay the buffer. After any reconnect take a new snapshot.
-- When the set of panes changes, replace the status subscription as described above.
-- After a status change, re-read the agent (`agent.get` or a snapshot) when its name, cwd or session may have changed.
-- The view replaces the old per-tick `agent list` and `pane list`. **Timing change:** Herdr is no longer polled.
+- Events wake the ticker; a fresh `session.snapshot` decides. The ticker keeps no copy of Herdr's state between passes. Each pass that needs Herdr takes one snapshot, which is newer than every request the ticker made before it.
+- The wake task subscribes to the global events (pane created, updated, closed, exited, moved, agent detected; tab created and closed; workspace closed) and to `pane.agent_status_changed` for the panes of its latest snapshot. It takes a snapshot only to learn the pane set: at connect and after an event that changes panes.
+- When the pane set changes it opens the new status subscription, waits for its ack, drops the old one, and wakes the ticker once more, so a status change that reached only the old connection is seen in the next snapshot.
+- An event that does not parse is skipped. A refused status subscription or a failed snapshot is retried (200 ms doubling to 5 s) without counting as a disconnect. Only a failed connect, EOF or I/O error on the global subscription marks Herdr disconnected; the reconnect backoff (200 ms doubling to 5 s) resets after the connection stayed up 30 s.
+- Rules that read panes or agents run only in a pass whose snapshot succeeded.
+- **Timing change:** Herdr is no longer polled. The snapshot replaces the old per-tick `agent list` and `pane list`.
 
 ### Requests used
 
@@ -993,7 +995,7 @@ report [--percent N | --unknown] --activity TEXT
 
 ## Porting the scenario tests
 
-- The World's fake Herdr is a trait-level fake, not a socket server. It holds the same model (panes, agents, prompts, keys, closed workspaces, notifications, starts, a one-shot `start_error`), records each request, and produces the `HerdrView` the reconciler reads. The socket protocol is tested separately in `src/herdr/`.
+- The World's fake Herdr is a trait-level fake, not a socket server. It holds the same model (panes, agents, prompts, keys, closed workspaces, notifications, starts, a one-shot `start_error`), records each request, and answers `snapshot()` from its model, so the reconciler decides from a snapshot as in production. The socket protocol is tested separately in `src/herdr/`.
 - `agent_not_ready` in the fake leaves a `blocked` agent in the pane and returns the error.
 - Git: every `git -C` fails with 128 `not a git repository`, except `fetch origin`, which succeeds.
 - The fake Linear (`src/linear/api.rs` `fake`) is kept, with its clock that stamps each activity after the present.

@@ -9,7 +9,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 
 use crate::config::Config;
-use crate::herdr::{self, Agent, Herdr, Pane};
+use crate::herdr_cli::{self, Agent, Herdr, Pane};
 use crate::linear::api::{Activity, Content};
 use crate::outbox::{self, Op, StateTarget};
 use crate::paths::Ctx;
@@ -52,7 +52,7 @@ struct View<'a> {
 }
 
 fn view<'a>(ctx: &'a Ctx, config: &Config) -> Result<View<'a>> {
-    let socket = herdr::session_socket(
+    let socket = herdr_cli::session_socket(
         &ctx.env.herdr_bin(),
         ctx.runner,
         config.herdr.session.as_deref(),

@@ -20,7 +20,7 @@ use anyhow::{Context, Result};
 use serde_json::json;
 
 use crate::config::{Config, Size};
-use crate::herdr::{Agent, Herdr, Pane, ready_state};
+use crate::herdr_cli::{Agent, Herdr, Pane, ready_state};
 use crate::linear::api::{
     Activity, Content, ExternalUrl, IssueDetail, IssueRef, Linear, Prompt, RunQuery,
 };
@@ -169,7 +169,7 @@ pub fn agent_count(runs: &[Run]) -> usize {
 /// point is per run, and one run's failure never stops the others.
 pub fn tick(ctx: &Ctx, memory: &mut Memory, log: &Log) -> Result<()> {
     let config = Config::load(&ctx.config_dir())?;
-    let socket = crate::herdr::session_socket(
+    let socket = crate::herdr_cli::session_socket(
         &ctx.env.herdr_bin(),
         ctx.runner,
         config.herdr.session.as_deref(),
@@ -740,7 +740,7 @@ fn report_pane(t: &Tick, pane: &str, display: &str, state: &str) {
             "--ttl-ms",
             TOKEN_TTL_MS,
         ],
-        crate::herdr::CALL_TIMEOUT,
+        crate::herdr_cli::CALL_TIMEOUT,
     );
 }
 

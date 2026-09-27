@@ -12,7 +12,7 @@ use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::files;
-use crate::herdr::{CALL_TIMEOUT, Herdr};
+use crate::herdr_cli::{CALL_TIMEOUT, Herdr};
 use crate::paths::{Ctx, Env};
 use crate::runner::Runner;
 

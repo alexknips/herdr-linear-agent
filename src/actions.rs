@@ -6,7 +6,8 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 
 use crate::config::Config;
-use crate::herdr::{self, Herdr};
+use crate::herdr::{self, Client, HerdrError};
+use crate::herdr_cli::{self, Herdr};
 use crate::linear::api::Linear;
 use crate::linear::credentials::{CredentialManager, CredentialStatus};
 use crate::linear::transport::HttpsTransport;
@@ -17,26 +18,28 @@ use crate::{ticker, worker};
 
 const TITLE: &str = "herdr-linear-agent";
 
+/// Runs a Herdr socket call from an action. Actions run on a blocking thread
+/// of the runtime, where waiting for a future is allowed.
+fn block_on<F: Future>(future: F) -> F::Output {
+    tokio::runtime::Handle::current().block_on(future)
+}
+
 /// Prints `body` and shows it as a notification in the invoking session, or
 /// in the configured one.
 fn tell(ctx: &Ctx, body: &str) {
     println!("{body}");
-    let socket = ctx
-        .env
-        .var("HERDR_SOCKET_PATH")
-        .map(std::path::PathBuf::from)
-        .or_else(|| {
-            let config = Config::load(&ctx.config_dir()).ok()?;
-            herdr::session_socket(
-                &ctx.env.herdr_bin(),
-                ctx.runner,
-                config.herdr.session.as_deref(),
-            )
-            .ok()
-        });
-    if let Some(socket) = socket {
-        let _ = Herdr::new(ctx.env.herdr_bin(), socket, ctx.runner).notification_show(TITLE, body);
-    }
+    let session = Config::load(&ctx.config_dir())
+        .ok()
+        .and_then(|c| c.herdr.session);
+    let _ = block_on(async {
+        // The session the action was invoked from, when there is one.
+        let socket = match ctx.env.var("HERDR_SOCKET_PATH").filter(|s| !s.is_empty()) {
+            Some(socket) => socket.into(),
+            None => herdr::session_socket(&ctx.env.herdr_bin(), session.as_deref()).await?,
+        };
+        Client::new(socket).notification_show(TITLE, body).await?;
+        anyhow::Ok(())
+    });
 }
 
 /// The actions the plugin manifest declares.
@@ -238,7 +241,7 @@ fn focus_run(ctx: &Ctx) -> Result<String> {
         bail!("{key} has no coordinator workspace yet");
     }
     let config = Config::load(&ctx.config_dir())?;
-    let socket = herdr::session_socket(
+    let socket = herdr_cli::session_socket(
         &ctx.env.herdr_bin(),
         ctx.runner,
         config.herdr.session.as_deref(),
@@ -268,16 +271,43 @@ fn on_path(program: &str) -> bool {
     std::env::split_paths(&path).any(|dir| dir.join(program).is_file())
 }
 
+/// The version the session reports, and the error that kept its snapshot
+/// from being read. An old Herdr whose snapshot no longer parses still gives
+/// its version.
+async fn herdr_version(client: Client) -> (Option<String>, Option<HerdrError>) {
+    match client.snapshot().await {
+        Ok(snapshot) => (Some(snapshot.version), None),
+        Err(error @ HerdrError::Protocol(_)) => (client.version().await.ok(), Some(error)),
+        Err(error) => (None, Some(error)),
+    }
+}
+
 /// Checks the setup and lists every problem found.
 fn doctor(ctx: &Ctx) -> Result<String> {
     let mut ok = Vec::new();
     let mut problems = Vec::new();
-    match herdr::version(&ctx.env.herdr_bin(), ctx.runner) {
-        Ok(v) if v >= herdr::MIN_VERSION => ok.push(format!("herdr {v}")),
-        Ok(v) => problems.push(format!("herdr {v} is older than {}", herdr::MIN_VERSION)),
-        Err(error) => problems.push(format!("herdr: {error:#}")),
+    let config = Config::load(&ctx.config_dir());
+    // Without a config this is the default session.
+    let session = config.as_ref().ok().and_then(|c| c.herdr.session.clone());
+    let socket = block_on(herdr::session_socket(
+        &ctx.env.herdr_bin(),
+        session.as_deref(),
+    ));
+    let (version, error) = match &socket {
+        Ok(socket) => block_on(herdr_version(Client::new(socket))),
+        Err(_) => (None, None),
+    };
+    match (&version, &error, &socket) {
+        (Some(v), _, _) if !herdr::version_at_least(v, herdr::MIN_VERSION) => {
+            problems.push(format!("herdr {v} is older than {}", herdr::MIN_VERSION))
+        }
+        (_, Some(error), _) => problems.push(format!("herdr: {error}")),
+        (Some(v), None, _) => ok.push(format!("herdr {v}")),
+        // With a config the session line below reports this.
+        (None, None, Err(error)) if config.is_err() => problems.push(format!("herdr: {error:#}")),
+        (None, None, _) => {}
     }
-    let config = match Config::load(&ctx.config_dir()) {
+    let config = match config {
         Ok(config) => {
             ok.push(format!(
                 "config {}",
@@ -291,19 +321,13 @@ fn doctor(ctx: &Ctx) -> Result<String> {
         }
     };
     if let Some(config) = &config {
-        match herdr::session_socket(
-            &ctx.env.herdr_bin(),
-            ctx.runner,
-            config.herdr.session.as_deref(),
-        )
-        .map(|socket| Herdr::new(ctx.env.herdr_bin(), socket, ctx.runner))
-        {
-            Ok(h) if h.agent_list().is_ok() => ok.push(format!(
+        match (&socket, &version) {
+            (Err(error), _) => problems.push(format!("{error:#}")),
+            (Ok(_), Some(_)) => ok.push(format!(
                 "Herdr session `{}` is reachable",
-                config.herdr.session.as_deref().unwrap_or("default")
+                session.as_deref().unwrap_or("default")
             )),
-            Ok(_) => problems.push("the configured Herdr session does not answer".into()),
-            Err(error) => problems.push(format!("{error:#}")),
+            (Ok(_), None) => problems.push("the configured Herdr session does not answer".into()),
         }
         let mut kinds: Vec<&str> = config
             .profiles

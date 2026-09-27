@@ -7,6 +7,10 @@ mod config;
 mod coordinator;
 mod files;
 mod herdr;
+// The doctor no longer asks `herdr --version`; the module goes away once the
+// ticker moves to the socket client.
+#[allow(dead_code)]
+mod herdr_cli;
 mod inbox;
 mod linear;
 mod names;
@@ -55,8 +59,12 @@ fn extend_path() {
 }
 
 fn main() {
+    // `PATH` is changed before the runtime starts its threads.
     extend_path();
-    if let Err(error) = cli::run() {
+    let result = tokio::runtime::Runtime::new()
+        .map_err(anyhow::Error::from)
+        .and_then(|runtime| runtime.block_on(cli::run()));
+    if let Err(error) = result {
         eprintln!("herdr-linear-agent: {error:#}");
         std::process::exit(1);
     }

@@ -11,7 +11,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::files::{self, seconds_since, write_atomic};
-use crate::herdr::{Agent, Pane, ready_state};
+use crate::herdr_cli::{Agent, Pane, ready_state};
 use crate::progress;
 use crate::run::{AgentRecord, AgentStatus, Run};
 

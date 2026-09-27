@@ -13,7 +13,7 @@ use anyhow::Result;
 
 use crate::config::Config;
 use crate::files::{self, shell_quote, write_atomic};
-use crate::herdr::{Agent, Pane};
+use crate::herdr_cli::{Agent, Pane};
 use crate::run::{AgentRecord, AgentStatus, Run, RunRecord};
 use crate::worker::{self, Group};
 use crate::{inbox, names};

@@ -2,12 +2,16 @@
 //! are for the plugin manifest, the ticker and the agents it starts, so every
 //! name is spelled out in full.
 
+use std::path::PathBuf;
+
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 
 use crate::actions::{self, Action};
 use crate::commands::{self, WorkerStart};
+use crate::config::Config;
 use crate::files::read_text_arg;
+use crate::herdr;
 use crate::paths::{Ctx, Env};
 use crate::runner::RealRunner;
 use crate::{progress, ticker};
@@ -66,6 +70,22 @@ enum Command {
     },
     /// Report a worker's progress from its own pane.
     Report(ReportArgs),
+    /// Tools for checking the plugin against a real Herdr.
+    #[command(hide = true)]
+    Debug {
+        #[command(subcommand)]
+        command: DebugCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum DebugCommand {
+    /// Follow the Herdr session and print one JSON line per wake.
+    HerdrWatch {
+        /// The socket to watch; the configured session's by default.
+        #[arg(long)]
+        socket: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -156,8 +176,62 @@ fn parse_option(text: &str) -> Result<(String, String), String> {
     commands::parse_option(text).map_err(|e| e.to_string())
 }
 
-pub fn run() -> Result<()> {
-    let cli = Cli::parse();
+pub async fn run() -> Result<()> {
+    match Cli::parse().command {
+        Command::Debug {
+            command: DebugCommand::HerdrWatch { socket },
+        } => herdr_watch(socket).await,
+        // The existing commands block (the Linear client is blocking
+        // reqwest), so they must stay off the runtime's worker threads.
+        command => match tokio::task::spawn_blocking(move || run_blocking(command)).await {
+            Ok(result) => result,
+            Err(error) => std::panic::resume_unwind(error.into_panic()),
+        },
+    }
+}
+
+async fn herdr_watch(socket: Option<PathBuf>) -> Result<()> {
+    let socket = match socket {
+        Some(socket) => socket,
+        None => {
+            let env = Env::from_process()?;
+            let config = Config::load(&env.config_dir())?;
+            herdr::session_socket(&env.herdr_bin(), config.herdr.session.as_deref()).await?
+        }
+    };
+    let client = herdr::Client::new(socket);
+    let mut rx = herdr::wake(client.clone());
+    let mut printed = None;
+    while rx.changed().await.is_ok() {
+        let link = rx.borrow_and_update().clone();
+        // A new error alone is not a wake.
+        if printed == Some((link.connected, link.wakes)) {
+            continue;
+        }
+        printed = Some((link.connected, link.wakes));
+        let snapshot = client.snapshot().await.ok();
+        let agents: Vec<_> = snapshot
+            .iter()
+            .flat_map(|s| &s.agents)
+            .map(|a| {
+                serde_json::json!({
+                    "pane": a.pane, "name": a.name, "status": a.status, "seq": a.state_change_seq,
+                })
+            })
+            .collect();
+        let line = serde_json::json!({
+            "at": jiff::Timestamp::now().to_string(),
+            "connected": link.connected,
+            "wakes": link.wakes,
+            "panes": snapshot.as_ref().map(|s| s.panes.len()),
+            "agents": agents,
+        });
+        println!("{line}");
+    }
+    Ok(())
+}
+
+fn run_blocking(command: Command) -> Result<()> {
     let env = Env::from_process()?;
     let runner = RealRunner;
     let ctx = Ctx {
@@ -165,7 +239,8 @@ pub fn run() -> Result<()> {
         runner: &runner,
         detached_ticker: true,
     };
-    match cli.command {
+    match command {
+        Command::Debug { .. } => unreachable!("handled on the runtime"),
         Command::Startup => ticker::start(&ctx),
         Command::Action { action } => actions::run(&ctx, action),
         Command::Ticker { command } => match command {
@@ -270,6 +345,7 @@ mod tests {
         assert!(matches!(parsed.command, Command::Ask { ref options, .. } if options.len() == 2));
         assert!(Cli::try_parse_from(["hla", "action", "open-issue"]).is_ok());
         assert!(Cli::try_parse_from(["hla", "action", "logout"]).is_err());
+        assert!(Cli::try_parse_from(["hla", "debug", "herdr-watch", "--socket", "/s"]).is_ok());
         assert!(
             Cli::try_parse_from([
                 "hla",
