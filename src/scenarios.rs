@@ -916,7 +916,7 @@ fn a_claim_without_a_session_still_decides_its_coordinator() {
 }
 
 #[test]
-fn pre_trust_marks_claude_folders_trusted_only_when_enabled() {
+fn the_trust_dialog_is_accepted_only_when_enabled() {
     let trusted = |world: &World| -> Vec<String> {
         let config: Value = serde_json::from_str(
             &std::fs::read_to_string(world.home.path().join(".claude.json")).unwrap(),
@@ -933,7 +933,7 @@ fn pre_trust_marks_claude_folders_trusted_only_when_enabled() {
     world.started_run();
     assert!(trusted(&world).is_empty(), "off by default");
 
-    let mut world = World::with_config(|c| c + "\n[claude]\npre_trust = true\n");
+    let mut world = World::with_config(|c| c + "\n[claude]\nauto_accept_trust_dialog = true\n");
     std::fs::write(world.home.path().join(".claude.json"), "{}").unwrap();
     world.started_run();
     let run_dir = world

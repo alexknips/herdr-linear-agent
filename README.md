@@ -63,7 +63,7 @@ run_timeout_hours = 8
 herdr = true                             # also show a Herdr notification when a run needs a person
 
 [claude]
-pre_trust = false                        # true: mark the folders Claude Code runs in as trusted (see below)
+auto_accept_trust_dialog = false         # true: accept Claude Code's trust dialog for the plugin's folders (see below)
 
 [repositories.api]
 path = "/Users/me/src/github.com/acme/api"
@@ -119,7 +119,7 @@ coordinator = "coordinator-light"
 
 A profile becomes agent CLI flags: `claude` gets `--model` and `--effort`, `codex` gets `-m` and `-c model_reasoning_effort=...`, and any other kind gets `--model` (put the effort in the model ID). `args` are passed unchanged; this is where permission and sandbox flags belong.
 
-**Claude Code's trust dialog.** Claude Code asks whether you trust a folder the first time it runs there, and every run gets a new run folder, so a coordinator stops at that dialog until someone answers it in Herdr. With `claude.pre_trust = true`, the plugin marks the folder trusted right before it starts a `claude` agent: the run folder for a coordinator, and the worktree and its repository's main checkout for a worker. Claude Code has no setting for this, so the plugin adds `hasTrustDialogAccepted` to that folder's entry in `~/.claude.json` (`$CLAUDE_CONFIG_DIR/.claude.json` when set), which is where Claude Code records your own answers, and changes nothing else in the file. The format is not documented; if Claude Code changes it, the dialog appears again and the plugin asks for someone in Herdr as before.
+**Claude Code's trust dialog.** Claude Code asks whether you trust a folder the first time it runs there, and every run gets a new run folder, so a coordinator stops at that dialog until someone answers it in Herdr. With `claude.auto_accept_trust_dialog = true`, the plugin accepts that dialog ahead of time, right before it starts a `claude` agent: the run folder for a coordinator, and the worktree and its repository's main checkout for a worker. Claude Code has no setting for this, so the plugin adds `hasTrustDialogAccepted` to that folder's entry in `~/.claude.json` (`$CLAUDE_CONFIG_DIR/.claude.json` when set), which is where Claude Code records your own answers, and changes nothing else in the file. The format is not documented; if Claude Code changes it, the dialog appears again and the plugin asks for someone in Herdr as before.
 
 **Coordinator routing.** An issue's size comes from its estimate (the n-th value of the team's scale is the n-th size, XS to XXXL; 0 is XS), then from a size label, then from the routing agent, else it is `unknown`. The first rule whose `sizes`, `teams` and `labels_any` all match picks the coordinator profile; otherwise `routing.default`. The routing agent reads only the issue title and description, on standard input, and may only answer a size.
 
@@ -168,7 +168,7 @@ A worker's brief and report live inside its worktree because the worker runs the
 ## Security notes
 
 - Agents run as your user. The allow-list the plugin writes for Claude Code and the rules in the coordinator sheet are guidance, not a sandbox: an agent can run any command your shell can.
-- `claude.pre_trust` makes the plugin accept Claude Code's trust dialog for you in its run folders and in worktrees of your catalog repositories. Turn it on only for repositories you already trust.
+- `claude.auto_accept_trust_dialog` makes the plugin accept Claude Code's trust dialog for you in its run folders and in worktrees of your catalog repositories. Turn it on only for repositories you already trust.
 - The plugin has no subcommand that prints the token. The macOS Keychain may ask for confirmation when a rebuilt binary reads it; a locked Secret Service collection asks to be unlocked.
 - The issue text, reports and comments are treated as data. Only replies from `allowed_user_ids` reach the coordinator as instructions.
 

@@ -103,10 +103,11 @@ impl Default for Notifications {
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields, default)]
 pub struct Claude {
-    /// Before starting Claude Code in a run folder or a worktree, mark the
-    /// folder (and the worktree's main checkout) trusted in `~/.claude.json`,
-    /// so the session does not stop at its workspace trust dialog.
-    pub pre_trust: bool,
+    /// Accept Claude Code's workspace trust dialog ahead of time: before
+    /// starting Claude Code in a run folder or a worktree, set
+    /// `hasTrustDialogAccepted` for the folder (and the worktree's main
+    /// checkout) in `~/.claude.json`.
+    pub auto_accept_trust_dialog: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]

@@ -1112,11 +1112,11 @@ fn launch_agent(
             next.launch_attempts += 1;
             next.last_state_change = files::now();
             if record.kind == "claude"
-                && t.config.claude.pre_trust
+                && t.config.claude.auto_accept_trust_dialog
                 && let Err(error) = crate::claude_trust::trust(t.ctx.env, trust_dirs)
             {
                 t.log.line(&format!(
-                    "{}: could not pre-trust {who}'s folder for Claude Code: {error:#}",
+                    "{}: could not accept Claude Code's trust dialog for {who}: {error:#}",
                     run.key
                 ));
             }
