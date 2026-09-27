@@ -1,0 +1,1424 @@
+//! End-to-end behavior of the ticker and the coordinator's commands, run in
+//! the World: each scenario settles the ticker and checks what reached
+//! Herdr, Linear and the run folder.
+
+use serde_json::{Value, json};
+
+use super::world::World;
+use crate::commands::{self, WorkerStart};
+use crate::config::Size;
+use crate::coordinator::{NUDGE_INBOX, NUDGE_REPLY};
+use crate::herdr::PaneId;
+use crate::linear::api::fake::APP_USER;
+use crate::linear::api::{IssueStatus, RunUpdate};
+use crate::linear::task::LinearEvent;
+use crate::run::{AgentStatus, Status};
+use crate::{inbox, worker};
+
+const KEY: &str = "DATA-1";
+const PR: &str = "https://github.com/acme/api/pull/7";
+const LAUNCH: &str = "[herdr-linear-agent ticker] Start DATA-1. Follow AGENTS.md.";
+const RESUMED_WITH: [&str; 2] = ["--resume", "sess-data-1-coordinator"];
+
+fn request(repo: &str, profile: &str, title: &str) -> WorkerStart {
+    WorkerStart {
+        repo: repo.into(),
+        profile: profile.into(),
+        title: title.into(),
+        task: "t".into(),
+    }
+}
+
+fn limit(key: &str, value: u64) -> impl FnOnce(String) -> String {
+    let table = format!("[limits]\n{key} = {value}\n\n[herdr]");
+    move |config| config.replace("[herdr]", &table)
+}
+
+fn to(world: &World, pane: &str) -> Vec<String> {
+    world.herdr.prompts_to(pane)
+}
+
+fn last_args(world: &World) -> Vec<String> {
+    world
+        .herdr
+        .starts()
+        .pop()
+        .map(|s| s.args)
+        .unwrap_or_default()
+}
+
+fn ends_with(args: &[String], tail: &[&str]) -> bool {
+    args.len() >= tail.len() && args[args.len() - tail.len()..].iter().eq(tail)
+}
+
+fn count(texts: &[String], wanted: &str) -> usize {
+    texts.iter().filter(|t| *t == wanted).count()
+}
+
+fn mentions(texts: &[String], part: &str) -> bool {
+    texts.iter().any(|t| t.contains(part))
+}
+
+const WAITING_TOO_LONG: i64 = 280;
+
+// ---------------------------------------------------------------- claiming
+
+#[tokio::test]
+async fn a_delegated_issue_is_claimed_placed_started_and_prompted_once() {
+    let mut world = World::sample();
+    world.delegate(KEY, "Fix the login", Some(2.0));
+    world.settle().await;
+
+    let (run, c) = (world.run(KEY), world.record(KEY));
+    assert_eq!(
+        (
+            c.size,
+            c.size_source.as_str(),
+            c.coordinator.profile.as_str()
+        ),
+        (Size::S, "estimate", "coordinator-light")
+    );
+    assert_eq!(
+        c.coordinator.status,
+        AgentStatus::Open,
+        "placed in the claim"
+    );
+    assert!(run.issue_md().is_file() && run.dir.join("AGENTS.md").is_file());
+    let expected = [
+        "Picked up DATA-1.",
+        "The coordinator uses the `coordinator-light` profile (size S from the estimate).",
+    ];
+    assert_eq!(world.bodies(KEY, "thought"), expected);
+    assert_eq!(world.issue_state(KEY), "In Progress");
+    let canonical = run.canonical_dir().to_string_lossy().into_owned();
+    let cwds: Vec<Option<String>> = world.herdr.panes().into_iter().map(|p| p.cwd).collect();
+    assert_eq!(cwds, [Some(canonical)]);
+
+    // A placement, then one start, then one prompt.
+    let order: Vec<String> = world
+        .herdr
+        .requests()
+        .into_iter()
+        .filter(|m| m.starts_with("workspace.") || m.starts_with("agent."))
+        .collect();
+    assert_eq!(order, ["workspace.create", "agent.start", "agent.prompt"]);
+    let start = &world.herdr.starts()[0];
+    assert_eq!(start.name, "data-1-coordinator");
+    assert!(
+        ends_with(&start.args, &["--model", "sonnet"]),
+        "{:?}",
+        start.args
+    );
+    assert_eq!(to(&world, &c.coordinator.pane_id), [LAUNCH]);
+
+    world.later(5);
+    world.settle().await;
+    assert_eq!(to(&world, &c.coordinator.pane_id).len(), 1, "prompted once");
+    assert_eq!(
+        (world.herdr.starts().len(), world.sessions()),
+        (1, 1),
+        "claimed once"
+    );
+}
+
+#[tokio::test]
+async fn intake_stops_at_max_runs_and_while_paused() {
+    let mut full = World::with(limit("max_runs", 1));
+    full.delegate(KEY, "One", None);
+    full.delegate("DATA-2", "Two", None);
+    full.settle().await;
+    assert_eq!(full.runs(), 1);
+
+    let mut paused = World::sample();
+    paused.pause_intake();
+    paused.delegate(KEY, "One", None);
+    paused.settle().await;
+    assert_eq!(paused.runs(), 0);
+}
+
+#[tokio::test]
+async fn the_session_linear_opened_on_delegation_is_the_runs_session() {
+    let mut world = World::sample();
+    world.delegate(KEY, "Delegated", None);
+    let opened = world.fake().delegate_session(KEY);
+    world.settle().await;
+    assert_eq!(world.record(KEY).session_id, opened);
+    assert_eq!(world.sessions(), 1, "no second session");
+    assert!(!world.bodies(KEY, "thought").is_empty());
+}
+
+#[tokio::test]
+async fn without_a_session_the_claim_still_decides_and_a_lost_decision_is_made_again() {
+    let mut world = World::sample();
+    world.delegate(KEY, "Early", None);
+    world.refuse_sessions(true);
+    world.settle().await;
+    let early = world.record(KEY);
+    assert_eq!(
+        (
+            early.session_id.as_str(),
+            early.coordinator.profile.as_str()
+        ),
+        ("", "coordinator"),
+        "the claim went on without a session"
+    );
+
+    // An older build left the run without a decision.
+    let forgotten = world.run(KEY);
+    forgotten
+        .update(|r| r.coordinator = crate::run::AgentRecord::default())
+        .unwrap();
+    world.refuse_sessions(false);
+    world.later(5);
+    world.settle().await;
+    let later = world.record(KEY);
+    assert_eq!(later.coordinator.profile.as_str(), "coordinator");
+    assert!(!later.session_id.is_empty());
+    assert_eq!(
+        (world.sessions(), world.issue_state(KEY)),
+        (1, "In Progress".into())
+    );
+    assert_eq!(count(&world.bodies(KEY, "thought"), "Picked up DATA-1."), 1);
+}
+
+#[tokio::test]
+async fn an_unsized_issue_is_sized_by_the_routing_agent() {
+    let mut world =
+        World::with(|c| c + "\n[routing.agent]\nprofile = \"router\"\ntimeout_seconds = 60\n");
+    let answer = r#"{"structured_output":{"size":"XS"}}"#;
+    let bin = world.script(
+        "claude",
+        &format!("#!/bin/sh\ncat > /dev/null\necho '{answer}'\n"),
+    );
+    world.put_on_path(&bin);
+    world.delegate(KEY, "Tiny", None);
+    world.settle().await;
+    let sized = world.record(KEY);
+    assert_eq!(
+        (sized.size, sized.size_source, sized.coordinator.profile),
+        (
+            Size::XS,
+            "agent".to_string(),
+            "coordinator-light".to_string()
+        )
+    );
+}
+
+#[tokio::test]
+async fn a_routing_job_an_older_build_recorded_is_left_alone_and_routed_again() {
+    let mut world = World::sample();
+    world.delegate(KEY, "Old", None);
+    world.refuse_sessions(true);
+    world.settle().await;
+    let run = world.run(KEY);
+    run.update(|r| r.coordinator = crate::run::AgentRecord::default())
+        .unwrap();
+    // The field an older build wrote; nothing reads it now.
+    let path = run.state_dir().join("run.json");
+    let mut stored: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    stored["routing"] = json!({"pid": 4242, "started": "2026-01-01T00:00:00Z", "output": ""});
+    std::fs::write(&path, stored.to_string()).unwrap();
+
+    world.restart_ticker();
+    world.settle().await;
+    assert_eq!(world.record(KEY).coordinator.profile, "coordinator");
+}
+
+// ---------------------------------------------------------------- workers
+
+#[tokio::test]
+async fn a_worker_report_with_a_pr_reaches_the_inbox_and_linear() {
+    let mut world = World::sample();
+    let coordinator = world.running_issue().await;
+    let plan = "- [>] Change the API\n- [ ] Finish";
+    commands::plan_set(&world.ctx(), KEY, plan).await.unwrap();
+    commands::say(&world.ctx(), KEY, "Starting a worker on api.")
+        .await
+        .unwrap();
+    let w = world.start_worker("api").await;
+    assert_eq!(w.branch, "herdr-linear-agent/data-1/w1-change-api");
+    assert!(world.runner.count("git -C") > 0);
+    assert!(!world.brief(&w).is_empty(), "brief.md is written");
+    assert_eq!(world.herdr.worktrees()[0].2, "origin/main", "--base");
+
+    world.settle().await;
+    let flags = [
+        "--model",
+        "sonnet",
+        "--effort",
+        "high",
+        "--permission-mode",
+        "auto",
+    ];
+    assert!(ends_with(&last_args(&world), &flags));
+    assert_eq!(
+        to(&world, &w.agent.pane_id),
+        ["Read .herdr-linear-agent/DATA-1-w1/brief.md and do what it says."]
+    );
+
+    world.report(
+        &w,
+        &format!("PR: {PR}\n## Report\nDone.\n## Next\n- Review\n"),
+    );
+    world.settle().await;
+    let items = world.inbox(KEY);
+    assert!(mentions(&items, "w1 (api) has a new report"), "{items:?}");
+    assert!(worker::home_report_path(&world.run(KEY), "w1").is_file());
+    assert_eq!(world.actions(KEY), ["Start worker", "Pull request"]);
+    {
+        let linear = world.fake();
+        let session = linear.session(KEY);
+        let urls: Vec<&str> = session
+            .external_urls
+            .iter()
+            .map(|u| u.url.as_str())
+            .collect();
+        assert_eq!(urls, [PR]);
+        assert_eq!(
+            session.plan.clone().unwrap_or_default()[0]["status"],
+            "inProgress"
+        );
+    }
+    assert_eq!(
+        count(&world.bodies(KEY, "thought"), "Starting a worker on api."),
+        1
+    );
+
+    // Idle for two minutes: one nudge for the unseen items.
+    world.later(120);
+    world.settle().await;
+    assert_eq!(
+        to(&world, &coordinator).last().map(String::as_str),
+        Some(NUDGE_INBOX)
+    );
+    world.later(5);
+    world.settle().await;
+    assert_eq!(
+        count(&to(&world, &coordinator), NUDGE_INBOX),
+        1,
+        "one nudge per set"
+    );
+
+    let summary = format!("Opened {PR}.");
+    commands::finish(&world.ctx(), &world.session(), KEY, &summary)
+        .await
+        .unwrap();
+    world.settle().await;
+    assert_eq!(world.issue_state(KEY), "In Review");
+    assert_eq!(world.bodies(KEY, "response"), [summary]);
+}
+
+#[tokio::test]
+async fn finish_and_worker_start_hold_their_limits() {
+    let mut world = World::with(limit("max_workers_per_run", 1));
+    world.running_issue().await;
+    world.start_worker("api").await;
+    let (ctx, session) = (world.ctx(), world.session());
+    let refused = commands::finish(&ctx, &session, KEY, "Done")
+        .await
+        .unwrap_err();
+    assert!(refused.to_string().contains("w1 is Working"), "{refused}");
+    let refusals = [
+        (request("web", "standard", "Web"), "max_workers_per_run"),
+        (
+            request("api", "standard", "Again"),
+            "one worker per repository",
+        ),
+        (request("web", "coordinator", "x"), "not a worker profile"),
+        (
+            request("nope", "standard", "x"),
+            "not in the repository catalog",
+        ),
+    ];
+    for (start, expected) in refusals {
+        let refused = commands::worker_start(&ctx, &session, KEY, &start)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains(expected), "{refused}");
+    }
+}
+
+#[tokio::test]
+async fn a_restart_switches_the_profile_and_stops_at_two() {
+    let mut world = World::sample();
+    world.running_issue().await;
+    world.start_worker("api").await;
+    world.settle().await;
+    let again = commands::worker_restart(&world.ctx(), &world.session(), KEY, "w1", Some("deep"))
+        .await
+        .unwrap();
+    assert_eq!(
+        (
+            again.agent.kind.as_str(),
+            again.restarts,
+            again.agent.prompt_pending
+        ),
+        ("codex", 1, true)
+    );
+    assert_eq!(
+        world.herdr.closed().len(),
+        1,
+        "the old workspace; the checkout stays"
+    );
+    assert!(world.brief(&again).contains("previous attempt"));
+
+    world.settle().await;
+    assert!(
+        last_args(&world)
+            .iter()
+            .any(|a| a == "model_reasoning_effort=xhigh")
+    );
+    let (ctx, session) = (world.ctx(), world.session());
+    let restart = || commands::worker_restart(&ctx, &session, KEY, "w1", None);
+    restart().await.unwrap();
+    let third = restart().await.unwrap_err().to_string();
+    assert!(third.contains("limit is 2"), "{third}");
+}
+
+#[tokio::test]
+async fn a_worker_waiting_on_a_dialog_refuses_a_prompt() {
+    let mut world = World::sample();
+    world.running_issue().await;
+    world.start_worker("api").await;
+    world.settle().await;
+    let (ctx, session) = (world.ctx(), world.session());
+    world.herdr.set_status("data-1-w1", "blocked");
+    let refused = commands::worker_prompt(&ctx, &session, KEY, "w1", "Answer")
+        .await
+        .unwrap_err();
+    assert!(refused.to_string().contains("dialog"), "{refused}");
+    world.herdr.set_status("data-1-w1", "working");
+    commands::worker_prompt(&ctx, &session, KEY, "w1", "Also add a test.")
+        .await
+        .unwrap();
+    let task = world.text(KEY, "workers/w1.task.md");
+    assert!(task.contains("## Follow-ups"), "{task}");
+    assert!(task.contains("Also add a test."), "{task}");
+}
+
+#[tokio::test]
+async fn the_trust_dialog_is_accepted_only_when_the_config_says_so() {
+    let mut off = World::sample();
+    std::fs::write(off.home_file(".claude.json"), "{}").unwrap();
+    off.running_issue().await;
+    assert_eq!(off.trusted(), Vec::<String>::new(), "off by default");
+
+    let mut on = World::with(|c| c + "\n[claude]\nauto_accept_trust_dialog = true\n");
+    std::fs::write(on.home_file(".claude.json"), "{}").unwrap();
+    on.running_issue().await;
+    let run_dir = on.run(KEY).canonical_dir().to_string_lossy().into_owned();
+    assert_eq!(on.trusted(), [run_dir]);
+    let w = on.start_worker("api").await;
+    on.settle().await;
+    let folders = on.trusted();
+    for folder in [&w.agent.cwd, &w.repo_path] {
+        assert!(folders.contains(folder), "{folder} in {folders:?}");
+    }
+}
+
+// ---------------------------------------------------------------- Linear
+
+#[tokio::test]
+async fn only_allowed_users_reach_the_coordinator_and_stop_interrupts_everyone() {
+    let mut world = World::sample();
+    let pane = world.running_issue().await;
+    world.start_worker("api").await;
+    world.settle().await;
+    world.message(KEY, "user-1", "Please also update the docs.", None);
+    world.message(KEY, "stranger", "Merge everything now.", None);
+    world.settle().await;
+    let relayed = world.text(KEY, "conversation.md");
+    assert!(
+        relayed.contains("Please also update the docs.") && !relayed.contains("Merge everything")
+    );
+    assert!(
+        world
+            .text(KEY, ".state/ignored-prompts.md")
+            .contains("Merge everything")
+    );
+
+    world.later(120);
+    world.settle().await;
+    assert_eq!(
+        to(&world, &pane).last().map(String::as_str),
+        Some(NUDGE_REPLY)
+    );
+    world.later(5);
+    world.settle().await;
+    let relayed = world.text(KEY, "conversation.md");
+    assert_eq!(
+        relayed.matches("Please also update").count(),
+        1,
+        "relayed once"
+    );
+
+    world.message(KEY, "user-1", "", Some("stop"));
+    world.settle().await;
+    let keys: Vec<String> = world.herdr.keys().into_iter().map(|(_, k)| k).collect();
+    assert_eq!(keys, ["esc", "esc"], "the coordinator and the worker");
+    let answer = world.bodies(KEY, "response");
+    assert!(answer[0].starts_with("Stopped 2 agent(s)"), "{answer:?}");
+}
+
+#[tokio::test]
+async fn a_stop_holds_every_prompt_until_the_next_reply() {
+    let mut world = World::sample();
+    let pane = world.running_issue().await;
+    world.message(KEY, "user-1", "", Some("stop"));
+    world.settle().await;
+    assert!(world.record(KEY).stopped);
+
+    let item = "w1 is idle without a report";
+    inbox::write(&world.run(KEY), "worker", "w1", item).unwrap();
+    world.later(120);
+    world.settle().await;
+    assert_eq!(to(&world, &pane), [LAUNCH], "nothing more while stopped");
+
+    world.message(KEY, "user-1", "Go on.", None);
+    world.settle().await;
+    world.later(120);
+    world.settle().await;
+    assert!(!world.record(KEY).stopped);
+    assert_eq!(
+        to(&world, &pane).last().map(String::as_str),
+        Some(NUDGE_REPLY)
+    );
+}
+
+#[tokio::test]
+async fn quiet_runs_get_a_heartbeat_and_long_ones_ask_to_go_on() {
+    let mut world = World::with(limit("run_timeout_hours", 1));
+    let pane = world.running_issue().await;
+    world.later(2 * 3600);
+    world.settle().await;
+    let ephemeral: Vec<Value> = world
+        .sent(KEY, "thought")
+        .into_iter()
+        .filter(|a| a["ephemeral"] == json!(true))
+        .collect();
+    assert_eq!(ephemeral.len(), 1, "one heartbeat");
+    assert!(mentions(
+        &world.bodies(KEY, "elicitation"),
+        "going for 1 hours"
+    ));
+
+    inbox::write(&world.run(KEY), "worker", "w1", "something").unwrap();
+    world.later(120);
+    world.settle().await;
+    assert_eq!(
+        to(&world, &pane),
+        [LAUNCH],
+        "no nudge while the question is open"
+    );
+    world.message(KEY, "user-1", "Continue", None);
+    world.settle().await;
+    assert!(!world.record(KEY).timeout_asked);
+}
+
+#[tokio::test]
+async fn a_completed_issue_closes_its_run_and_a_reopened_one_resumes() {
+    let mut world = World::sample();
+    world.running_issue().await;
+    world.start_worker("api").await;
+    world.settle().await;
+    world.move_issue(KEY, "Done");
+    world.later(5);
+    world.settle().await;
+    assert_eq!(world.record(KEY).status, Status::Closed);
+    assert_eq!(
+        world.herdr.closed().len(),
+        2,
+        "the worker's and the coordinator's"
+    );
+    assert_eq!(world.worker(KEY, "w1").agent.status, AgentStatus::Stopped);
+    let before = world.herdr.starts().len();
+    world.later(5);
+    world.settle().await;
+    assert_eq!(
+        world.herdr.starts().len(),
+        before,
+        "nothing is started for it"
+    );
+
+    world.move_issue(KEY, "Todo");
+    world.later(5);
+    world.settle().await;
+    let reopened = world.record(KEY);
+    assert_eq!(
+        (reopened.status, reopened.coordinator.resume),
+        (Status::Active, true)
+    );
+    assert!(
+        ends_with(&last_args(&world), &RESUMED_WITH),
+        "{:?}",
+        last_args(&world)
+    );
+}
+
+#[tokio::test]
+async fn a_removed_delegation_detaches_the_run_and_keeps_its_workspaces() {
+    let mut world = World::sample();
+    world.running_issue().await;
+    world.set_delegate(KEY, Value::Null);
+    world.later(5);
+    world.settle().await;
+    assert_eq!(world.record(KEY).status, Status::Detached);
+    assert_eq!(world.herdr.closed(), [], "workspaces stay");
+
+    world.set_delegate(KEY, json!({ "id": APP_USER }));
+    world.later(5);
+    world.settle().await;
+    assert_eq!(
+        world.record(KEY).status,
+        Status::Active,
+        "the run continues"
+    );
+}
+
+// ---------------------------------------------------------------- people in Herdr
+
+#[tokio::test]
+async fn a_dialog_is_reported_once_and_a_gone_coordinator_resumes_on_request() {
+    let mut world = World::sample();
+    world.running_issue().await;
+    let w = world.start_worker("api").await;
+    world.herdr.fail_next_start("agent_not_ready");
+    world.settle().await;
+    // Blocked for a minute and a half.
+    world.later(90);
+    world.settle().await;
+    world.later(5);
+    world.settle().await;
+    let questions = world.bodies(KEY, "elicitation");
+    assert_eq!(questions.len(), 1, "{questions:?}");
+    assert!(questions[0].contains(&w.agent.pane_id), "{questions:?}");
+    assert_eq!(world.herdr.notifications()[0].0, "DATA-1 needs you");
+    assert!(mentions(&world.inbox(KEY), "Waiting on you"));
+
+    // A person closes the coordinator's workspace.
+    let workspace = world.record(KEY).coordinator.workspace_id;
+    world.herdr.remove_workspace(&workspace);
+    world.settle().await;
+    assert!(world.record(KEY).coordinator_lost);
+    assert_eq!(world.bodies(KEY, "elicitation").len(), 2);
+
+    world.message(KEY, "user-1", "resume", None);
+    world.settle().await;
+    assert!(
+        ends_with(&last_args(&world), &RESUMED_WITH),
+        "{:?}",
+        last_args(&world)
+    );
+    let pane = world.record(KEY).coordinator.pane_id;
+    assert!(to(&world, &pane)[0].contains("You were restarted"));
+}
+
+#[tokio::test]
+async fn context_prints_the_digest_and_marks_its_items_seen() {
+    let mut world = World::sample();
+    world.running_issue().await;
+    let id = inbox::write(&world.run(KEY), "worker", "w1", "item").unwrap();
+    commands::context(&world.ctx(), Some(&world.session()), KEY)
+        .await
+        .unwrap();
+    assert!(inbox::seen(&world.run(KEY)).contains(&id));
+    commands::inbox_done(&world.ctx(), KEY, &[], true).unwrap();
+    assert_eq!(world.inbox(KEY), Vec::<String>::new());
+}
+
+// ---------------------------------------------------------------- event-driven
+
+#[tokio::test]
+async fn a_ticker_started_while_herdr_is_down_judges_nothing_lost() {
+    let mut world = World::sample();
+    let pane = world.running_issue().await;
+    world.start_worker("api").await;
+    world.settle().await;
+    let items = world.inbox(KEY).len();
+
+    world.herdr.set_down(true);
+    world.restart_ticker();
+    world.message(KEY, "user-1", "Status?", None);
+    world.later(60);
+    world.settle().await;
+    assert!(!world.record(KEY).coordinator_lost);
+    assert!(world.bodies(KEY, "error").is_empty());
+    assert!(
+        world.text(KEY, "conversation.md").contains("Status?"),
+        "Linear goes on"
+    );
+    assert_eq!(world.inbox(KEY).len(), items + 1, "only the reply");
+
+    world.herdr.set_down(false);
+    world.settle().await;
+    let back = world.record(KEY);
+    assert_eq!(
+        (back.coordinator_lost, back.coordinator.pane_id),
+        (false, pane)
+    );
+    assert!(world.bodies(KEY, "error").is_empty());
+    assert!(world.bodies(KEY, "elicitation").is_empty());
+}
+
+#[tokio::test]
+async fn a_worker_pane_that_shows_up_late_is_not_lost() {
+    let mut world = World::sample();
+    world.running_issue().await;
+    world.herdr.delay_panes(3);
+    let w = world.start_worker("api").await;
+    for _ in 0..4 {
+        world.settle().await;
+    }
+    assert!(world.bodies(KEY, "error").is_empty());
+    assert!(!mentions(&world.inbox(KEY), "closed before"));
+    let starts: Vec<PaneId> = world
+        .herdr
+        .starts()
+        .into_iter()
+        .filter(|s| s.name == "data-1-w1")
+        .map(|s| s.pane)
+        .collect();
+    assert_eq!(starts, [PaneId(w.agent.pane_id.clone())]);
+    assert_eq!(to(&world, &w.agent.pane_id).len(), 1);
+}
+
+#[tokio::test]
+async fn an_agent_herdr_detects_late_is_started_once() {
+    let mut world = World::sample();
+    world.herdr.delay_detection(3);
+    world.delegate(KEY, "Fix the login", Some(2.0));
+    for _ in 0..4 {
+        world.settle().await;
+    }
+    assert_eq!(world.asked("agent.start"), 1);
+    let pane = world.record(KEY).coordinator.pane_id;
+    assert_eq!(to(&world, &pane), [LAUNCH]);
+}
+
+#[tokio::test]
+async fn a_placement_without_an_answer_is_adopted_not_repeated() {
+    let mut world = World::sample();
+    world.herdr.next_placement_unknown();
+    world.delegate(KEY, "Fix the login", Some(2.0));
+    world.settle().await;
+    let panes = world.herdr.panes();
+    assert_eq!((world.asked("workspace.create"), panes.len()), (1, 1));
+    let c = world.record(KEY).coordinator;
+    assert_eq!(
+        (c.status, c.launch_attempts, c.pane_id),
+        (AgentStatus::Open, 0, panes[0].id.0.clone())
+    );
+    assert_eq!(world.asked("agent.start"), 1);
+}
+
+#[tokio::test]
+async fn delegating_again_and_reopening_settle_without_a_loop() {
+    let mut world = World::sample();
+    world.running_issue().await;
+    let issue_id = world.record(KEY).issue_id;
+
+    world.set_delegate(KEY, Value::Null);
+    world.later(5);
+    world.settle().await;
+    let detached_at = world.now();
+    world.set_delegate(KEY, json!({ "id": APP_USER }));
+    world.later(5);
+    world.settle().await;
+    assert_eq!(world.record(KEY).status, Status::Active);
+
+    // A read made before the delegation came back must not detach it again.
+    world.inject(LinearEvent::RunRead {
+        issue_id,
+        read_started_at: detached_at,
+        update: RunUpdate {
+            issue: IssueStatus {
+                updated_at: "2026-09-25T00:00:00.000Z".into(),
+                state_type: "unstarted".into(),
+                state_name: "Todo".into(),
+                delegate_id: None,
+            },
+            prompts: Vec::new(),
+        },
+        detail: None,
+    });
+    world.settle().await;
+    assert_eq!(
+        world.record(KEY).status,
+        Status::Active,
+        "the stale read is ignored"
+    );
+
+    world.move_issue(KEY, "Canceled");
+    world.later(5);
+    world.settle().await;
+    assert_eq!(world.record(KEY).status, Status::Closed);
+    world.move_issue(KEY, "Todo");
+    for _ in 0..2 {
+        world.later(5);
+        world.settle().await;
+    }
+    assert_eq!(world.record(KEY).status, Status::Active);
+    let again = "The issue was delegated again; the run continues.";
+    assert_eq!(
+        count(&world.bodies(KEY, "thought"), again),
+        2,
+        "once per return"
+    );
+    let log = world.log_text();
+    assert_eq!(
+        log.matches("detached (no longer delegated)").count(),
+        1,
+        "{log}"
+    );
+    assert_eq!(
+        log.matches("closed (the issue is Canceled)").count(),
+        1,
+        "{log}"
+    );
+}
+
+#[tokio::test]
+async fn every_pass_repeated_at_once_changes_nothing() {
+    let mut world = World::sample();
+    world.every_pass_twice = true;
+    let coordinator = world.running_issue().await;
+    let w = world.start_worker("api").await;
+    world.settle().await;
+    world.report(&w, &format!("PR: {PR}\n"));
+    world.settle().await;
+    world.later(120);
+    world.settle().await;
+    world.message(KEY, "user-1", "Thanks.", None);
+    world.settle().await;
+    assert_eq!(world.herdr.starts().len(), 2);
+    assert_eq!(to(&world, &w.agent.pane_id).len(), 1);
+    assert_eq!(count(&to(&world, &coordinator), NUDGE_INBOX), 1);
+    assert_eq!(world.actions(KEY), ["Start worker", "Pull request"]);
+}
+
+#[tokio::test]
+async fn a_blocked_episode_missed_between_passes_is_still_a_new_episode() {
+    let mut world = World::sample();
+    world.running_issue().await;
+    world.start_worker("api").await;
+    world.settle().await;
+    world.herdr.set_status("data-1-w1", "blocked");
+    world.settle().await;
+    let blocked_at = world.now();
+    assert_eq!(
+        world.deadline(),
+        blocked_at + jiff::SignedDuration::from_secs(30)
+    );
+    world.later(30);
+    world.settle().await;
+    assert_eq!(world.bodies(KEY, "elicitation").len(), 1);
+
+    // Answered and blocked again with no pass in between: the snapshot
+    // shows the same status with a newer sequence.
+    world.herdr.set_status("data-1-w1", "idle");
+    world.herdr.set_status("data-1-w1", "blocked");
+    world.later(5);
+    world.settle().await;
+    assert_eq!(world.bodies(KEY, "elicitation").len(), 1, "not 30 s yet");
+    world.later(30);
+    world.settle().await;
+    assert_eq!(world.bodies(KEY, "elicitation").len(), 2, "a new episode");
+}
+
+#[tokio::test]
+async fn a_list_read_with_the_detaching_read_does_not_bring_the_run_back() {
+    let mut world = World::sample();
+    world.running_issue().await;
+    world.later(5);
+    // Linear dropped the delegation between the two reads of one round: the
+    // delegated list still has the issue, the run read does not.
+    world.inject(LinearEvent::RunRead {
+        issue_id: world.record(KEY).issue_id,
+        read_started_at: world.now(),
+        update: RunUpdate {
+            issue: IssueStatus {
+                updated_at: "2026-09-25T00:00:00.000Z".into(),
+                state_type: "unstarted".into(),
+                state_name: "Todo".into(),
+                delegate_id: None,
+            },
+            prompts: Vec::new(),
+        },
+        detail: None,
+    });
+    world.settle().await;
+    assert_eq!(world.record(KEY).status, Status::Detached);
+    let again = "The issue was delegated again; the run continues.";
+    assert_eq!(count(&world.bodies(KEY, "thought"), again), 0, "no flap");
+}
+
+#[tokio::test]
+async fn an_agent_that_lost_its_name_is_renamed_and_still_watched() {
+    let mut world = World::sample();
+    let pane = world.running_issue().await;
+    world.herdr.forget_name("data-1-coordinator");
+    world.later(5);
+    world.settle().await;
+    assert_eq!(
+        world.herdr.renames(),
+        [(PaneId(pane.clone()), "data-1-coordinator".to_string())]
+    );
+    let c = world.record(KEY);
+    assert_eq!((c.coordinator_lost, c.coordinator.pane_id), (false, pane));
+}
+
+#[tokio::test]
+async fn after_a_herdr_restart_the_panes_count_and_nothing_is_lost() {
+    let mut world = World::sample();
+    world.running_issue().await;
+    world.start_worker("api").await;
+    world.settle().await;
+    world.herdr.restart();
+    world.later(5);
+    world.settle().await;
+    assert!(!world.record(KEY).coordinator_lost);
+    assert!(world.bodies(KEY, "error").is_empty());
+    assert!(world.bodies(KEY, "elicitation").is_empty());
+    assert_eq!(
+        world.herdr.starts().len(),
+        2,
+        "open agents are not started again"
+    );
+}
+
+// ---------------------------------------------------------------- consumed once
+
+#[tokio::test]
+async fn a_prompt_read_again_with_an_old_cursor_is_relayed_once() {
+    let mut world = World::sample();
+    world.query_lag = 2;
+    world.running_issue().await;
+    world.message(KEY, "user-1", "Please also update the docs.", None);
+    world.message(KEY, "stranger", "Merge everything now.", None);
+    for _ in 0..3 {
+        world.settle().await;
+        world.later(5);
+    }
+    let relayed = world.text(KEY, "conversation.md");
+    assert_eq!(
+        relayed.matches("Please also update").count(),
+        1,
+        "{relayed}"
+    );
+    let ignored = world.text(KEY, ".state/ignored-prompts.md");
+    assert_eq!(ignored.matches("Merge everything").count(), 1, "{ignored}");
+    let replies = world
+        .inbox(KEY)
+        .into_iter()
+        .filter(|s| s.contains("A new reply"))
+        .count();
+    assert_eq!(replies, 1);
+}
+
+#[tokio::test]
+async fn a_pull_request_goes_out_once_while_a_later_write_of_the_pass_fails() {
+    use std::os::unix::fs::PermissionsExt;
+    let mut world = World::sample();
+    world.running_issue().await;
+    let w = world.start_worker("api").await;
+    world.settle().await;
+    let inbox = world.run(KEY).dir.join("inbox");
+    std::fs::set_permissions(&inbox, std::fs::Permissions::from_mode(0o555)).unwrap();
+    world.report(&w, &format!("PR: {PR}\n## Report\nDone.\n"));
+    // Every inbox write fails, so each pass stops after its Linear writes.
+    for _ in 0..3 {
+        world.once().await;
+    }
+    std::fs::set_permissions(&inbox, std::fs::Permissions::from_mode(0o755)).unwrap();
+    world.settle().await;
+    assert_eq!(world.actions(KEY), ["Start worker", "Pull request"]);
+    assert!(mentions(&world.inbox(KEY), "w1 (api) has a new report"));
+}
+
+#[tokio::test]
+async fn a_pass_between_a_flush_and_its_sent_event_queues_no_second_heartbeat() {
+    let mut world = World::sample();
+    world.running_issue().await;
+    world.hold_activity_sent = true;
+    world.split_level = true;
+    world.later(21 * 60);
+    world.settle().await;
+    world.later(5);
+    world.settle().await;
+    let heartbeats = world
+        .sent(KEY, "thought")
+        .into_iter()
+        .filter(|a| a["ephemeral"] == json!(true))
+        .count();
+    assert_eq!(heartbeats, 1);
+}
+
+#[tokio::test]
+async fn a_claim_cut_short_before_its_first_thought_still_announces_it() {
+    let mut world = World::sample();
+    let issue_id = world.delegate(KEY, "Fix the login", Some(2.0));
+    // A ticker that crashed right after creating the run folder.
+    std::fs::create_dir_all(world.ctx().runs_dir()).unwrap();
+    let at = world.now().to_string();
+    crate::run::Run::create(
+        &world.ctx().runs_dir(),
+        crate::run::RunRecord {
+            issue_id,
+            identifier: KEY.into(),
+            title: "Fix the login".into(),
+            team_key: "DATA".into(),
+            created: at.clone(),
+            prompt_cursor: at.clone(),
+            last_activity: at.clone(),
+            timeout_since: at,
+            announce_pending: true,
+            ..crate::run::RunRecord::default()
+        },
+    )
+    .unwrap();
+    world.settle().await;
+    let thoughts = world.bodies(KEY, "thought");
+    assert_eq!(count(&thoughts, "Picked up DATA-1."), 1, "{thoughts:?}");
+    assert_eq!(thoughts[0], "Picked up DATA-1.");
+    assert!(!world.record(KEY).announce_pending);
+}
+
+#[tokio::test]
+async fn a_failing_outbox_of_a_run_that_ended_raises_no_notice() {
+    let mut world = World::sample();
+    world.running_issue().await;
+    let issue_id = world.record(KEY).issue_id;
+    world.inject(LinearEvent::WritesFailing {
+        issue_id,
+        since: world.now(),
+    });
+    world.move_issue(KEY, "Done");
+    world.later(5);
+    world.settle().await;
+    assert_eq!(world.record(KEY).status, Status::Closed);
+    world.later(11 * 60);
+    world.settle().await;
+    let notices: Vec<String> = world
+        .herdr
+        .notifications()
+        .into_iter()
+        .map(|(title, _)| title)
+        .filter(|t| t == "herdr-linear-agent")
+        .collect();
+    assert_eq!(notices, Vec::<String>::new());
+}
+
+// ---------------------------------------------------------------- Herdr effects
+
+#[tokio::test]
+async fn a_prompt_whose_answer_is_lost_counts_as_delivered() {
+    let mut world = World::sample();
+    world.herdr.next_prompt_unknown();
+    let pane = world.running_issue().await;
+    world.later(5);
+    world.settle().await;
+    assert_eq!(to(&world, &pane), [LAUNCH]);
+
+    world.herdr.next_prompt_unknown();
+    let w = world.start_worker("api").await;
+    world.settle().await;
+    world.later(5);
+    world.settle().await;
+    assert_eq!(to(&world, &w.agent.pane_id).len(), 1);
+    assert_eq!(world.actions(KEY), ["Start worker"]);
+
+    inbox::write(&world.run(KEY), "worker", "w1", "item").unwrap();
+    world.herdr.next_prompt_unknown();
+    world.later(120);
+    world.settle().await;
+    world.later(5);
+    world.settle().await;
+    assert_eq!(count(&to(&world, &pane), NUDGE_INBOX), 1);
+}
+
+#[tokio::test]
+async fn a_coordinator_prompted_in_a_pass_is_not_nudged_in_it() {
+    let mut world = World::sample();
+    let pane = world.running_issue().await;
+    world.later(120);
+    world.settle().await;
+    // A coordinator idle for two minutes whose launch prompt is due again,
+    // with an unseen item.
+    world
+        .run(KEY)
+        .update(|r| r.coordinator.prompt_pending = true)
+        .unwrap();
+    inbox::write(&world.run(KEY), "worker", "w1", "item").unwrap();
+    world.once().await;
+    assert_eq!(to(&world, &pane), [LAUNCH, LAUNCH]);
+}
+
+#[tokio::test]
+async fn a_stop_while_herdr_is_down_interrupts_once_herdr_is_back() {
+    let mut world = World::sample();
+    world.running_issue().await;
+    world.start_worker("api").await;
+    world.settle().await;
+    world.herdr.set_down(true);
+    world.message(KEY, "user-1", "", Some("stop"));
+    world.settle().await;
+    assert!(world.record(KEY).stopped);
+    assert!(world.bodies(KEY, "response").is_empty(), "no count yet");
+
+    world.herdr.set_down(false);
+    world.later(5);
+    world.settle().await;
+    let keys: Vec<String> = world.herdr.keys().into_iter().map(|(_, k)| k).collect();
+    assert_eq!(keys, ["esc", "esc"]);
+    let answer = world.bodies(KEY, "response");
+    assert_eq!(answer.len(), 1);
+    assert!(answer[0].starts_with("Stopped 2 agent(s)"), "{answer:?}");
+}
+
+#[tokio::test]
+async fn a_detach_while_herdr_is_down_interrupts_once_herdr_is_back() {
+    let mut world = World::sample();
+    world.running_issue().await;
+    world.herdr.set_down(true);
+    world.set_delegate(KEY, Value::Null);
+    world.later(5);
+    world.settle().await;
+    assert_eq!(world.record(KEY).status, Status::Detached);
+    world.herdr.set_down(false);
+    world.later(5);
+    world.settle().await;
+    let keys: Vec<String> = world.herdr.keys().into_iter().map(|(_, k)| k).collect();
+    assert_eq!(keys, ["esc"]);
+    assert!(world.bodies(KEY, "response").is_empty());
+}
+
+#[tokio::test]
+async fn a_start_herdr_never_detects_counts_as_an_attempt() {
+    let mut world = World::sample();
+    world.herdr.delay_detection(1_000_000);
+    world.delegate(KEY, "Fix the login", Some(2.0));
+    world.settle().await;
+    for _ in 0..8 {
+        world.later(61);
+        world.settle().await;
+    }
+    assert_eq!(world.asked("agent.start"), 3);
+    let c = world.record(KEY).coordinator;
+    assert_eq!((c.status, c.launch_attempts), (AgentStatus::Failed, 3));
+    let errors = world.bodies(KEY, "error");
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(
+        errors[0].starts_with("Could not start the coordinator agent: "),
+        "{errors:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_start_herdr_never_received_waits_fifteen_seconds_whatever_the_attempts() {
+    let mut world = World::sample();
+    world.herdr.fail_next_start("startup_failed");
+    world.delegate(KEY, "Fix the login", Some(2.0));
+    world.settle().await;
+    world.later(15);
+    world.herdr.fail_next_start("startup_failed");
+    world.settle().await;
+    assert_eq!(world.record(KEY).coordinator.launch_attempts, 2);
+    world.later(30);
+    world.herdr.next_start_not_sent();
+    world.settle().await;
+    assert_eq!(
+        world.herdr.starts().len(),
+        2,
+        "the dropped start is not seen"
+    );
+    world.later(15);
+    world.settle().await;
+    assert_eq!(world.herdr.starts().len(), 3);
+    assert_eq!(world.record(KEY).coordinator.launch_attempts, 2);
+}
+
+#[tokio::test]
+async fn a_placement_without_an_answer_is_adopted_after_a_title_edit() {
+    let mut world = World::sample();
+    world.herdr.next_placement_unknown();
+    world.delegate(KEY, "Fix the login", Some(2.0));
+    while world.asked("workspace.create") == 0 {
+        world.once().await;
+    }
+    // The title changes while the answer is lost, and with it the label.
+    world
+        .run(KEY)
+        .update(|r| r.title = "Fix the login page".into())
+        .unwrap();
+    world.settle().await;
+    let panes = world.herdr.panes();
+    assert_eq!((world.asked("workspace.create"), panes.len()), (1, 1));
+    let c = world.record(KEY).coordinator;
+    assert_eq!(
+        (c.status, c.pane_id),
+        (AgentStatus::Open, panes[0].id.0.clone())
+    );
+    assert_eq!(to(&world, &panes[0].id.0), [LAUNCH]);
+}
+
+// ---------------------------------------------------------------- races
+
+#[tokio::test]
+async fn a_restart_between_a_snapshot_and_its_pass_keeps_the_new_pane() {
+    let mut world = World::sample();
+    world.running_issue().await;
+    world.start_worker("api").await;
+    world.settle().await;
+    let again = world.restart_worker_mid_pass("w1").await;
+    world.settle().await;
+    world.later(5);
+    world.settle().await;
+    assert!(
+        world.bodies(KEY, "error").is_empty(),
+        "{:?}",
+        world.bodies(KEY, "error")
+    );
+    assert!(!mentions(&world.inbox(KEY), "closed before"));
+    let w = world.worker(KEY, "w1");
+    assert_eq!(w.agent.pane_id, again.agent.pane_id);
+    assert_eq!(
+        to(&world, &w.agent.pane_id).len(),
+        1,
+        "started and prompted"
+    );
+}
+
+#[tokio::test]
+async fn a_worker_without_a_pane_is_never_judged_gone() {
+    let mut world = World::sample();
+    world.running_issue().await;
+    let w = world.start_worker("api").await;
+    world.settle().await;
+    // A restart has cleared the pane and closed the workspace; the new one
+    // is not open yet.
+    world.run(KEY).update(|_| ()).unwrap();
+    crate::worker::update(&world.run(KEY), "w1", |w| {
+        w.agent.pane_id.clear();
+        w.agent.prompt_pending = true;
+    })
+    .unwrap();
+    world.herdr.remove_workspace(&w.agent.workspace_id);
+    world.later(5);
+    world.settle().await;
+    assert!(world.bodies(KEY, "error").is_empty());
+    assert!(!mentions(&world.inbox(KEY), "closed before"));
+}
+
+#[tokio::test]
+async fn a_start_result_for_a_pane_the_worker_left_is_dropped() {
+    let mut world = World::sample();
+    world.running_issue().await;
+    let first = world.start_worker("api").await;
+    world.herdr.fail_next_start("startup_failed");
+    world.once().await;
+    // The start in the first pane is out when the coordinator restarts it.
+    let again = commands::worker_restart(&world.ctx(), &world.session(), KEY, "w1", None)
+        .await
+        .unwrap();
+    assert_ne!(again.agent.pane_id, first.agent.pane_id);
+    world.settle().await;
+    let w = world.worker(KEY, "w1");
+    assert_eq!(w.agent.launch_attempts, 0);
+    let in_new: Vec<PaneId> = world
+        .herdr
+        .starts()
+        .into_iter()
+        .map(|s| s.pane)
+        .filter(|p| p.0 == again.agent.pane_id)
+        .collect();
+    assert_eq!(in_new.len(), 1);
+}
+
+// ---------------------------------------------------------------- trust and lifetime
+
+#[tokio::test]
+async fn panes_left_out_of_a_partly_parsed_snapshot_are_not_judged() {
+    let mut world = World::sample();
+    let pane = world.running_issue().await;
+    let w = world.start_worker("api").await;
+    world.settle().await;
+    let state = world.ctx().state_dir();
+    crate::progress::save(
+        &state,
+        &crate::progress::Record {
+            socket: super::world::SOCKET.into(),
+            pane_id: w.agent.pane_id.clone(),
+            activity: "Reading".into(),
+            reported_at: world.now().as_second(),
+            ..crate::progress::Record::default()
+        },
+    )
+    .unwrap();
+    world.herdr.unparsed(&pane, true);
+    world.herdr.unparsed(&w.agent.pane_id, true);
+    world.later(5);
+    world.settle().await;
+    assert!(!world.record(KEY).coordinator_lost);
+    assert!(world.bodies(KEY, "elicitation").is_empty());
+    assert!(world.bodies(KEY, "error").is_empty());
+    assert!(!mentions(&world.inbox(KEY), "closed before"));
+    assert!(crate::progress::load(&state, super::world::SOCKET, &w.agent.pane_id).is_some());
+
+    world.herdr.unparsed(&pane, false);
+    world.herdr.unparsed(&w.agent.pane_id, false);
+    world.later(5);
+    world.settle().await;
+    assert!(!world.record(KEY).coordinator_lost);
+    assert_eq!(world.herdr.starts().len(), 2, "nothing is started again");
+}
+
+#[tokio::test]
+async fn an_agent_whose_entry_does_not_parse_is_not_started_again() {
+    let mut world = World::sample();
+    world.running_issue().await;
+    let w = world.start_worker("api").await;
+    // The started agent is there, but its one entry does not parse.
+    world.herdr.unparsed_agent(&w.agent.pane_id, true);
+    world.settle().await;
+    for _ in 0..3 {
+        world.later(61);
+        world.settle().await;
+    }
+    let starts = |world: &World| {
+        world
+            .herdr
+            .starts()
+            .into_iter()
+            .filter(|s| s.name == "data-1-w1")
+            .count()
+    };
+    assert_eq!(starts(&world), 1);
+    assert_eq!(world.worker(KEY, "w1").agent.launch_attempts, 0);
+    assert!(
+        to(&world, &w.agent.pane_id).is_empty(),
+        "not found, not prompted"
+    );
+
+    world.herdr.unparsed_agent(&w.agent.pane_id, false);
+    world.later(5);
+    world.settle().await;
+    assert_eq!(starts(&world), 1);
+    assert_eq!(to(&world, &w.agent.pane_id).len(), 1);
+}
+
+#[tokio::test]
+async fn a_waiting_self_report_wakes_the_ticker_when_it_expires() {
+    let mut world = World::sample();
+    world.running_issue().await;
+    let w = world.start_worker("api").await;
+    world.settle().await;
+    world.later(120);
+    world.settle().await;
+    crate::progress::save(
+        &world.ctx().state_dir(),
+        &crate::progress::Record {
+            socket: super::world::SOCKET.into(),
+            pane_id: w.agent.pane_id.clone(),
+            activity: crate::progress::WAITING.into(),
+            reported_at: world.now().as_second() - WAITING_TOO_LONG,
+            ..crate::progress::Record::default()
+        },
+    )
+    .unwrap();
+    world.settle().await;
+    let expiry = worker::SELF_REPORT_SECS - WAITING_TOO_LONG;
+    assert_eq!(
+        world.deadline(),
+        world.now() + jiff::SignedDuration::from_secs(expiry)
+    );
+}
+
+#[tokio::test]
+async fn a_routing_agent_that_never_reads_its_input_times_out() {
+    let mut world =
+        World::with(|c| c + "\n[routing.agent]\nprofile = \"router\"\ntimeout_seconds = 1\n");
+    let bin = world.script("claude", "#!/bin/sh\nsleep 30\n");
+    world.put_on_path(&bin);
+    world.delegate(KEY, "Huge", None);
+    world.fake().issue_mut(KEY)["description"] = json!("x".repeat(1 << 20));
+    world.settle().await;
+    let routed = world.record(KEY);
+    assert_eq!(
+        (routed.size, routed.size_source.as_str()),
+        (Size::Unknown, "agent (timed out)")
+    );
+}
+
+#[tokio::test]
+async fn the_reconciler_forgets_what_ended_runs_and_gone_panes_left() {
+    let mut world = World::sample();
+    world.running_issue().await;
+    world.start_worker("api").await;
+    world.settle().await;
+    inbox::write(&world.run(KEY), "worker", "w1", "item").unwrap();
+    world.later(120);
+    world.settle().await;
+    world.move_issue(KEY, "Done");
+    world.later(5);
+    world.settle().await;
+    world.later(5);
+    world.settle().await;
+    assert_eq!(world.record(KEY).status, Status::Closed);
+    let kept: Vec<(&str, usize)> = world
+        .remembered()
+        .into_iter()
+        .filter(|(_, n)| *n > 0)
+        .collect();
+    assert_eq!(kept, []);
+}
+
+#[tokio::test]
+async fn the_reconciler_leaves_an_unreadable_outbox_file_to_the_linear_task() {
+    let mut world = World::sample();
+    world.running_issue().await;
+    world.move_issue(KEY, "Done");
+    world.later(5);
+    world.settle().await;
+    // A closed run's outbox is listed to decide whether it is flushed.
+    let outbox = world.run(KEY).state_dir().join("outbox");
+    std::fs::write(outbox.join("9999999999.json"), "not json").unwrap();
+    world.pass_alone().await;
+    assert!(outbox.join("9999999999.json").is_file());
+    world.settle().await;
+    assert!(outbox.join("failed/9999999999.json").is_file());
+}
+
+#[tokio::test]
+async fn a_run_under_every_lag_knob_writes_each_fact_once() {
+    let mut world = World::sample();
+    world.query_lag = 2;
+    world.hold_activity_sent = true;
+    world.split_level = true;
+    world.every_pass_twice = true;
+    let coordinator = world.running_issue().await;
+    let w = world.start_worker("api").await;
+    world.settle().await;
+    world.report(&w, &format!("PR: {PR}\n"));
+    world.settle().await;
+    world.message(KEY, "user-1", "Thanks.", None);
+    world.settle().await;
+    world.later(21 * 60);
+    world.settle().await;
+    world.later(5);
+    world.settle().await;
+    assert_eq!(to(&world, &coordinator)[0], LAUNCH);
+    assert_eq!(count(&to(&world, &coordinator), LAUNCH), 1);
+    assert_eq!(to(&world, &w.agent.pane_id).len(), 1);
+    assert_eq!(world.actions(KEY), ["Start worker", "Pull request"]);
+    assert_eq!(count(&world.bodies(KEY, "thought"), "Picked up DATA-1."), 1);
+    let relayed = world.text(KEY, "conversation.md");
+    assert_eq!(relayed.matches("Thanks.").count(), 1);
+    let heartbeats = world
+        .sent(KEY, "thought")
+        .into_iter()
+        .filter(|a| a["ephemeral"] == json!(true))
+        .count();
+    assert_eq!(heartbeats, 1);
+    assert_eq!(world.sessions(), 1);
+}

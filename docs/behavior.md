@@ -131,6 +131,7 @@ State directory:
   runs/<KEY>/                 one run per Linear issue
   ticker.lock                 the ticker's lock and its {"version","pid"}
   ticker.log                  the ticker's log, capped
+  ticker.sock                 the datagram socket subcommands poke the ticker through
   <stop file>                 asks the running ticker to exit (name: open question)
   paused                      intake is paused while this file exists
   progress/                   progress records written by `report`
@@ -167,6 +168,7 @@ Rules:
 - The key is validated before any path is built: `TEAM-NUMBER`, team starts with an ASCII upper-case letter, then upper-case letters or digits, at most 16 characters; number 1 to 12 digits. Error: ``\`<key>\` is not a Linear issue key (expected the form TEAM-123)``. `src/run.rs:keys_are_validated_before_any_path_is_built`
 - The run lock is an exclusive file lock on `.state/lock`. It is held while reading and rewriting anything under `workers/`, `inbox/` or `.state/`, and never across a Herdr, git or Linear call. In the async rewrite, take it on a blocking thread or with an async file lock; never hold it across an `.await` on I/O to Herdr, git or Linear.
 - `update(change)` is a read-modify-write of the record under the lock; each step changes only the fields it owns.
+- A Linear write the reconciler queues is pushed in the same critical section (one hold of the run lock) that stores the field guarding it (`report_hash`, `pr_url`, `blocked_reported`, `gone_reported`, `coordinator_lost`, `timeout_asked`, `prompt_cursor`, `announce_pending`, the coordinator profile, `prompt_pending`), so a failure later in the pass never sends it twice. `tests/scenarios:a_pull_request_goes_out_once_while_a_later_write_of_the_pass_fails`
 - `canonical_dir` is the run folder with symlinks resolved (or the plain path when that fails). Herdr reports physical working directories and records compare against it.
 - JSON and text files are written atomically (temporary file and rename, no leftover). `tests/files:slugs_quotes_and_atomic_writes`
 
@@ -182,7 +184,7 @@ Run record (`run.json`), every field defaulted when missing:
 | `issue_updated_at` | the issue's `updatedAt` when `issue.md` was last written |
 | `issue_hash` | hash of the parts a person edits |
 | `size`, `size_source` | size and where it came from: `estimate`, `label`, `agent`, `agent (timed out)`, `default` |
-| `routing` | a running routing job: `pid`, `started`, `output` path; `null` otherwise |
+| `routing` | a routing job an older build recorded (`pid`, `started`, `output`); the rewrite keeps routing jobs in memory, ignores this field when reading, and drops it on the next write |
 | `coordinator` | the coordinator's agent record |
 | `prompt_cursor` | prompts created after this timestamp are unread |
 | `last_activity` | when an activity was last sent |
@@ -192,6 +194,8 @@ Run record (`run.json`), every field defaulted when missing:
 | `timeout_asked` | the timeout question is open |
 | `coordinator_lost` | the coordinator's pane is gone and the resume question was asked |
 | `stopped` | a person pressed stop; no prompt or heartbeat goes out until they reply |
+| `interrupt` | `stop` or `detach`: Escape keys still owed to the run's agents, sent by the first pass with a snapshot |
+| `announce_pending` | the claim's `Picked up <KEY>.` thought is not queued yet; missing in an older record, which reads as announced |
 
 Agent record (coordinator and every worker's `agent`):
 
@@ -204,7 +208,9 @@ Agent record (coordinator and every worker's `agent`):
 | `launch_attempts` | |
 | `agent_session` | the agent's native session id, for a resume |
 | `resume` | the next start resumes `agent_session` |
-| `last_state`, `last_state_change` | the last Herdr status seen and when it changed |
+| `last_state`, `last_state_change` | the last Herdr status seen and when its episode began |
+| `last_state_seq` | Herdr's `state_change_seq` when `last_state` was seen |
+| `last_attempt_at` | when the last unsuccessful placement or start was made |
 | `last_group` | the last worker group token |
 | `blocked_reported` | the "needs someone in Herdr" question was sent for this episode |
 
@@ -317,7 +323,10 @@ Git, the routing agent, `open`/`xdg-open` and `herdr session list --json` run as
 - The wake task subscribes to the global events (pane created, updated, closed, exited, moved, agent detected; tab created and closed; workspace closed) and to `pane.agent_status_changed` for the panes of its latest snapshot. It takes a snapshot only to learn the pane set: at connect and after an event that changes panes.
 - When the pane set changes it opens the new status subscription, waits for its ack, drops the old one, and wakes the ticker once more, so a status change that reached only the old connection is seen in the next snapshot.
 - An event that does not parse is skipped. A refused status subscription or a failed snapshot is retried (200 ms doubling to 5 s) without counting as a disconnect. Only a failed connect, EOF or I/O error on the global subscription marks Herdr disconnected; the reconnect backoff (200 ms doubling to 5 s) resets after the connection stayed up 30 s.
-- Rules that read panes or agents run only in a pass whose snapshot succeeded.
+- Rules that read panes or agents run only in a pass whose snapshot succeeded. Without one, a pass still applies Linear facts: relay, close (closing the recorded workspaces of open agents), detach and the heartbeat (groups from `last_group`).
+- A snapshot with entries that do not parse (`skipped > 0`) may lack a pane that exists. It serves the rules that find an agent (prompts, nudges, interrupts, renames, tokens); for every rule that judges a pane gone or empty (a lost coordinator, a lost worker, placement and adoption, starts, an undetected start) or prunes what belongs to a pane (progress records, the in-memory maps), the pass runs as if the snapshot had failed, and an agent the snapshot does not show is not watched. The skip count is logged once per change. `tests/scenarios:panes_left_out_of_a_partly_parsed_snapshot_are_not_judged`
+- The snapshot's workspaces give each workspace's label, which finds a coordinator placement whose answer was lost.
+- A recorded pane the ticker has never seen in a snapshot counts as present and empty for 30 s after it was first missed (Herdr may answer a placement before its pane list shows the pane). A pane seen before is gone as soon as a snapshot lacks it.
 - **Timing change:** Herdr is no longer polled. The snapshot replaces the old per-tick `agent list` and `pane list`.
 
 ### Requests used
@@ -381,15 +390,20 @@ An agent in Herdr is the recorded agent only when pane id, working directory, ki
 - Spawning: a new session (`setsid`) with null stdio, running `<binary> ticker run`. The startup hook returns at once; Herdr runs at most 32 plugin commands at a time, so a hook must never stay resident.
 - Version handoff: `VERSION` is the release version plus a build id, so a rebuilt binary always differs from the running one. A start from another version stops the old ticker and spawns the new one.
 - The ticker exits only when the stop file exists or the configured Herdr session has been unreachable for 5 minutes. It keeps reading Linear while no run exists.
+- The Linear task and the reconciler start at once. Until the configured session's socket is found (retried every 5 s), every Herdr request is `NotSent`, so passes run the Linear-only steps; the link counts as down since the start, so the 5-minute exit applies. `src/herdr/requests.rs:a_late_herdr_is_not_sent_until_its_session_is_found`
 - A crashed ticker comes back on the next startup hook or the next agent-facing subcommand (`context`, `plan set`, `say`, `ask`, `finish`, `worker ...`), because each runs `ticker start` first.
 - Log: `<state_dir>/ticker.log`, one line per event. Its size stays at most `LOG_CAP` and, after it is trimmed, more than `LOG_CAP / 4` remains. After 150 lines of 10,000 characters the file obeys both bounds. `tests/ticker:log_is_capped`
 - Only one ticker may run per state directory. Running the same app on two machines would claim the same issue twice; the plugin does not guard against that.
 
 ### Pass structure
 
-Each run pass runs, in this order, the parts whose inputs are ready: relay (after a run read), watch, routing results, launch (placement, start, prompt, nudge), heartbeat, inbox pruning, flush. Intake runs in the Linear task. A failure in one run is logged as `<KEY>: <error>` and never stops the others. After Herdr state changes, progress records of panes that no longer exist are pruned.
+A pass takes one snapshot, then: applies the Linear events (sessions, sent activities, write failures, run reads: close, detach, issue edits, relay); intake from a delegated list it has not seen; the results of effect tasks and routing agents; then per active run, with a snapshot, watch, launch (placement, start, prompt) and nudge, and with or without one the heartbeat and inbox pruning; then the write-failure notice and the pruning of progress records. Intake runs in the reconciler, which owns the run records and the limits; the Linear task only polls and flushes. A failure in one run is logged as `<KEY>: <error>` and never stops the others. After Herdr state changes, progress records of panes that no longer exist are pruned.
 
-**Timing change:** passes are driven by events and timers, not by a 15 second loop. Time-based rules (30 s blocked, 60 s launch dialog, 60 s idle nudge, 20 min heartbeat, run timeout, routing timeout, 10 min write failure) must be re-evaluated by timers at least as often as they would have been at 15 s.
+Wakes: a Herdr event; a Linear event; the Linear level only when the app user or the delegated issue list changed, not when only its read time did (the latest level is still what the next pass reads) `src/linear/task.rs:a_new_read_time_alone_does_not_wake_the_reconciler`; an effect or routing result; a poke from a subcommand that wrote run files the ticker acts on (`say`, `ask`, `plan set`, `finish`, `worker start/prompt/restart`, `inbox done`, `report`), which sends one byte to `<state_dir>/ticker.sock` and ignores every error, since no ticker running is normal `src/commands.rs:commands_that_write_run_files_poke_the_ticker`, `src/ticker/reconcile.rs:a_poke_wakes_a_pass`; and the next deadline, which includes the expiry of a `Waiting for you` self-report (decision 11) `tests/scenarios:a_waiting_self_report_wakes_the_ticker_when_it_expires`.
+
+Once per pass the reconciler drops what its in-memory maps (launched starts, NotSent retries, nudges, heartbeats, seen and missing panes, reported tokens, status changes) hold for runs that are no longer active and, with a whole snapshot, for panes that are gone and no active agent records. A run's status change is kept until a delegated list read after it was handled, since only an older read or list could undo it. `tests/scenarios:the_reconciler_forgets_what_ended_runs_and_gone_panes_left`
+
+**Timing change:** passes are driven by events and timers, not by a 15 second loop. After a pass the reconciler sleeps until the earliest future time a rule may become due, at most 150 s. Time rules read an injected `now`; nothing in a pass reads the wall clock. Time-based rules (30 s blocked, 60 s launch dialog, 60 s idle nudge, 20 min heartbeat, run timeout, routing timeout, 10 min write failure) must be re-evaluated by timers at least as often as they would have been at 15 s.
 
 ### Log lines
 
@@ -399,7 +413,7 @@ Each run pass runs, in this order, the parts whose inputs are ready: relay (afte
 | `intake: <error>` | the delegated-issue poll failed |
 | `<KEY>: picked up` | a claim |
 | `<KEY>: could not pick up: <error>` | a claim failed |
-| `<KEY>: could not open the session yet: <error>` | claim without a session |
+| `<KEY>: could not open the session yet: <error>` | not written by the rewrite: the claim leaves the session to the flush, which logs the next line |
 | `<KEY>: could not create the session: <error>` | flush without a session |
 | `<KEY>: Linear refused request <request id>: <error>` | a definitive refusal |
 | `<KEY>: Linear write failed, will retry: <error>` | the queue is blocked |
@@ -446,7 +460,7 @@ Operations of the Linear task:
 
 | Operation | Interval | Behavior |
 | --- | --- | --- |
-| intake poll | `linear.intake_interval_seconds` (default 5) | `delegated_issues`, then intake |
+| intake poll | `linear.intake_interval_seconds` (default 5) | `delegated_issues`, published for the reconciler's intake |
 | run read | `linear.run_read_interval_seconds` (default 5) | `run_updates` for every active run with a session, then per-run handling |
 | viewer | once, cached | the app user id; retried until known; run reads wait for it |
 | flush | after new outbox requests and after each read | see [Outbox and flush](#outbox-and-flush) |
@@ -473,7 +487,7 @@ For each delegated issue in the order returned:
 
 1. A run exists for the key:
    - Active, with no coordinator profile decided and no routing job (a claim cut short, or an older build): read the issue and run `finish_claim`. Log errors as `<KEY>: <error>`.
-   - Not active (detached or closed): set it active. When the coordinator is `stopped` (a closed run), set it `pending` with `resume = agent_session non-empty` and `launch_attempts = 0`. Queue the thought `The issue was delegated again; the run continues.` and write an inbox item (kind `issue`, subject `issue`): `The issue was delegated to this agent again; the run is active again.`
+   - Not active (detached or closed), in a delegated list read after the detach or close: set it active. A list read at or before that moment does not count, so a list and a run read of one round cannot flip the run back and forth. When the coordinator is `stopped` (a closed run), set it `pending` with `resume = agent_session non-empty` and `launch_attempts = 0`. Queue the thought `The issue was delegated again; the run continues.` and write an inbox item (kind `issue`, subject `issue`): `The issue was delegated to this agent again; the run is active again.`
    - Otherwise nothing. The issue is never claimed twice. `tests/scenarios:a_delegated_issue_becomes_a_run_whose_coordinator_is_started_and_primed`
 2. No run: skip while `<state_dir>/paused` exists. `tests/scenarios:max_runs_limits_intake_and_pause_stops_it`
 3. Stop the whole intake (not only this issue) when active runs are at `max_runs`, or when the agent count plus one would exceed `max_agents`. `tests/scenarios:max_runs_limits_intake_and_pause_stops_it`
@@ -484,16 +498,17 @@ Agent count: over active runs, one for a coordinator that is `pending` or `open`
 ### `claim(issue)`
 
 1. Validate the key; read the issue detail.
-2. Create the state and runs directories. Create the run with `issue_id`, `identifier`, `title`, `url`, `team_key`, `labels`, `created = now`, `issue_updated_at`, `issue_hash`, and `prompt_cursor = last_activity = timeout_since = now`.
-3. Write `issue.md`. Log `<KEY>: picked up`.
-4. Queue the thought `Picked up <KEY>.`
-5. `finish_claim`.
+2. Create the state and runs directories. Create the run with `issue_id`, `identifier`, `title`, `url`, `team_key`, `labels`, `created = now`, `issue_updated_at`, `issue_hash`, `prompt_cursor = last_activity = timeout_since = now` and `announce_pending = true`.
+3. Log `<KEY>: picked up`.
+4. Queue the thought `Picked up <KEY>.` and the issue-state request with target `started`, clearing `announce_pending` in the same critical section.
+5. The run's query has no `issue_updated_at`, so the next run read brings the issue detail; that writes `issue.md` (the first write is not an edit) and runs `finish_claim`. The session is opened by the flush (Linear's auto-created one, or a new one).
 
 ### `finish_claim(run, detail)`
 
-1. When the run has no session: `open_session` (the session Linear created on delegation, or a new one). On failure log `<KEY>: could not open the session yet: <error>` and go on; the flush opens it later.
-2. Queue an issue-state request with target `started`.
-3. Route.
+1. The session is opened by the flush, never here.
+2. When `announce_pending` is still set (a crash between creating the run and queuing its first thought), queue `Picked up <KEY>.` and clear it. `tests/scenarios:a_claim_cut_short_before_its_first_thought_still_announces_it`
+3. Queue an issue-state request with target `started`, unless one is queued or the issue is already started, completed or canceled.
+4. Route.
 
 Rules pinned:
 
@@ -516,8 +531,8 @@ Rules pinned:
 
 ### Route and decide
 
-- `route`: a known size decides now. Without `[routing.agent]`, decide `(unknown, "default")`. Otherwise start the routing agent, record the job in `run.json` (`pid`, `started`, `output`) and return; a spawn failure is logged and decides `(unknown, "agent")`.
-- `decide(size, source)`: pick the profile, set `size`, `size_source`, `routing = null` and a pending coordinator record (`status pending`, `profile`, `kind`, `agent_name`), then queue the thought ``The coordinator uses the `<profile>` profile (<why>).`` with `<why>`:
+- `route`: a known size decides now. Without `[routing.agent]`, decide `(unknown, "default")`. Otherwise start the routing agent in its own task and keep the job in memory; a spawn failure is logged and decides `(unknown, "agent")`. A run whose coordinator is undecided and whose routing is not running asks the Linear task for the detail and is routed when it arrives.
+- `decide(size, source)`: pick the profile, set `size`, `size_source` and a pending coordinator record (`status pending`, `profile`, `kind`, `agent_name`), then queue the thought ``The coordinator uses the `<profile>` profile (<why>).`` with `<why>`:
 
 | Size and source | `<why>` |
 | --- | --- |
@@ -533,12 +548,13 @@ Rules pinned:
 - Schema: object with one required property `size`, a string enum of the 8 size names, no additional properties. It is written to `.state/routing.schema.json`.
 - The child runs in `.state/`, with the ticker's `PATH`, stderr discarded, stdin `Title: <title>\n\n<description>\n`. For `claude`, stdout goes to `.state/routing.out`; for `codex`, stdout is discarded and `-o` writes that file. A child that exits before reading closes the pipe; that is not an error and the answer reads as unknown. `src/routing.rs:the_agent_gets_the_issue_on_standard_input`
 - `parse_output`: take `structured_output` when it is an object, else parse the string `result` as JSON, else the whole value. The answer must be an object with exactly one key, `size`, whose value is a size name; anything else is `unknown`. `src/routing.rs:outputs_are_checked_against_the_schema`
-- Collection: when the child finished, decide `(parse_output(routing.out), "agent")`. When it runs past `routing.agent.timeout_seconds` (120 when the section is absent) from `started`, kill it and decide `(unknown, "agent (timed out)")`. A job started by an earlier ticker is not a child: check it with signal 0 and kill it with SIGKILL. The job is in the record, so a ticker restart never runs the agent twice.
+- Collection: when the child finished, decide `(parse_output(routing.out), "agent")`. When it runs past `routing.agent.timeout_seconds` (120 when the section is absent) from `started`, kill it and decide `(unknown, "agent (timed out)")`. Routing jobs are in memory, so a ticker restart routes again. A record written by an older build with `routing` set is read as if the field were absent; an undecided coordinator is routed again. **Spec change:** the recorded pid is never signalled, since pids are reused and the record may predate a reboot; an old child ends by itself. `tests/scenarios:a_routing_job_an_older_build_recorded_is_left_alone_and_routed_again`
+- The issue goes to the child's standard input under the same timeout as the wait, so a child that never reads cannot hold the job past it. `tests/scenarios:a_routing_agent_that_never_reads_its_input_times_out`
 - With `tokio::process`, wait on the child with a timeout in its own task and hand the result to the run's pass. `tests/scenarios:the_routing_agent_decides_an_unsized_issue` (fake `claude` answers XS: size XS, source `agent`, profile `coordinator-light`).
 
 ## Reading runs: close, detach, issue edits
 
-For every active run with a session, per update, in this order:
+For every active run with a session, per update, in this order. A read that started before the run's last status change (a re-delegation, a reopen, a close or a detach) is ignored, so a read made with an old query cannot undo a newer state:
 
 1. State type `completed` or `canceled`: close the run.
 2. Delegate is not the app user: detach the run.
@@ -556,7 +572,7 @@ For every active run with a session, per update, in this order:
 5. Set the run `closed` and the coordinator `stopped`. Log the close line.
 6. A closed run is left alone: nothing is started for it. Reopened and still delegated, it becomes active with the coordinator resumed from its session (`--resume sess-...`). `tests/scenarios:a_completed_issue_closes_the_run_and_a_removed_delegation_detaches_it` (two workspaces closed, worker `stopped`).
 
-`detach_run`: interrupt the agents, set the run `detached`, log. Workspaces stay. Delegated again, the run is active again. `tests/scenarios:a_completed_issue_closes_the_run_and_a_removed_delegation_detaches_it`
+`detach_run`: set the run `detached` with a pending interrupt (`interrupt = detach`, cleared when the run becomes active again), log; the first pass with a snapshot interrupts the agents and posts nothing. Workspaces stay. `tests/scenarios:a_detach_while_herdr_is_down_interrupts_once_herdr_is_back` Delegated again, the run is active again. `tests/scenarios:a_completed_issue_closes_the_run_and_a_removed_delegation_detaches_it`
 
 Checkouts and branches are never removed.
 
@@ -565,14 +581,14 @@ Checkouts and branches are never removed.
 `relay(run, prompts)`, prompts oldest first. Nothing happens for an empty list. For each prompt:
 
 - A user not in `linear.allowed_user_ids`: append to `.state/ignored-prompts.md`; nothing else. Stop signals from such users are ignored too.
-- Signal `stop` from an allowed user: interrupt the agents, set `stopped = true`, queue the response `Stopped <n> agent(s) as asked. Their worktrees are kept; reply here to continue.`
+- Signal `stop` from an allowed user: set `stopped = true` and a pending interrupt (`interrupt = stop`). The first pass with a snapshot, which may be this one, interrupts the agents, clears it and queues the response `Stopped <n> agent(s) as asked. Their worktrees are kept; reply here to continue.` with the true count. `tests/scenarios:a_stop_while_herdr_is_down_interrupts_once_herdr_is_back`
 - Any other allowed prompt:
   1. Append it to `conversation.md`.
   2. Write an inbox item (kind `reply`, subject `reply`): `A new reply from user <user id> is in conversation.md.`
   3. Set `stopped = false`. When `timeout_asked`, clear it and set `timeout_since = now`.
   4. When `coordinator_lost` and the trimmed body equals `resume` case-insensitively: clear `coordinator_lost`, set the coordinator `pending`, `resume = agent_session non-empty`, `launch_attempts = 0`.
 
-After the loop, `prompt_cursor` becomes the last prompt's `createdAt`, ignored prompts included. A prompt is relayed once. `tests/scenarios:replies_are_relayed_only_from_allowed_users_and_stop_interrupts`
+The Linear task may read with the query of an earlier pass, so a prompt created at or before the record's current `prompt_cursor` is dropped. Each prompt, ignored ones included, moves `prompt_cursor` to its `createdAt` in the critical section that records it (the conversation entry and the record fields, the ignored-prompts entry, or the stop and its pending interrupt); a reply's inbox item is written just before. A prompt is relayed once. `tests/scenarios:replies_are_relayed_only_from_allowed_users_and_stop_interrupts`, `tests/scenarios:a_prompt_read_again_with_an_old_cursor_is_relayed_once`
 
 Interrupting sends `esc` to the coordinator's pane and to every `open` worker's pane, for each agent found by identity; the count is the number of successful sends. With a coordinator and one worker the count is 2. `tests/scenarios:replies_are_relayed_only_from_allowed_users_and_stop_interrupts`
 
@@ -587,7 +603,7 @@ For an `open` record, given `Live`:
 - `moved_to` updates `workspace_id`, `tab_id`, `pane_id`.
 - A found agent with an empty name is renamed to the recorded name.
 - A found agent's non-empty session id is stored in `agent_session`.
-- A status different from `last_state` sets `last_state` (empty when no agent) and `last_state_change = now`.
+- A status different from `last_state`, or the same status with a `state_change_seq` different from `last_state_seq`, starts a new episode: it sets `last_state` (empty when no agent), `last_state_seq`, `last_state_change = now`, and clears `blocked_reported`. A new blocked episode with the same status is therefore reported again.
 - `blocked_reported` is cleared when the agent no longer needs a person.
 
 ### Needs a person
@@ -649,7 +665,7 @@ The tokens are stored in worker records, so existing values must keep parsing.
 
 ### Worker watch (`watch_worker`)
 
-For every worker that is `open` or `failed`:
+For every worker that is `open` or `failed`, except an `open` worker without a pane, which is between two panes and never judged gone, and a `restarting` one until a snapshot shows its recorded pane (or 30 s passed without it), which clears `restarting`: `tests/scenarios:a_worker_without_a_pane_is_never_judged_gone`
 
 1. Track it.
 2. Report: when `report_hash` of the report file differs from the stored one, copy the report home, store the new hash, and read the home copy. When it has a PR line different from `pr_url`: queue the action `Pull request` with parameter `<url> (worker <id>, repo <repo>)` and no result; add `{label: "<id> <repo> PR", url}` to the run's `external_urls` once; queue the full URL list; store `pr_url`. A report written in this pass counts for the group at once.
@@ -667,7 +683,7 @@ Pinned: the report with a PR gives the inbox summary containing `w1 (api) has a 
 
 ### Pane metadata tokens
 
-`pane.report_metadata` with `pane_id`, `source` (the plugin's metadata source id), `display_agent`, `tokens: {"hla_state": "<state>"}`, `ttl_ms: 300000`. Failures are ignored. All pane tokens use the `hla_` prefix. Herdr allows at most 16 tokens per report, names `^[A-Za-z0-9_-]{1,32}$`. Refresh the token before the TTL runs out while the pane exists (the old tick refreshed it every 15 s).
+`pane.report_metadata` with `pane_id`, `source` (the plugin's metadata source id), `display_agent`, `tokens: {"hla_state": "<state>"}`, `ttl_ms: 300000`. Failures are ignored. All pane tokens use the `hla_` prefix. Herdr allows at most 16 tokens per report, names `^[A-Za-z0-9_-]{1,32}$`. A pane's token is reported when its value changes, and otherwise every 150 s (half the TTL) while the pane exists.
 
 ## Launching agents
 
@@ -690,27 +706,30 @@ For an active run whose coordinator is `pending`:
    - `tests/coordinator:priming_names_the_binary_and_the_allow_list_leaves_out_plugin_commands`
 2. `workspace.create` with `cwd` = `canonical_dir`, `label` = the workspace label, not focused.
 3. Record `workspace_id`, `tab_id`, `pane_id`, `cwd` from the root pane; set `status open`, `prompt_pending true`, `launch_attempts 0`.
-4. Placement happens in the claim pass. `tests/scenarios:a_delegated_issue_becomes_a_run_whose_coordinator_is_started_and_primed`
+4. `workspace.create` runs as an effect task. When its answer is lost (`OutcomeUnknown`), the next snapshot decides: a pane whose cwd is `canonical_dir` and that is empty or holds our agent (kind and name) is adopted instead of creating a second workspace; the label is not compared, since a title edit changes it. With our agent in it, the adopted coordinator is prompted, not started. `tests/scenarios:a_placement_without_an_answer_is_adopted_after_a_title_edit` Placement happens while the claim settles. `tests/scenarios:a_delegated_issue_becomes_a_run_whose_coordinator_is_started_and_primed`
 
-A placement failure counts as a launch attempt (see below).
+A placement failure counts as a launch attempt (see below); `NotSent` and `OutcomeUnknown` do not.
+
+Effect results are applied only to records that did not move on, decided under the run lock when the result is applied: a placement only while the run is active and the coordinator still `pending` (otherwise the new workspace is closed), a start or its failure only while the run is active and the agent is still `open` in the pane the start went to. Other results are dropped. `tests/scenarios:a_start_result_for_a_pane_the_worker_left_is_dropped`
 
 ### Start
 
 For each `open` agent of the run with `prompt_pending` (coordinator first, then workers by id):
 
 - Start only when the pane exists and no agent is in it (the pane is at its shell prompt). An agent already in the pane (for example one left `blocked` by `agent_not_ready`) is never started again.
-- At most one start per run per pass. **Timing change:** in the rewrite a run has at most one start in flight, and the next start waits until the previous one's outcome is known.
+- At most one start per run per pass. **Timing change:** in the rewrite a run has at most one start in flight, and the next start waits until the previous one's outcome is known. `agent.start` runs as an effect task; after it answers (or its answer is lost) the agent is not started again in that pane for 60 s while Herdr has not detected it. When the 60 s end and the pane is still empty, that counts as an unsuccessful attempt with the error `Herdr did not detect the agent within 60 s`, so a start that never shows ends after three. `tests/scenarios:a_start_herdr_never_detects_counts_as_an_attempt`
 - Arguments: `profile_args(profile)`, then `resume_args(kind, agent_session)` when `resume` is set and the arguments exist. Examples: a `coordinator-light` start ends `-- --model sonnet`; a resumed coordinator ends `--resume sess-data-1-coordinator`; a `standard` worker ends `--model sonnet --effort high --permission-mode auto`; a `deep` worker includes `model_reasoning_effort=xhigh`. `tests/scenarios:a_delegated_issue_becomes_a_run_whose_coordinator_is_started_and_primed`, `tests/scenarios:a_worker_runs_in_a_worktree_and_its_report_and_pr_reach_linear`, `tests/scenarios:restarts_switch_profiles_and_are_limited`
 - Trust dialog: when `claude.auto_accept_trust_dialog` is true and the kind is `claude`, right before the start, trust the coordinator's `canonical_dir`, or the worker's worktree (its `cwd`) and its repository's main checkout (`repo_path`). Nothing is trusted when the option is off. `tests/scenarios:the_trust_dialog_is_accepted_only_when_enabled`
 - `claude_trust.trust(env, dirs)`: the config is `$CLAUDE_CONFIG_DIR/.claude.json` when set, else `~/.claude.json`. A missing file is left missing; a file whose top level is not an object is left alone. For each non-empty folder, set `projects.<folder>.hasTrustDialogAccepted = true` when it is not already true, keeping every other key, the key order and the file mode (0600 when unknown). Write through `.claude.json.hla.<pid>.tmp` and a rename. Returns whether the file changed. `src/claude_trust.rs:trust_is_added_once_and_everything_else_is_kept`, `src/claude_trust.rs:a_missing_or_unexpected_config_is_left_alone`
 - Outcome:
   - Success: the agent is running; the prompt is still pending.
   - Error `agent_not_ready`: the agent exists in the pane but is not ready (a trust or permission dialog); keep `open` and `prompt_pending`; the needs-a-person rules take over. `tests/scenarios:a_dialog_in_a_pane_is_reported_once_and_a_lost_coordinator_can_be_resumed`
-  - Any other error: increase `launch_attempts`. After 3 attempts, set `failed` with `error` = the message and queue an error activity (text: open question).
+  - Any other error: increase `launch_attempts`. After 3 attempts, set `failed` with `error` = the message and queue an error activity (see decision 6).
+  - Attempts are spaced: after an unsuccessful attempt the next one waits 15 s, doubling with every counted attempt (`last_attempt_at`). `NotSent` (Herdr down), for a placement or a start, waits a fixed 15 s whatever the count, does not count, and is kept in memory only. `tests/scenarios:a_start_herdr_never_received_waits_fifteen_seconds_whatever_the_attempts`
 
 ### Launch prompt
 
-When `prompt_pending` and our agent is in the pane and ready for input (idle or done), send the prompt and clear `prompt_pending`. It goes out once. `tests/scenarios:a_delegated_issue_becomes_a_run_whose_coordinator_is_started_and_primed`
+When `prompt_pending` and our agent is in the pane and ready for input (idle or done), send the prompt and clear `prompt_pending`. It goes out once: a prompt whose answer was lost (`OutcomeUnknown`) counts as delivered, and for a worker the `Start worker` action is queued, since a missed prompt is recovered by the nudge and a doubled one is not. `tests/scenarios:a_prompt_whose_answer_is_lost_counts_as_delivered` `tests/scenarios:a_delegated_issue_becomes_a_run_whose_coordinator_is_started_and_primed`
 
 | Agent | Prompt |
 | --- | --- |
@@ -727,6 +746,8 @@ While the run is `stopped` or `timeout_asked`, no prompt goes to the coordinator
 - Constants: `NUDGE_REPLY` = `[herdr-linear-agent ticker] There is a new reply in Linear. Run context.`; `NUDGE_INBOX` = `[herdr-linear-agent ticker] There are new inbox items. Run context.`
 - Condition: the coordinator is `open`, not lost, its launch prompt is delivered, its status is `idle` for at least 60 s (`COORDINATOR_IDLE_SECS`), the run is neither `stopped` nor `timeout_asked`, and unseen inbox items exist (unhandled and not marked seen).
 - The prompt is `NUDGE_REPLY` when any unseen item has kind `reply`, else `NUDGE_INBOX`.
+- No nudge in the pass that delivered the coordinator's launch prompt. `tests/scenarios:a_coordinator_prompted_in_a_pass_is_not_nudged_in_it`
+- A nudge whose answer was lost counts as sent.
 - One nudge per set of items: the ticker keeps, per run, a hash of the unseen item ids it last nudged about, and nudges again only when that set changes. The memory is in-process; a new ticker may nudge once more.
 - Pinned: `tests/scenarios:a_worker_runs_in_a_worktree_and_its_report_and_pr_reach_linear` (inbox nudge once), `tests/scenarios:replies_are_relayed_only_from_allowed_users_and_stop_interrupts` (reply nudge), `tests/scenarios:a_stop_holds_prompts_until_the_next_reply` (no nudge while stopped; after the next reply, `NUDGE_REPLY` although a worker item is also unseen), `tests/scenarios:quiet_runs_get_a_heartbeat_and_long_runs_ask_to_continue` (no nudge while the timeout question is open).
 
@@ -734,7 +755,7 @@ While the run is `stopped` or `timeout_asked`, no prompt goes to the coordinator
 
 Skipped entirely while the run has no session or is `stopped`.
 
-- Heartbeat: when `last_activity` is at least 20 minutes old and the outbox is empty, queue an ephemeral thought `Still on it: <summary>.` `<summary>` is `no workers`, or the counts of `open` workers by group in first-seen order, as `<n> <label in lower case>` joined by `, ` (for example `1 working, 1 waiting on you`). Linear marks a session `stale` after 30 minutes without an activity.
+- Heartbeat: when `last_activity` is at least 20 minutes old, the outbox is empty, and no heartbeat was queued for the run in the last 20 minutes without an `ActivitySent` at or after it (the reconciler remembers this in memory; a flush and its event may be a pass apart), queue an ephemeral thought `Still on it: <summary>.` `<summary>` is `no workers`, or the counts of `open` workers by group in the order waiting on you, working, idle, reported, as `<n> <label in lower case>` joined by `, ` (for example `1 waiting on you, 1 working`). Linear marks a session `stale` after 30 minutes without an activity.
 - Run timeout: when not `timeout_asked` and `timeout_since` is at least `run_timeout_hours * 3600` s old, queue the elicitation `This run has been going for <h> hours. Reply to let it continue; until then the coordinator gets no prompts.` with option `Continue`=`continue`, set `timeout_asked`, and show the notification `<KEY> ran <h> hours` with body `Reply in the Linear session to let it continue.`
 - A reply clears `timeout_asked` and restarts the window. `tests/scenarios:quiet_runs_get_a_heartbeat_and_long_runs_ask_to_continue`
 
@@ -746,7 +767,7 @@ The kept module `src/outbox.rs` defines the queue.
 
 - `push(run, op)`: under the run lock, increase `.state/outbox-counter.json`, write `.state/outbox/<counter as 10 digits>.json` with `{id: UUIDv4, created, attempted: false, op...}`, return the id. Requests are sent in the order written.
 - Ops (`op` tag): `activity {activity}`, `plan {plan}`, `external_urls {urls}`, `issue_state {target: "started" | "review"}`.
-- `pending(run)`: queued requests oldest first; a file that does not parse is moved to `outbox/failed/`.
+- `pending(run)`: queued requests oldest first; a file that does not parse is moved to `outbox/failed/`. Only the Linear task calls it: it alone moves, rewrites or removes outbox files. The reconciler lists them read-only (`queued`, the requests that parse; `is_empty`, any file). `tests/scenarios:the_reconciler_leaves_an_unreadable_outbox_file_to_the_linear_task`
 
 ### Send
 
@@ -758,6 +779,7 @@ The kept module `src/outbox.rs` defines the queue.
 4. A definitive refusal (`Graphql`, `Configuration`, HTTP 400 to 428 or 430 to 499): move the file to `outbox/failed/` and go on. HTTP 429 and `RATELIMITED` are not definitive (see above).
 5. Any other error: stop the queue; the rest waits for the next flush.
 
+- The Linear task hands each event to the reconciler as soon as it happened (an `ActivitySent` right after that run's flush) and publishes the level after the step's events. A run whose outbox was failing and that leaves the queries is reported with `WritesRecovered`. `src/linear/task.rs:a_failing_run_that_leaves_the_queries_is_reported_recovered`, `tests/scenarios:a_pass_between_a_flush_and_its_sent_event_queues_no_second_heartbeat`
 - A lost response is checked by a read and never sent twice. `src/outbox.rs:a_lost_response_is_checked_by_a_read_and_never_sent_twice`
 - A failure keeps the rest in order; a refusal is set aside and the next request still goes out. `src/outbox.rs:a_failure_keeps_the_rest_in_order_and_a_refusal_is_set_aside`
 - Requests go out in order and are removed. `src/outbox.rs:requests_go_out_in_order_and_are_removed`
@@ -781,7 +803,7 @@ For every run with queued requests, including detached and closed runs:
 
 1. No session: `open_session`, store it; on failure log and count the flush as blocked.
 2. Send. When an activity went out, set `last_activity = now`. Log refusals and a blocked queue.
-3. When any run was blocked, remember since when. When Linear has accepted no write for 10 minutes, show once the notification `herdr-linear-agent` / `Linear has not accepted writes for 10 minutes. They are kept and retried; see the ticker log.` A flush without a block resets the timer and the notice.
+3. When any run was blocked, remember since when. The reconciler forgets a blocked run that is no longer active. `tests/scenarios:a_failing_outbox_of_a_run_that_ended_raises_no_notice` When Linear has accepted no write for 10 minutes, show once the notification `herdr-linear-agent` / `Linear has not accepted writes for 10 minutes. They are kept and retried; see the ticker log.` A flush without a block resets the timer and the notice.
 
 Requests queued before the session existed wait and go out once it exists. `tests/scenarios:a_claim_without_a_session_still_decides_its_coordinator`
 
@@ -829,7 +851,7 @@ Kinds and subjects written by the ticker: `issue`/`issue`, `reply`/`reply`, `wor
 
 ### Worker record (`workers/<id>.toml`)
 
-Fields: `id`, `title`, `repo`, `repo_path`, `branch`, `base`, `worktree_path`, `brief_dir`, `restarts`, `report_hash`, `announced_report_hash`, `pr_url`, `gone_reported`, `created`, `updated`, `agent` (agent record; the profile name is `agent.profile`).
+Fields: `id`, `title`, `repo`, `repo_path`, `branch`, `base`, `worktree_path`, `brief_dir`, `restarts`, `report_hash`, `announced_report_hash`, `pr_url`, `gone_reported`, `restarting` (a restart is moving it to a new pane), `created`, `updated`, `agent` (agent record; the profile name is `agent.profile`).
 
 | Operation | Behavior |
 | --- | --- |
@@ -855,7 +877,7 @@ A worker counts against `max_agents` when its status is `pending` or `open`.
 2. Checks, in this order: the repository is in the catalog; the profile is a worker profile (`not a worker profile`); no other worker of the run uses the repository (message contains `one worker per repository`); the run has fewer than `max_workers_per_run` workers (message contains `max_workers_per_run`); the agent count leaves room under `max_agents`. `tests/scenarios:finish_waits_for_every_worker_and_limits_hold`
 3. Allocate the id. Branch: `branch_name(KEY, id, title)`.
 4. `git -C <repo path> fetch origin <base>` (60 s).
-5. `worktree.create` with `cwd` = repo path, `branch`, `base` = `origin/<base>`, not focused. Record `workspace_id`, `tab_id`, `pane_id`, `cwd` and `worktree_path` from the result.
+5. `worktree.create` with `cwd` = repo path, `branch`, `base` = `origin/<base>`, not focused. Record `workspace_id`, `tab_id`, `pane_id`, `cwd` and `worktree_path` from the result. When its answer is lost (`OutcomeUnknown`), look for the branch's worktree in `git -C <repo path> worktree list --porcelain` (10 s); when it exists, open it with `worktree.open` and go on, else mark the worker failed. `src/commands.rs:a_worktree_created_without_an_answer_is_opened_not_failed`
 6. Add `.herdr-linear-agent/` to the repository's shared `info/exclude` (the common git dir, so every worktree is covered), once. A failure here does not fail the command. `tests/commands:exclude_is_added_once_to_the_shared_file` (git status stays clean with files under `.herdr-linear-agent/`); the scenario World fails every `git -C` except the fetch and the command still succeeds.
 7. Write `workers/<id>.task.md` and `<brief_dir>/brief.md`.
 8. Set the agent `open`, `prompt_pending`, `profile`, `kind`, `agent_name = <key>-<id>`.
@@ -886,6 +908,8 @@ Input: issue key, title, URL, worker, task, restart flag, binary. Order in the t
 
 - At most 2 restarts per worker; the third fails with a message containing `limit is 2`.
 - A new profile must be a worker profile; without one the profile stays.
+- Under the run lock, before the old workspace is closed, the worker is marked `restarting`: its pane is cleared, `prompt_pending` set, `gone_reported`, `last_group` and `blocked_reported` reset. Only then are the workspace closed and the new pane opened. A failure there leaves the worker `failed`, no longer restarting. `tests/scenarios:a_restart_between_a_snapshot_and_its_pass_keeps_the_new_pane`
+- A worker without a `worktree_path` first looks for its branch's worktree (`git worktree list --porcelain`) and opens it when it exists; otherwise it is placed again from its base. `src/commands.rs:a_restart_opens_the_worktree_a_lost_answer_left_behind`
 - Close the old workspace (the checkout stays), open the kept worktree again with `worktree.open` and `path` = `worktree_path`, record the new pane, rewrite the brief with the restart note, set `restarts += 1`, `kind` of the profile, `open`, `prompt_pending`, `launch_attempts = 0`. The ticker starts it in a later pass with the new profile's arguments.
 - `tests/scenarios:restarts_switch_profiles_and_are_limited` (kind `codex`, restarts 1, one workspace closed, `previous attempt` in the brief, `model_reasoning_effort=xhigh` in the next start).
 
@@ -999,8 +1023,9 @@ report [--percent N | --unknown] --activity TEXT
 - `agent_not_ready` in the fake leaves a `blocked` agent in the pane and returns the error.
 - Git: every `git -C` fails with 128 `not a git repository`, except `fetch origin`, which succeeds.
 - The fake Linear (`src/linear/api.rs` `fake`) is kept, with its clock that stamps each activity after the present.
-- `World::tick` becomes "run the ticker until quiescent" with both Linear intervals due. Assertions that count ticks become assertions on the order of effects (placement, then one start, then one prompt).
-- Ages are simulated by rewriting recorded timestamps (`last_state_change`, `last_activity`, `timeout_since`), so time rules must read those fields, not only in-memory timers.
+- `World::tick` becomes `World::settle`: Linear step and pass alternate, with both Linear intervals due, until a round changes no run-folder file, makes no Herdr request other than `session.snapshot` and `pane.report_metadata`, leaves the Linear queries as they were and has nothing in flight; it fails after 50 rounds. Assertions that count ticks become assertions on the order of effects (placement, then one start, then one prompt).
+- Durations use an injected clock. The World advances its clock instead of rewriting recorded timestamps, and the fake Linear stamps activities after that clock.
+- Knobs that make the World fail where the ticker would: the Linear task steps with the queries of an earlier round (`query_lag`), `ActivitySent` arrives a round after its flush, the level reaches the pass after the events, every pass runs twice, the fake Herdr holds a snapshot's answer while a subcommand runs, leaves entries unparsed, loses the answers of placements and prompts, and drops starts. `tests/scenarios:a_run_under_every_lag_knob_writes_each_fact_once`
 
 ## Decisions for the questions the inputs left open
 
@@ -1009,11 +1034,11 @@ The inputs did not pin these. Each line is the rule the rewrite follows. A rule 
 1. `last_group` stores `waiting_on_you`, `working`, `reported` or `idle`. An unknown stored value reads as none, so the next group is always a transition.
 2. **Kept:** the stop file is `ticker.stop` and the log is `ticker.log`, capped at 1 MB. When a write would pass the cap, the older half of the file is dropped at a line boundary. A running ticker is described as `ticker <version> running since <started> (pid <pid>)`.
 3. Progress records use the metadata `source` `herdr-linear-agent`. **Kept:** a record is `state/progress/<pane>-<hash>.json` and sets the pane token `hla_activity` with a 300 s TTL. The record holds `pane`, `terminal`, `percent` (or null for `--unknown`), `activity` and `at`. The percent is not sent as a token.
-4. An inbox item is `inbox/<id>.json` with the fields `id`, `kind`, `created`, `worker` (optional) and `body`. Ids are `i<n>` from a counter kept under the run lock. `inbox done` moves an item to `inbox/done/`. Done items older than 7 days are pruned. The digest's headings are `## Issue`, `## Conversation`, `## Repositories`, `## Worker profiles`, `## Workers` and `## Inbox`. A worker line is `<id> <repo> <group>`, followed by `PR <url>` when one is known. An inbox line starts with its id.
+4. An inbox item is `inbox/<id>.json` with the fields `id`, `kind`, `created`, `worker` (optional) and `body`. Ids are `i<n>` from a counter kept under the run lock. `inbox done` moves an item to `inbox/done/`. **Kept:** done items older than 30 days are pruned. The digest's headings are `## Issue`, `## Conversation`, `## Repositories`, `## Worker profiles`, `## Workers` and `## Inbox`. A worker line is `<id> <repo> <group>`, followed by `PR <url>` when one is known. An inbox line starts with its id.
 5. The `Start worker` action is queued when a worker's launch prompt is delivered, not when `worker start` returns. Its parameter is `<id> <repo>: <title>`.
-6. A launch attempt is one failed placement or one failed `agent.start`, including `agent_not_ready`. After 3 attempts the agent is `Failed` with the last error. The ticker then posts the error activity `Could not start the <role> agent: <error>`, where the role is `coordinator` or `worker <id>`. `agent.start` gets `timeout_ms` 30000.
+6. A launch attempt is one failed placement or one failed `agent.start`, including `agent_not_ready`; `NotSent` and `OutcomeUnknown` are not attempts. After 3 attempts the agent is `Failed` with the last error. The ticker then posts the error activity `Could not start the <role> agent: <error>`, where the role is `coordinator` or `worker <id>`. `agent.start` gets `timeout_ms` 30000.
 7. `worker prompt` sends the given text itself with `agent.prompt`. It fails with `worker <id> is not running` when the worker is not `open` or has no pane. It is refused while the worker waits on a dialog, as the tests pin.
-8. A restart resets `last_group`, `report_hash`, `gone_reported`, `blocked_reported`, `error` and `launch_attempts`, and sets `prompt_pending`. `announced_report_hash` and `pr_url` are kept. A `failed` worker whose worktree was never created is placed again from its base.
+8. A restart resets `last_group`, `report_hash`, `gone_reported`, `blocked_reported`, `error`, `launch_attempts`, `last_attempt_at` and `last_state_seq`, and sets `prompt_pending`. `announced_report_hash` and `pr_url` are kept. A `failed` worker whose worktree was never created is placed again from its base.
 9. When `git fetch` fails, `worker start` fails with `git fetch failed: <stderr first line>` and writes no worker record. The `max_agents` refusal is `the limit of <n> agents is reached`.
 10. Only workers that are not `stopped` count for one worker per repository and for `max_workers_per_run`.
 11. A `Waiting for you` self-report counts only while Herdr does not show the agent `working`, and only while the report is younger than 5 minutes.

@@ -3,11 +3,12 @@
 //! GraphQL text. Every read also selects the viewer, so the transport can
 //! check that the credential still belongs to the app user.
 
+use std::future::Future;
+
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::ApiError;
-use super::transport::Transport;
 
 /// Pages read per poll at most: 50 issues each.
 const MAX_PAGES: usize = 4;
@@ -261,9 +262,309 @@ pub struct RunUpdate {
     pub prompts: Vec<Prompt>,
 }
 
-/// The typed Linear API over a transport.
-pub struct Linear<T: Transport> {
-    transport: T,
+/// The Linear operations the ticker needs. An implementation supplies
+/// `execute`; every operation's text and parsing is here. Tests fake Linear
+/// by implementing `execute`.
+pub trait LinearApi: Sync {
+    /// Sends one GraphQL operation and returns its `data` object.
+    fn execute(
+        &self,
+        operation: &str,
+        query: &str,
+        variables: Value,
+        write: bool,
+    ) -> impl Future<Output = Result<Value, ApiError>> + Send;
+
+    /// Sends a mutation and returns its `payload` field once its `success`
+    /// is true.
+    fn mutate(
+        &self,
+        operation: &'static str,
+        query: &'static str,
+        variables: Value,
+        payload: &'static str,
+    ) -> impl Future<Output = Result<Value, ApiError>> + Send {
+        async move {
+            let data = self.execute(operation, query, variables, true).await?;
+            let result = field(&data, payload)?;
+            if result["success"].as_bool() != Some(true) {
+                return Err(ApiError::Graphql(format!("{payload} did not succeed")));
+            }
+            Ok(result.clone())
+        }
+    }
+
+    fn viewer(&self) -> impl Future<Output = Result<Viewer, ApiError>> + Send {
+        async move {
+            let data = self
+                .execute("HlaViewer", VIEWER_QUERY, json!({}), false)
+                .await?;
+            serde_json::from_value(field(&data, "viewer")?.clone())
+                .map_err(|_| ApiError::ReadFieldsInvalid)
+        }
+    }
+
+    /// Issues delegated to the app user in the teams whose state is neither
+    /// completed nor canceled.
+    fn delegated_issues(
+        &self,
+        team_keys: &[String],
+    ) -> impl Future<Output = Result<Vec<IssueRef>, ApiError>> + Send {
+        async move {
+            let mut issues = Vec::new();
+            let mut after: Option<String> = None;
+            for _ in 0..MAX_PAGES {
+                let variables = json!({ "teamKeys": team_keys, "after": after });
+                let data = self
+                    .execute("HlaDelegatedIssues", DELEGATED_QUERY, variables, false)
+                    .await?;
+                let page = field(&data, "issues")?;
+                for node in nodes(page) {
+                    issues.push(
+                        serde_json::from_value(node.clone())
+                            .map_err(|_| ApiError::ReadFieldsInvalid)?,
+                    );
+                }
+                let info = &page["pageInfo"];
+                if info["hasNextPage"].as_bool() != Some(true) {
+                    break;
+                }
+                after = Some(text(info, "endCursor")?);
+            }
+            Ok(issues)
+        }
+    }
+
+    fn issue(&self, id: &str) -> impl Future<Output = Result<IssueDetail, ApiError>> + Send {
+        async move {
+            let data = self
+                .execute("HlaIssue", ISSUE_QUERY, json!({ "id": id }), false)
+                .await?;
+            parse_issue(field(&data, "issue")?)
+        }
+    }
+
+    /// The issue's newest open session of this app: the one Linear created
+    /// on delegation, or one the plugin created earlier.
+    fn find_session(
+        &self,
+        issue_id: &str,
+    ) -> impl Future<Output = Result<Option<String>, ApiError>> + Send {
+        async move {
+            let data = self
+                .execute("HlaSessions", SESSIONS_QUERY, json!({}), false)
+                .await?;
+            let viewer = text(field(&data, "viewer")?, "id")?;
+            nodes(field(&data, "agentSessions")?)
+                .filter(|s| s["issue"]["id"] == issue_id && s["appUser"]["id"] == viewer.as_str())
+                .filter(|s| s["status"] != "complete")
+                .max_by(|a, b| a["createdAt"].as_str().cmp(&b["createdAt"].as_str()))
+                .map(|session| text(session, "id"))
+                .transpose()
+        }
+    }
+
+    /// Opens a new Agent Session on the issue and returns its ID.
+    fn create_session(
+        &self,
+        issue_id: &str,
+    ) -> impl Future<Output = Result<String, ApiError>> + Send {
+        async move {
+            let payload = self
+                .mutate(
+                    "HlaSessionCreate",
+                    SESSION_CREATE,
+                    json!({ "issueId": issue_id }),
+                    "agentSessionCreateOnIssue",
+                )
+                .await?;
+            text(field(&payload, "agentSession")?, "id")
+        }
+    }
+
+    /// Sends an activity with the caller's UUID as its ID.
+    fn create_activity(
+        &self,
+        session_id: &str,
+        id: &str,
+        activity: &Activity,
+    ) -> impl Future<Output = Result<(), ApiError>> + Send {
+        async move {
+            let mut input = json!({
+                "agentSessionId": session_id,
+                "id": id,
+                "content": serde_json::to_value(&activity.content).map_err(|_| ApiError::Configuration)?,
+                "ephemeral": activity.ephemeral,
+            });
+            if let Some(signal) = &activity.signal {
+                input["signal"] = json!(signal);
+            }
+            if let Some(metadata) = &activity.signal_metadata {
+                input["signalMetadata"] = metadata.clone();
+            }
+            let variables = json!({ "input": input });
+            self.mutate(
+                "HlaActivityCreate",
+                ACTIVITY_CREATE,
+                variables,
+                "agentActivityCreate",
+            )
+            .await
+            .map(|_| ())
+        }
+    }
+
+    fn activity_exists(
+        &self,
+        session_id: &str,
+        id: &str,
+    ) -> impl Future<Output = Result<bool, ApiError>> + Send {
+        async move {
+            let variables = json!({ "sessionId": session_id, "id": id });
+            let data = self
+                .execute("HlaActivityFind", ACTIVITY_FIND, variables, false)
+                .await?;
+            Ok(nodes(&field(&data, "agentSession")?["activities"]).any(|n| n["id"] == id))
+        }
+    }
+
+    fn set_plan(
+        &self,
+        session_id: &str,
+        plan: &Value,
+    ) -> impl Future<Output = Result<(), ApiError>> + Send {
+        async move {
+            let variables = json!({ "id": session_id, "input": { "plan": plan } });
+            self.mutate(
+                "HlaSessionUpdate",
+                SESSION_UPDATE,
+                variables,
+                "agentSessionUpdate",
+            )
+            .await
+            .map(|_| ())
+        }
+    }
+
+    fn set_external_urls(
+        &self,
+        session_id: &str,
+        urls: &[ExternalUrl],
+    ) -> impl Future<Output = Result<(), ApiError>> + Send {
+        async move {
+            let variables = json!({ "id": session_id, "input": { "externalUrls": urls } });
+            self.mutate(
+                "HlaSessionUpdate",
+                SESSION_UPDATE,
+                variables,
+                "agentSessionUpdate",
+            )
+            .await
+            .map(|_| ())
+        }
+    }
+
+    fn set_issue_state(
+        &self,
+        issue_id: &str,
+        state_id: &str,
+    ) -> impl Future<Output = Result<(), ApiError>> + Send {
+        async move {
+            let variables = json!({ "id": issue_id, "stateId": state_id });
+            self.mutate(
+                "HlaIssueState",
+                ISSUE_STATE_UPDATE,
+                variables,
+                "issueUpdate",
+            )
+            .await
+            .map(|_| ())
+        }
+    }
+
+    /// Every given run's issue state and new prompts, in one `HlaRuns`
+    /// request, in query order.
+    fn run_updates(
+        &self,
+        runs: &[RunQuery],
+    ) -> impl Future<Output = Result<Vec<RunUpdate>, ApiError>> + Send {
+        async move {
+            if runs.is_empty() {
+                return Ok(Vec::new());
+            }
+            let mut declarations = Vec::new();
+            let mut body = String::from("  viewer { id app isMe }\n");
+            let mut variables = serde_json::Map::new();
+            for (n, run) in runs.iter().enumerate() {
+                declarations.push(format!(
+                    "$i{n}: String!, $s{n}: String!, $c{n}: DateTimeOrDuration!"
+                ));
+                body.push_str(&RUN_PART.replace('@', &n.to_string()));
+                variables.insert(format!("i{n}"), json!(run.issue_id));
+                variables.insert(format!("s{n}"), json!(run.session_id));
+                variables.insert(format!("c{n}"), json!(run.cursor));
+            }
+            let query = format!("query HlaRuns({}) {{\n{body}}}", declarations.join(", "));
+            let data = self
+                .execute("HlaRuns", &query, Value::Object(variables), false)
+                .await?;
+            (0..runs.len())
+                .map(|n| {
+                    let issue = field(&data, &format!("i{n}"))?;
+                    let session = field(&data, &format!("s{n}"))?;
+                    let mut prompts = nodes(&session["activities"])
+                        .map(|a| {
+                            Ok(Prompt {
+                                id: text(a, "id")?,
+                                created_at: text(a, "createdAt")?,
+                                signal: a["signal"].as_str().map(str::to_string),
+                                user_id: a["user"]["id"].as_str().unwrap_or("").to_string(),
+                                body: a["content"]["body"].as_str().unwrap_or("").to_string(),
+                            })
+                        })
+                        .collect::<Result<Vec<_>, ApiError>>()?;
+                    prompts.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+                    Ok(RunUpdate {
+                        issue: IssueStatus {
+                            updated_at: text(issue, "updatedAt")?,
+                            state_type: text(field(issue, "state")?, "type")?,
+                            state_name: text(field(issue, "state")?, "name")?,
+                            delegate_id: issue["delegate"]["id"].as_str().map(str::to_string),
+                        },
+                        prompts,
+                    })
+                })
+                .collect()
+        }
+    }
+
+    /// The batched run read, one result per run in order. When the batch
+    /// fails, each run is read with its own request so one broken run does
+    /// not hide the others; a rate-limited batch is not split.
+    fn read_runs(
+        &self,
+        runs: &[RunQuery],
+    ) -> impl Future<Output = Vec<Result<RunUpdate, ApiError>>> + Send {
+        async move {
+            match self.run_updates(runs).await {
+                Ok(updates) => updates.into_iter().map(Ok).collect(),
+                Err(ApiError::RateLimited) => {
+                    runs.iter().map(|_| Err(ApiError::RateLimited)).collect()
+                }
+                Err(_) => {
+                    let mut updates = Vec::with_capacity(runs.len());
+                    for run in runs {
+                        updates.push(
+                            self.run_updates(std::slice::from_ref(run))
+                                .await
+                                .map(|mut one| one.remove(0)),
+                        );
+                    }
+                    updates
+                }
+            }
+        }
+    }
 }
 
 fn field<'a>(value: &'a Value, name: &str) -> Result<&'a Value, ApiError> {
@@ -282,222 +583,6 @@ fn text(value: &Value, name: &str) -> Result<String, ApiError> {
 
 fn nodes(value: &Value) -> impl Iterator<Item = &Value> {
     value["nodes"].as_array().into_iter().flatten()
-}
-
-impl<T: Transport> Linear<T> {
-    pub fn new(transport: T) -> Self {
-        Linear { transport }
-    }
-
-    #[cfg(test)]
-    pub fn transport(&mut self) -> &mut T {
-        &mut self.transport
-    }
-
-    fn read(&mut self, operation: &str, query: &str, variables: Value) -> Result<Value, ApiError> {
-        self.transport.execute(operation, query, variables, false)
-    }
-
-    pub fn viewer(&mut self) -> Result<Viewer, ApiError> {
-        let data = self.read("HlaViewer", VIEWER_QUERY, json!({}))?;
-        serde_json::from_value(field(&data, "viewer")?.clone())
-            .map_err(|_| ApiError::ReadFieldsInvalid)
-    }
-
-    /// Issues delegated to the app user in the configured teams whose state is
-    /// neither completed nor canceled.
-    pub fn delegated_issues(&mut self, team_keys: &[String]) -> Result<Vec<IssueRef>, ApiError> {
-        let mut issues = Vec::new();
-        let mut after: Option<String> = None;
-        for _ in 0..MAX_PAGES {
-            let data = self.read(
-                "HlaDelegatedIssues",
-                DELEGATED_QUERY,
-                json!({ "teamKeys": team_keys, "after": after }),
-            )?;
-            let page = field(&data, "issues")?;
-            for node in nodes(page) {
-                issues.push(
-                    serde_json::from_value(node.clone())
-                        .map_err(|_| ApiError::ReadFieldsInvalid)?,
-                );
-            }
-            let info = &page["pageInfo"];
-            if info["hasNextPage"].as_bool() != Some(true) {
-                break;
-            }
-            after = Some(text(info, "endCursor")?);
-        }
-        Ok(issues)
-    }
-
-    pub fn issue(&mut self, id: &str) -> Result<IssueDetail, ApiError> {
-        let data = self.read("HlaIssue", ISSUE_QUERY, json!({ "id": id }))?;
-        parse_issue(field(&data, "issue")?)
-    }
-
-    fn write(
-        &mut self,
-        operation: &str,
-        query: &str,
-        variables: Value,
-        payload: &str,
-    ) -> Result<Value, ApiError> {
-        let data = self.transport.execute(operation, query, variables, true)?;
-        let result = field(&data, payload)?;
-        if result["success"].as_bool() != Some(true) {
-            return Err(ApiError::Graphql(format!("{payload} did not succeed")));
-        }
-        Ok(result.clone())
-    }
-
-    /// Creates an Agent Session on the issue and returns its ID.
-    /// The issue's newest open session of this app: the one Linear created on
-    /// delegation, or one the plugin created earlier. Otherwise a new one.
-    pub fn open_session(&mut self, issue_id: &str) -> Result<String, ApiError> {
-        let data = self.read("HlaSessions", SESSIONS_QUERY, json!({}))?;
-        let viewer = text(field(&data, "viewer")?, "id")?;
-        let found = nodes(field(&data, "agentSessions")?)
-            .filter(|s| s["issue"]["id"] == issue_id && s["appUser"]["id"] == viewer.as_str())
-            .filter(|s| s["status"] != "complete")
-            .max_by(|a, b| a["createdAt"].as_str().cmp(&b["createdAt"].as_str()));
-        match found {
-            Some(session) => text(session, "id"),
-            None => self.create_session(issue_id),
-        }
-    }
-
-    fn create_session(&mut self, issue_id: &str) -> Result<String, ApiError> {
-        let result = self.write(
-            "HlaSessionCreate",
-            SESSION_CREATE,
-            json!({ "issueId": issue_id }),
-            "agentSessionCreateOnIssue",
-        )?;
-        text(field(&result, "agentSession")?, "id")
-    }
-
-    /// Sends an activity with the caller's UUID as its ID, so a lost response
-    /// can be checked with `activity_exists` before anything is sent again.
-    pub fn create_activity(
-        &mut self,
-        session_id: &str,
-        id: &str,
-        activity: &Activity,
-    ) -> Result<(), ApiError> {
-        let mut input = json!({
-            "agentSessionId": session_id,
-            "id": id,
-            "content": serde_json::to_value(&activity.content).map_err(|_| ApiError::Configuration)?,
-            "ephemeral": activity.ephemeral,
-        });
-        if let Some(signal) = &activity.signal {
-            input["signal"] = json!(signal);
-        }
-        if let Some(metadata) = &activity.signal_metadata {
-            input["signalMetadata"] = metadata.clone();
-        }
-        self.write(
-            "HlaActivityCreate",
-            ACTIVITY_CREATE,
-            json!({ "input": input }),
-            "agentActivityCreate",
-        )
-        .map(|_| ())
-    }
-
-    pub fn activity_exists(&mut self, session_id: &str, id: &str) -> Result<bool, ApiError> {
-        let data = self.read(
-            "HlaActivityFind",
-            ACTIVITY_FIND,
-            json!({ "sessionId": session_id, "id": id }),
-        )?;
-        Ok(nodes(&field(&data, "agentSession")?["activities"]).any(|n| n["id"] == id))
-    }
-
-    /// Replaces the session's plan (Linear's list of `{content, status}`).
-    pub fn set_plan(&mut self, session_id: &str, plan: &Value) -> Result<(), ApiError> {
-        self.write(
-            "HlaSessionUpdate",
-            SESSION_UPDATE,
-            json!({ "id": session_id, "input": { "plan": plan } }),
-            "agentSessionUpdate",
-        )
-        .map(|_| ())
-    }
-
-    /// Replaces the session's external URLs with the full list.
-    pub fn set_external_urls(
-        &mut self,
-        session_id: &str,
-        urls: &[ExternalUrl],
-    ) -> Result<(), ApiError> {
-        self.write(
-            "HlaSessionUpdate",
-            SESSION_UPDATE,
-            json!({ "id": session_id, "input": { "externalUrls": urls } }),
-            "agentSessionUpdate",
-        )
-        .map(|_| ())
-    }
-
-    pub fn set_issue_state(&mut self, issue_id: &str, state_id: &str) -> Result<(), ApiError> {
-        self.write(
-            "HlaIssueState",
-            ISSUE_STATE_UPDATE,
-            json!({ "id": issue_id, "stateId": state_id }),
-            "issueUpdate",
-        )
-        .map(|_| ())
-    }
-
-    /// Every active run's issue state and new prompts, in one request.
-    pub fn run_updates(&mut self, runs: &[RunQuery]) -> Result<Vec<RunUpdate>, ApiError> {
-        if runs.is_empty() {
-            return Ok(Vec::new());
-        }
-        let mut declarations = Vec::new();
-        let mut body = String::from("  viewer { id app isMe }\n");
-        let mut variables = serde_json::Map::new();
-        for (n, run) in runs.iter().enumerate() {
-            declarations.push(format!(
-                "$i{n}: String!, $s{n}: String!, $c{n}: DateTimeOrDuration!"
-            ));
-            body.push_str(&RUN_PART.replace('@', &n.to_string()));
-            variables.insert(format!("i{n}"), json!(run.issue_id));
-            variables.insert(format!("s{n}"), json!(run.session_id));
-            variables.insert(format!("c{n}"), json!(run.cursor));
-        }
-        let query = format!("query HlaRuns({}) {{\n{body}}}", declarations.join(", "));
-        let data = self.read("HlaRuns", &query, Value::Object(variables))?;
-        (0..runs.len())
-            .map(|n| {
-                let issue = field(&data, &format!("i{n}"))?;
-                let session = field(&data, &format!("s{n}"))?;
-                let mut prompts = nodes(&session["activities"])
-                    .map(|a| {
-                        Ok(Prompt {
-                            id: text(a, "id")?,
-                            created_at: text(a, "createdAt")?,
-                            signal: a["signal"].as_str().map(str::to_string),
-                            user_id: a["user"]["id"].as_str().unwrap_or("").to_string(),
-                            body: a["content"]["body"].as_str().unwrap_or("").to_string(),
-                        })
-                    })
-                    .collect::<Result<Vec<_>, ApiError>>()?;
-                prompts.sort_by(|a, b| a.created_at.cmp(&b.created_at));
-                Ok(RunUpdate {
-                    issue: IssueStatus {
-                        updated_at: text(issue, "updatedAt")?,
-                        state_type: text(field(issue, "state")?, "type")?,
-                        state_name: text(field(issue, "state")?, "name")?,
-                        delegate_id: issue["delegate"]["id"].as_str().map(str::to_string),
-                    },
-                    prompts,
-                })
-            })
-            .collect()
-    }
 }
 
 fn parse_state(value: &Value) -> Result<WorkflowState, ApiError> {
@@ -559,7 +644,7 @@ fn parse_issue(issue: &Value) -> Result<IssueDetail, ApiError> {
 
 #[cfg(test)]
 pub mod fake {
-    //! An in-memory Linear behind the `Transport` boundary. It answers the
+    //! An in-memory Linear behind the client's `execute`. It answers the
     //! operations this module sends by name, keeps the issues, sessions and
     //! activities a test sets up, and records every call.
 
@@ -613,6 +698,9 @@ pub mod fake {
         pub lose_next_response: bool,
         /// Sessions fail as for an app without the agent session webhook category.
         pub sessions_disabled: bool,
+        /// The present the fake stamps activities after; the wall clock when
+        /// unset, a test clock otherwise.
+        pub present: Option<jiff::Timestamp>,
         clock: i64,
     }
 
@@ -625,7 +713,8 @@ pub mod fake {
         /// activities sort after a cursor the plugin took from the clock.
         fn tick_clock(&mut self) -> String {
             self.clock += 1;
-            (jiff::Timestamp::now() + jiff::SignedDuration::from_secs(self.clock)).to_string()
+            let present = self.present.unwrap_or_else(jiff::Timestamp::now);
+            (present + jiff::SignedDuration::from_secs(self.clock)).to_string()
         }
 
         /// Adds an issue delegated to the app user in `team`.
@@ -910,8 +999,8 @@ pub mod fake {
         }
     }
 
-    impl Transport for FakeLinear {
-        fn execute(
+    impl FakeLinear {
+        pub fn execute(
             &mut self,
             operation: &str,
             _query: &str,
@@ -930,43 +1019,27 @@ pub mod fake {
             answer
         }
     }
-
-    /// A fake shared between a test and the ticker that owns the transport.
-    #[derive(Clone, Default)]
-    pub struct Shared(pub std::rc::Rc<std::cell::RefCell<FakeLinear>>);
-
-    impl Transport for Shared {
-        fn execute(
-            &mut self,
-            operation: &str,
-            query: &str,
-            variables: Value,
-            write: bool,
-        ) -> Result<Value, ApiError> {
-            self.0
-                .borrow_mut()
-                .execute(operation, query, variables, write)
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use super::fake::FakeLinear;
     use super::*;
 
-    #[test]
-    fn reads_parse_into_typed_records() {
+    #[tokio::test]
+    async fn reads_parse_into_typed_records() {
         let mut fake = FakeLinear::default();
         let id = fake.add_issue("DATA-1", "DATA", "First");
         fake.add_issue("OTHER-1", "OTHER", "Elsewhere");
         fake.add_issue("DATA-2", "DATA", "Done already");
         fake.issue_mut("DATA-2")["state"]["type"] = json!("completed");
         fake.issue_mut("DATA-1")["labels"] = json!({ "nodes": [{ "name": "S", "parent": { "name": "size" } }, { "name": "bug", "parent": null }] });
-        let mut linear = Linear::new(fake);
+        let linear = Mutex::new(fake);
 
-        assert_eq!(linear.viewer().unwrap().id, fake::APP_USER);
-        let issues = linear.delegated_issues(&["DATA".into()]).unwrap();
+        assert_eq!(linear.viewer().await.unwrap().id, fake::APP_USER);
+        let issues = linear.delegated_issues(&["DATA".into()]).await.unwrap();
         assert_eq!(issues.len(), 1);
         assert_eq!(
             (
@@ -977,7 +1050,7 @@ mod tests {
             ("DATA-1", "DATA", "unstarted")
         );
 
-        let detail = linear.issue(&id).unwrap();
+        let detail = linear.issue(&id).await.unwrap();
         assert_eq!(detail.team.states.len(), 5);
         assert_eq!(
             detail.labels[0],
@@ -988,21 +1061,36 @@ mod tests {
         );
         assert_eq!(detail.labels[1].group, None);
         assert_eq!(detail.delegate_id.as_deref(), Some(fake::APP_USER));
-        assert!(linear.transport().calls.iter().all(|(_, _, write)| !write));
+        assert!(
+            linear
+                .lock()
+                .unwrap()
+                .calls
+                .iter()
+                .all(|(_, _, write)| !write)
+        );
     }
 
-    #[test]
-    fn writes_and_run_updates_round_trip() {
+    #[tokio::test]
+    async fn writes_and_run_updates_round_trip() {
         let mut fake = FakeLinear::default();
         let issue = fake.add_issue("DATA-1", "DATA", "First");
-        let mut linear = Linear::new(fake);
-        let session = linear.open_session(&issue).unwrap();
+        let linear = Mutex::new(fake);
+        assert_eq!(linear.find_session(&issue).await.unwrap(), None);
+        let session = linear.create_session(&issue).await.unwrap();
+        assert_eq!(
+            linear.find_session(&issue).await.unwrap().as_deref(),
+            Some(session.as_str())
+        );
         let thought = Activity::new(Content::Thought {
             body: "Picked up".into(),
         });
-        linear.create_activity(&session, "a-1", &thought).unwrap();
-        assert!(linear.activity_exists(&session, "a-1").unwrap());
-        assert!(!linear.activity_exists(&session, "a-2").unwrap());
+        linear
+            .create_activity(&session, "a-1", &thought)
+            .await
+            .unwrap();
+        assert!(linear.activity_exists(&session, "a-1").await.unwrap());
+        assert!(!linear.activity_exists(&session, "a-2").await.unwrap());
         let ask = Activity {
             signal: Some("select".into()),
             signal_metadata: Some(json!({ "options": [{ "label": "Yes", "value": "yes" }] })),
@@ -1010,12 +1098,13 @@ mod tests {
                 body: "Proceed?".into(),
             })
         };
-        linear.create_activity(&session, "a-2", &ask).unwrap();
+        linear.create_activity(&session, "a-2", &ask).await.unwrap();
         linear
             .set_plan(
                 &session,
                 &json!([{ "content": "Plan", "status": "pending" }]),
             )
+            .await
             .unwrap();
         linear
             .set_external_urls(
@@ -1025,27 +1114,33 @@ mod tests {
                     url: "https://github.com/o/r/pull/1".into(),
                 }],
             )
+            .await
             .unwrap();
-        linear.set_issue_state(&issue, "state-progress").unwrap();
+        linear
+            .set_issue_state(&issue, "state-progress")
+            .await
+            .unwrap();
 
-        let fake = linear.transport();
-        let stored = &fake.sessions[0];
-        assert_eq!(stored.sent_types(), ["thought", "elicitation"]);
-        assert_eq!(
-            stored.sent("elicitation")[0]["signalMetadata"]["options"][0]["value"],
-            "yes"
-        );
-        assert_eq!(stored.plan.as_ref().unwrap()[0]["status"], "pending");
-        assert_eq!(fake.issue("DATA-1")["state"]["name"], "In Progress");
-        fake.add_prompt("DATA-1", "user-1", "first", None);
-        fake.add_prompt("DATA-1", "user-2", "stop now", Some("stop"));
+        {
+            let mut fake = linear.lock().unwrap();
+            let stored = &fake.sessions[0];
+            assert_eq!(stored.sent_types(), ["thought", "elicitation"]);
+            assert_eq!(
+                stored.sent("elicitation")[0]["signalMetadata"]["options"][0]["value"],
+                "yes"
+            );
+            assert_eq!(stored.plan.as_ref().unwrap()[0]["status"], "pending");
+            assert_eq!(fake.issue("DATA-1")["state"]["name"], "In Progress");
+            fake.add_prompt("DATA-1", "user-1", "first", None);
+            fake.add_prompt("DATA-1", "user-2", "stop now", Some("stop"));
+        }
 
         let query = RunQuery {
             issue_id: issue.clone(),
             session_id: session.clone(),
             cursor: "2026-09-24T00:00:00Z".into(),
         };
-        let updates = linear.run_updates(&[query.clone(), query]).unwrap();
+        let updates = linear.run_updates(&[query.clone(), query]).await.unwrap();
         assert_eq!(updates.len(), 2);
         assert_eq!(updates[0].issue.state_type, "started");
         assert_eq!(updates[0].prompts.len(), 2);
@@ -1056,8 +1151,12 @@ mod tests {
             session_id: session,
             cursor: updates[0].prompts[1].created_at.clone(),
         };
-        assert!(linear.run_updates(&[later]).unwrap()[0].prompts.is_empty());
-        assert!(linear.run_updates(&[]).unwrap().is_empty());
+        assert!(
+            linear.run_updates(&[later]).await.unwrap()[0]
+                .prompts
+                .is_empty()
+        );
+        assert!(linear.run_updates(&[]).await.unwrap().is_empty());
     }
 
     #[test]

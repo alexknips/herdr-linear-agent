@@ -788,6 +788,7 @@ dependencies = [
  "jiff",
  "libc",
  "oauth2",
+ "reqwest",
  "secret-service",
  "security-framework",
  "security-framework-sys",

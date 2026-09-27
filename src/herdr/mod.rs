@@ -4,10 +4,16 @@
 mod client;
 #[cfg(test)]
 mod fake;
+#[cfg(test)]
+mod memory;
+mod requests;
 mod wake;
 
-pub use client::{Client, Subscription, session_socket};
-pub use wake::wake;
+pub use client::{Client, Snapshot, Subscription, session_socket};
+#[cfg(test)]
+pub use memory::FakeHerdr;
+pub use requests::{Herdr, Placed};
+pub use wake::{Link, wake};
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -42,6 +48,18 @@ pub struct PaneId(pub String);
 #[serde(transparent)]
 pub struct WorkspaceId(pub String);
 
+impl From<&str> for PaneId {
+    fn from(id: &str) -> Self {
+        PaneId(id.to_string())
+    }
+}
+
+impl From<&str> for WorkspaceId {
+    fn from(id: &str) -> Self {
+        WorkspaceId(id.to_string())
+    }
+}
+
 impl fmt::Display for PaneId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
@@ -65,6 +83,21 @@ pub enum AgentStatus {
 }
 
 impl AgentStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Working => "working",
+            Self::Blocked => "blocked",
+            Self::Done => "done",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// Ready for input: Herdr shows `idle` after `working` as `done`.
+    pub fn is_idle(self) -> bool {
+        matches!(self, Self::Idle | Self::Done)
+    }
+
     pub fn parse(text: &str) -> Self {
         match text {
             "idle" => Self::Idle,

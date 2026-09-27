@@ -39,6 +39,8 @@ type Push = (String, oneshot::Sender<()>);
 struct State {
     snapshot: Value,
     errors: BTreeMap<String, (String, String)>,
+    /// Results for methods other than the snapshot and notifications.
+    answers: BTreeMap<String, Value>,
     /// Refuses subscriptions that name panes with this code.
     refuse_status: Option<String>,
     hold_snapshot: Option<oneshot::Receiver<()>>,
@@ -51,14 +53,14 @@ struct Shared {
     requests: watch::Sender<Vec<Value>>,
 }
 
-pub struct FakeHerdr {
+pub struct FakeHerdrServer {
     _dir: tempfile::TempDir,
-    socket: PathBuf,
+    pub socket: PathBuf,
     shared: Arc<Shared>,
     server: Option<JoinHandle<()>>,
 }
 
-impl FakeHerdr {
+impl FakeHerdrServer {
     pub async fn start() -> Self {
         let dir = tempfile::tempdir().unwrap();
         let mut fake = Self {
@@ -98,6 +100,15 @@ impl FakeHerdr {
         self.state()
             .errors
             .insert(method.into(), (code.into(), message.into()));
+    }
+
+    pub fn answer(&self, method: &str, result: Value) {
+        self.state().answers.insert(method.into(), result);
+    }
+
+    /// Every request received so far, oldest first.
+    pub fn requests(&self) -> Vec<Value> {
+        self.shared.requests.borrow().clone()
     }
 
     pub fn refuse_status(&self, code: Option<&str>) {
@@ -188,7 +199,7 @@ impl FakeHerdr {
     }
 }
 
-impl Drop for FakeHerdr {
+impl Drop for FakeHerdrServer {
     fn drop(&mut self) {
         if let Some(server) = self.server.take() {
             server.abort();
@@ -283,10 +294,13 @@ async fn connection(stream: UnixStream, shared: Arc<Shared>) {
                 ok(json!({"type": "notification_show", "shown": true, "reason": "shown"})),
                 None,
             ),
-            (None, other) => (
-                error("unknown_method", format!("unknown method {other}")),
-                None,
-            ),
+            (None, other) => match state.answers.get(other) {
+                Some(result) => (ok(result.clone()), None),
+                None => (
+                    error("unknown_method", format!("unknown method {other}")),
+                    None,
+                ),
+            },
         }
     };
     if let Some(hold) = hold {

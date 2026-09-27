@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-use crate::runner::Runner;
+use crate::process::Runner;
 
 pub const APP: &str = "herdr-linear-agent";
 

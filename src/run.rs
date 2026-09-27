@@ -24,6 +24,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::Size;
 use crate::files::{self, write_atomic};
+use crate::herdr::Placed;
 use crate::linear::api::{ExternalUrl, IssueDetail};
 
 pub const SUBDIRS: [&str; 6] = [
@@ -105,18 +106,48 @@ pub struct AgentRecord {
     pub resume: bool,
     pub last_state: String,
     pub last_state_change: String,
+    /// Herdr's `state_change_seq` when `last_state` was seen, so the same
+    /// status in a new episode is still a change.
+    pub last_state_seq: u64,
+    /// When the last unsuccessful placement or start was made; the next one
+    /// waits for the spacing.
+    pub last_attempt_at: String,
     pub last_group: String,
     /// A "needs someone in the pane" elicitation was sent for the current episode.
     pub blocked_reported: bool,
 }
 
-/// A coordinator routing job running as a child process.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
-#[serde(default)]
-pub struct RoutingJob {
-    pub pid: u32,
-    pub started: String,
-    pub output: String,
+impl AgentRecord {
+    /// Open in the pane Herdr placed it in, its launch prompt due.
+    pub fn placed(&mut self, placed: &Placed) {
+        self.status = AgentStatus::Open;
+        self.error.clear();
+        self.workspace_id = placed.workspace.0.clone();
+        self.tab_id = placed.tab.clone();
+        self.pane_id = placed.pane.0.clone();
+        self.cwd = placed.cwd.clone();
+        self.prompt_pending = true;
+        self.launch_attempts = 0;
+        self.last_attempt_at.clear();
+    }
+
+    /// Pending again, to be placed anew and resumed when it has a session.
+    pub fn repend(&mut self) {
+        self.status = AgentStatus::Pending;
+        self.resume = !self.agent_session.is_empty();
+        self.launch_attempts = 0;
+        self.last_attempt_at.clear();
+    }
+}
+
+/// Escape keys the run still owes its agents: a stop or a detach decided
+/// while no snapshot showed where they run.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Interrupt {
+    /// Posts `Stopped <n> agent(s) ...` once the keys went out.
+    Stop,
+    Detach,
 }
 
 /// `.state/run.json`.
@@ -140,7 +171,6 @@ pub struct RunRecord {
     pub size: Size,
     /// Where the size came from: `estimate`, `label`, `agent` or `default`.
     pub size_source: String,
-    pub routing: Option<RoutingJob>,
     pub coordinator: AgentRecord,
     /// Prompts created after this timestamp have not been read yet.
     pub prompt_cursor: String,
@@ -158,6 +188,11 @@ pub struct RunRecord {
     /// A person pressed stop: no prompt or heartbeat goes out until they
     /// reply again. Inbox items are still written.
     pub stopped: bool,
+    /// The claim's `Picked up <KEY>.` thought is not queued yet. A record
+    /// of an older build lacks the field and reads as announced.
+    pub announce_pending: bool,
+    /// Sent by the next pass that has a snapshot.
+    pub interrupt: Option<Interrupt>,
 }
 
 #[derive(Debug, Clone)]
@@ -265,7 +300,17 @@ impl Run {
     /// Read-modify-write of the record under the lock: `change` touches only
     /// the fields its step owns.
     pub fn update(&self, change: impl FnOnce(&mut RunRecord)) -> Result<RunRecord> {
-        let _lock = self.lock()?;
+        let lock = self.lock()?;
+        self.update_held(&lock, change)
+    }
+
+    /// `update` for a caller that holds the lock, so several writes form one
+    /// critical section.
+    pub fn update_held(
+        &self,
+        _lock: &RunLock,
+        change: impl FnOnce(&mut RunRecord),
+    ) -> Result<RunRecord> {
         let mut record = self.record()?;
         change(&mut record);
         files::write_json(&self.record_path(), &record)?;
@@ -273,8 +318,13 @@ impl Run {
     }
 
     /// Appends one allowed reply to `conversation.md`.
-    pub fn append_conversation(&self, created: &str, user_id: &str, body: &str) -> Result<()> {
-        let _lock = self.lock()?;
+    pub fn append_conversation_held(
+        &self,
+        _lock: &RunLock,
+        created: &str,
+        user_id: &str,
+        body: &str,
+    ) -> Result<()> {
         let path = self.conversation_md();
         let mut text = std::fs::read_to_string(&path).unwrap_or_else(|_| "# Conversation\n\nReplies from allowed users in the issue's Agent Session, oldest first.\n".to_string());
         text.push_str(&format!(
@@ -285,8 +335,13 @@ impl Run {
     }
 
     /// Records a reply from a user who is not allowed; it never reaches the coordinator.
-    pub fn record_ignored_prompt(&self, created: &str, user_id: &str, body: &str) -> Result<()> {
-        let _lock = self.lock()?;
+    pub fn record_ignored_prompt_held(
+        &self,
+        _lock: &RunLock,
+        created: &str,
+        user_id: &str,
+        body: &str,
+    ) -> Result<()> {
         let path = self.state_dir().join("ignored-prompts.md");
         let mut text = std::fs::read_to_string(&path).unwrap_or_default();
         text.push_str(&format!(
@@ -388,6 +443,27 @@ mod tests {
     }
 
     #[test]
+    fn a_record_with_an_older_builds_routing_job_still_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = RunRecord {
+            identifier: "DATA-1".into(),
+            ..RunRecord::default()
+        };
+        let run = Run::create(dir.path(), record).unwrap();
+        std::fs::write(
+            run.record_path(),
+            r#"{"identifier":"DATA-1","size_source":"agent",
+                "routing":{"pid":4242,"started":"2026-01-01T00:00:00Z","output":""}}"#,
+        )
+        .unwrap();
+        let record = run.record().unwrap();
+        assert_eq!(
+            (record.identifier.as_str(), record.size_source.as_str()),
+            ("DATA-1", "agent")
+        );
+    }
+
+    #[test]
     fn runs_are_created_listed_and_updated_under_the_lock() {
         let dir = tempfile::tempdir().unwrap();
         let record = RunRecord {
@@ -414,10 +490,17 @@ mod tests {
         assert_eq!(Run::list(dir.path()).len(), 1);
         assert!(Run::load(dir.path(), "DATA-2").is_err());
 
-        run.append_conversation("2026-09-25T00:00:01Z", "user-1", "Please also fix B.\n")
+        let lock = run.lock().unwrap();
+        run.append_conversation_held(
+            &lock,
+            "2026-09-25T00:00:01Z",
+            "user-1",
+            "Please also fix B.\n",
+        )
+        .unwrap();
+        run.append_conversation_held(&lock, "2026-09-25T00:00:02Z", "user-1", "Thanks")
             .unwrap();
-        run.append_conversation("2026-09-25T00:00:02Z", "user-1", "Thanks")
-            .unwrap();
+        drop(lock);
         let text = std::fs::read_to_string(run.conversation_md()).unwrap();
         assert!(text.starts_with("# Conversation"));
         assert!(text.find("Please also fix B.").unwrap() < text.find("Thanks").unwrap());

@@ -3,6 +3,7 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -16,11 +17,14 @@ use tokio::time::{Instant, timeout_at};
 
 use super::{Agent, Event, HerdrError, Pane, PaneId, parse_event};
 
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
+pub(super) const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 
-#[derive(Debug, Clone)]
+/// A client of one session's socket. The ticker makes it before the
+/// session is found and fills the socket in later; until then every request
+/// is `NotSent`, so callers run as while Herdr is down.
+#[derive(Debug, Clone, Default)]
 pub struct Client {
-    pub socket: PathBuf,
+    socket: Arc<OnceLock<PathBuf>>,
 }
 
 /// `session.snapshot`: the complete view a decision reads. Entries that do
@@ -90,9 +94,14 @@ fn lenient<T: DeserializeOwned>(values: Vec<Value>, skipped: &mut usize) -> Vec<
 
 impl Client {
     pub fn new(socket: impl Into<PathBuf>) -> Self {
-        Self {
-            socket: socket.into(),
-        }
+        let client = Self::default();
+        client.set_socket(socket.into());
+        client
+    }
+
+    /// Fills in the socket of a client made without one; the first call wins.
+    pub fn set_socket(&self, socket: PathBuf) {
+        let _ = self.socket.set(socket);
     }
 
     /// Connects and writes one request, then reads its first line, all
@@ -103,7 +112,11 @@ impl Client {
         params: Value,
         deadline: Instant,
     ) -> Result<(String, Lines<BufReader<OwnedReadHalf>>, OwnedWriteHalf), HerdrError> {
-        let stream = timeout_at(deadline, UnixStream::connect(&self.socket))
+        let socket = self
+            .socket
+            .get()
+            .ok_or_else(|| HerdrError::NotSent("the Herdr session was not found yet".into()))?;
+        let stream = timeout_at(deadline, UnixStream::connect(socket))
             .await
             .map_err(|_| HerdrError::NotSent("connecting timed out".into()))?
             .map_err(|e| HerdrError::NotSent(e.to_string()))?;
@@ -203,12 +216,6 @@ impl Client {
         let Answer { snapshot } = self.call("session.snapshot", json!({})).await?;
         Ok(snapshot.version)
     }
-
-    pub async fn notification_show(&self, title: &str, body: &str) -> Result<(), HerdrError> {
-        self.call::<Value>("notification.show", json!({"title": title, "body": body}))
-            .await
-            .map(|_| ())
-    }
 }
 
 impl Subscription {
@@ -279,8 +286,8 @@ mod tests {
     use tokio::net::UnixListener;
 
     use super::*;
-    use crate::herdr::AgentStatus;
-    use crate::herdr::fake::{FakeHerdr, agent_json, pane_json};
+    use crate::herdr::fake::{FakeHerdrServer, agent_json, pane_json};
+    use crate::herdr::{AgentStatus, Herdr};
 
     #[test]
     fn a_session_socket_comes_from_the_session_list() {
@@ -303,7 +310,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_error_response_becomes_an_api_error() {
-        let fake = FakeHerdr::start().await;
+        let fake = FakeHerdrServer::start().await;
         fake.fail("session.snapshot", "server_busy", "try again later");
         let error = fake.client().snapshot().await.unwrap_err();
         assert_eq!(
@@ -312,6 +319,24 @@ mod tests {
                 code: "server_busy".into(),
                 message: "try again later".into(),
             }
+        );
+    }
+
+    #[tokio::test]
+    async fn a_client_is_not_sent_until_its_session_is_found() {
+        let fake = FakeHerdrServer::start().await;
+        let client = Client::default();
+        let error = client.snapshot().await.unwrap_err();
+        assert_eq!(
+            error,
+            HerdrError::NotSent("the Herdr session was not found yet".into())
+        );
+        client.clone().set_socket(fake.socket.clone());
+        assert_eq!(client.snapshot().await.unwrap().panes.len(), 0);
+        assert_eq!(
+            fake.requests().len(),
+            1,
+            "only the request after the socket was set"
         );
     }
 
@@ -361,7 +386,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_malformed_snapshot_entry_is_skipped() {
-        let fake = FakeHerdr::start().await;
+        let fake = FakeHerdrServer::start().await;
         let mut broken = agent_json("w1:p2", "codex", "idle", None);
         broken.as_object_mut().unwrap().remove("terminal_id");
         fake.set_snapshot(
@@ -403,7 +428,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_old_snapshot_still_gives_its_version() {
-        let fake = FakeHerdr::start().await;
+        let fake = FakeHerdrServer::start().await;
         fake.set_raw_snapshot(json!({"version": "0.8.0", "protocol": 20, "panes": {}}));
         let client = fake.client();
         assert!(matches!(

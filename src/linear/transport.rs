@@ -1,4 +1,5 @@
-//! One GraphQL request to Linear, bounded and without redirects or retries.
+//! The rules of one GraphQL request to Linear: the endpoint, the bounds, the
+//! decoding of an answer, and the viewer check.
 //!
 //! Reads go through the credential manager's verified-read lease: every read
 //! selects `viewer { id app isMe }`, and the response is accepted only when
@@ -7,127 +8,19 @@
 
 use std::time::Duration;
 
-use serde_json::{Value, json};
+use serde_json::Value;
 use zeroize::Zeroizing;
 
-use super::credentials::CredentialManager;
 use super::{ApiError, VerifiedReadOutcome};
 
 pub const GRAPHQL_ENDPOINT: &str = "https://api.linear.app/graphql";
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_ERROR_MESSAGE_CHARS: usize = 200;
 
-/// Sends one GraphQL operation and returns its `data` object.
-pub trait Transport {
-    fn execute(
-        &mut self,
-        operation: &str,
-        query: &str,
-        variables: Value,
-        write: bool,
-    ) -> Result<Value, ApiError>;
-}
-
-impl<T: Transport + ?Sized> Transport for Box<T> {
-    fn execute(
-        &mut self,
-        operation: &str,
-        query: &str,
-        variables: Value,
-        write: bool,
-    ) -> Result<Value, ApiError> {
-        (**self).execute(operation, query, variables, write)
-    }
-}
-
-/// The production transport: HTTPS to Linear with the Keychain-held token.
-pub struct HttpsTransport {
-    manager: CredentialManager,
-    client: oauth2::reqwest::blocking::Client,
-}
-
-impl HttpsTransport {
-    pub fn new(manager: CredentialManager) -> Result<Self, ApiError> {
-        let client = oauth2::reqwest::blocking::ClientBuilder::new()
-            .https_only(true)
-            .redirect(oauth2::reqwest::redirect::Policy::none())
-            .no_proxy()
-            .retry(oauth2::reqwest::retry::never())
-            .connect_timeout(CONNECT_TIMEOUT)
-            .timeout(REQUEST_TIMEOUT)
-            .build()
-            .map_err(|_| ApiError::ClientConfiguration)?;
-        Ok(Self { manager, client })
-    }
-
-    fn post(
-        client: &oauth2::reqwest::blocking::Client,
-        token: &str,
-        body: &[u8],
-    ) -> Result<Value, ApiError> {
-        use oauth2::reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderValue};
-        use std::io::Read;
-
-        let mut authorization = Zeroizing::new(Vec::with_capacity(7 + token.len()));
-        authorization.extend_from_slice(b"Bearer ");
-        authorization.extend_from_slice(token.as_bytes());
-        let mut authorization =
-            HeaderValue::from_bytes(&authorization).map_err(|_| ApiError::Configuration)?;
-        authorization.set_sensitive(true);
-        let response = client
-            .post(GRAPHQL_ENDPOINT)
-            .header(CONTENT_TYPE, "application/json")
-            .header(AUTHORIZATION, authorization)
-            .body(body.to_vec())
-            .send()
-            .map_err(|_| ApiError::RequestFailed)?;
-        let status = response.status().as_u16();
-        let json_content = json_content_type(
-            response
-                .headers()
-                .get_all(CONTENT_TYPE)
-                .iter()
-                .filter_map(|v| v.to_str().ok()),
-        );
-        let mut bytes = Vec::with_capacity(4096);
-        response
-            .take((MAX_RESPONSE_BYTES + 1) as u64)
-            .read_to_end(&mut bytes)
-            .map_err(|_| ApiError::RequestFailed)?;
-        if bytes.len() > MAX_RESPONSE_BYTES {
-            return Err(ApiError::ResponseTooLarge);
-        }
-        decode(status, json_content, &bytes)
-    }
-}
-
-impl Transport for HttpsTransport {
-    fn execute(
-        &mut self,
-        operation: &str,
-        query: &str,
-        variables: Value,
-        write: bool,
-    ) -> Result<Value, ApiError> {
-        let body = serde_json::to_vec(
-            &json!({ "operationName": operation, "query": query, "variables": variables }),
-        )
-        .map_err(|_| ApiError::Configuration)?;
-        let client = &self.client;
-        if write {
-            self.manager
-                .with_bound_access_token(|token| Self::post(client, token, &body))
-        } else {
-            self.manager
-                .with_verified_read(|token| verified(Self::post(client, token, &body)?))
-        }
-    }
-}
-
 /// Exactly one `application/json` content type, parameters allowed.
-fn json_content_type<'a>(mut values: impl Iterator<Item = &'a str>) -> bool {
+pub(crate) fn json_content_type<'a>(mut values: impl Iterator<Item = &'a str>) -> bool {
     let (Some(value), None) = (values.next(), values.next()) else {
         return false;
     };
@@ -139,8 +32,13 @@ fn json_content_type<'a>(mut values: impl Iterator<Item = &'a str>) -> bool {
         .eq_ignore_ascii_case("application/json")
 }
 
-/// A GraphQL response's `data`, or the first error it reports.
+/// A GraphQL response's `data`, or the first error it reports. HTTP 429 and
+/// a GraphQL error whose `extensions.code` is `RATELIMITED` (Linear answers
+/// those with HTTP 400) are `RateLimited`, never a definitive refusal.
 pub fn decode(status: u16, json_content: bool, body: &[u8]) -> Result<Value, ApiError> {
+    if status == 429 {
+        return Err(ApiError::RateLimited);
+    }
     if !json_content {
         return Err(if status == 200 {
             ApiError::ContentType
@@ -155,7 +53,17 @@ pub fn decode(status: u16, json_content: bool, body: &[u8]) -> Result<Value, Api
             ApiError::HttpStatus(status)
         }
     })?;
-    if let Some(error) = reply["errors"].as_array().and_then(|errors| errors.first()) {
+    let errors = reply["errors"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    if errors
+        .iter()
+        .any(|error| error["extensions"]["code"] == "RATELIMITED")
+    {
+        return Err(ApiError::RateLimited);
+    }
+    if let Some(error) = errors.first() {
         let message = error["extensions"]["userPresentableMessage"]
             .as_str()
             .or_else(|| error["message"].as_str())
@@ -195,6 +103,8 @@ pub(crate) fn verified(data: Value) -> Result<VerifiedReadOutcome<Value>, ApiErr
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
 
     #[test]
@@ -214,7 +124,6 @@ mod tests {
         );
         assert_eq!(decode(200, false, b"{}"), Err(ApiError::ContentType));
         assert_eq!(decode(200, true, b"{}"), Err(ApiError::ReadFieldsInvalid));
-        assert_eq!(decode(429, true, b"{}"), Err(ApiError::HttpStatus(429)));
         assert!(json_content_type(
             ["application/json; charset=utf-8"].into_iter()
         ));
@@ -222,6 +131,40 @@ mod tests {
             ["application/json", "text/html"].into_iter()
         ));
         assert!(!json_content_type(std::iter::empty()));
+    }
+
+    #[test]
+    fn rate_limits_decode_apart_from_refusals() {
+        assert_eq!(
+            decode(
+                400,
+                true,
+                br#"{"errors":[{"message":"Rate limit exceeded","extensions":{"code":"RATELIMITED"}}]}"#
+            ),
+            Err(ApiError::RateLimited)
+        );
+        assert_eq!(
+            decode(429, false, b"Too Many Requests"),
+            Err(ApiError::RateLimited)
+        );
+        assert_eq!(decode(429, true, b"{}"), Err(ApiError::RateLimited));
+        assert_eq!(
+            decode(
+                400,
+                true,
+                br#"{"errors":[{"message":"Entity not found","extensions":{"code":"INVALID_INPUT"}}]}"#
+            ),
+            Err(ApiError::Graphql("Entity not found".into()))
+        );
+        assert_eq!(
+            decode(502, false, b"<html>"),
+            Err(ApiError::HttpStatus(502))
+        );
+        assert_eq!(decode(200, true, br#"{"data":{"x":1}}"#).unwrap()["x"], 1);
+        assert_eq!(
+            ApiError::RateLimited.to_string(),
+            "Linear rate-limited the request"
+        );
     }
 
     #[test]

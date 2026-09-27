@@ -50,6 +50,12 @@ pub struct Linear {
     /// The workflow state an issue moves to on `finish`.
     #[serde(default = "default_review_state")]
     pub review_state: String,
+    /// Seconds between two polls of the delegated issues.
+    #[serde(default = "default_linear_interval")]
+    pub intake_interval_seconds: u64,
+    /// Seconds between two reads of the active runs.
+    #[serde(default = "default_linear_interval")]
+    pub run_read_interval_seconds: u64,
 }
 
 fn default_callback_port() -> u16 {
@@ -59,6 +65,13 @@ fn default_callback_port() -> u16 {
 fn default_review_state() -> String {
     "In Review".into()
 }
+
+fn default_linear_interval() -> u64 {
+    5
+}
+
+/// The longest Linear interval accepted: one hour.
+const MAX_LINEAR_INTERVAL: u64 = 3600;
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -264,6 +277,18 @@ impl Config {
             !linear.review_state.trim().is_empty(),
             "linear.review_state is empty"
         );
+        for (key, seconds) in [
+            ("intake_interval_seconds", linear.intake_interval_seconds),
+            (
+                "run_read_interval_seconds",
+                linear.run_read_interval_seconds,
+            ),
+        ] {
+            ensure!(
+                (1..=MAX_LINEAR_INTERVAL).contains(&seconds),
+                "linear.{key} must be between 1 and {MAX_LINEAR_INTERVAL}"
+            );
+        }
         let limits = &self.limits;
         ensure!(
             limits.max_runs >= 1 && limits.max_workers_per_run >= 1 && limits.max_agents >= 2,
@@ -485,6 +510,43 @@ coordinator = "coordinator-light"
             "[profiles.router]\nkind = \"cursor\"\neffort = \"high\"",
         );
         assert!(Config::parse(&cursor).is_err());
+    }
+
+    #[test]
+    fn linear_intervals_default_to_five_seconds_and_are_checked() {
+        let config = Config::parse(SAMPLE).unwrap();
+        assert_eq!(
+            (
+                config.linear.intake_interval_seconds,
+                config.linear.run_read_interval_seconds
+            ),
+            (5, 5)
+        );
+        let set = |lines: &str| {
+            Config::parse(&SAMPLE.replacen(
+                "teams = [\"DATA\"]",
+                &format!("teams = [\"DATA\"]\n{lines}"),
+                1,
+            ))
+        };
+        let config = set("intake_interval_seconds = 30\nrun_read_interval_seconds = 10").unwrap();
+        assert_eq!(
+            (
+                config.linear.intake_interval_seconds,
+                config.linear.run_read_interval_seconds
+            ),
+            (30, 10)
+        );
+        assert_eq!(
+            set("intake_interval_seconds = 0").unwrap_err().to_string(),
+            "linear.intake_interval_seconds must be between 1 and 3600"
+        );
+        assert_eq!(
+            set("run_read_interval_seconds = 3601")
+                .unwrap_err()
+                .to_string(),
+            "linear.run_read_interval_seconds must be between 1 and 3600"
+        );
     }
 
     #[test]

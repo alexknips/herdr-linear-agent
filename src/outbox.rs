@@ -10,13 +10,13 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::files;
 use crate::linear::ApiError;
-use crate::linear::api::{Activity, ExternalUrl, IssueDetail, Linear};
-use crate::linear::transport::Transport;
-use crate::run::Run;
+use crate::linear::api::{Activity, Content, ExternalUrl, IssueDetail};
+use crate::linear::client::LinearApi;
+use crate::run::{Run, RunLock};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -38,6 +38,22 @@ pub enum Op {
     IssueState { target: StateTarget },
 }
 
+impl Op {
+    /// A question; with options, Linear shows them as a select.
+    pub fn elicitation(body: impl Into<String>, options: &[(&str, &str)]) -> Op {
+        let mut activity = Activity::new(Content::Elicitation { body: body.into() });
+        if !options.is_empty() {
+            activity.signal = Some("select".into());
+            let options: Vec<_> = options
+                .iter()
+                .map(|(label, value)| json!({ "label": label, "value": value }))
+                .collect();
+            activity.signal_metadata = Some(json!({ "options": options }));
+        }
+        Op::Activity { activity }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Request {
     /// A UUIDv4; an activity is created with it as its ID.
@@ -57,7 +73,13 @@ fn outbox_dir(run: &Run) -> PathBuf {
 /// Queues one request. File names carry a counter allocated under the run
 /// lock, so requests are sent in the order they were written.
 pub fn push(run: &Run, op: Op) -> Result<String> {
-    let _lock = run.lock()?;
+    let lock = run.lock()?;
+    push_held(run, &lock, op)
+}
+
+/// `push` for a caller that holds the run lock, so a request is queued in
+/// the same critical section as the record field that guards it.
+pub fn push_held(run: &Run, _lock: &RunLock, op: Op) -> Result<String> {
     let counter_path = run.state_dir().join("outbox-counter.json");
     let n: u64 = files::read_json::<u64>(&counter_path).unwrap_or(0) + 1;
     files::write_json(&counter_path, &n)?;
@@ -71,8 +93,7 @@ pub fn push(run: &Run, op: Op) -> Result<String> {
     Ok(request.id)
 }
 
-/// Queued requests, oldest first. A file that does not parse is moved aside.
-pub fn pending(run: &Run) -> Vec<(PathBuf, Request)> {
+fn queued_paths(run: &Run) -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir(outbox_dir(run)) else {
         return Vec::new();
     };
@@ -83,6 +104,26 @@ pub fn pending(run: &Run) -> Vec<(PathBuf, Request)> {
         .collect();
     paths.sort();
     paths
+}
+
+/// Whether any request file waits, parsed or not. Read-only: the Linear
+/// task alone moves, rewrites or removes outbox files.
+pub fn is_empty(run: &Run) -> bool {
+    queued_paths(run).is_empty()
+}
+
+/// The requests that parse, oldest first, read-only like [`is_empty`].
+pub fn queued(run: &Run) -> Vec<Request> {
+    queued_paths(run)
+        .iter()
+        .filter_map(|path| files::read_json::<Request>(path))
+        .collect()
+}
+
+/// Queued requests, oldest first. A file that does not parse is moved
+/// aside. Only the Linear task calls it.
+pub fn pending(run: &Run) -> Vec<(PathBuf, Request)> {
+    queued_paths(run)
         .into_iter()
         .filter_map(|path| match files::read_json::<Request>(&path) {
             Some(request) => Some((path, request)),
@@ -117,13 +158,15 @@ pub struct Sent {
     pub activity_sent: bool,
 }
 
-/// Sends a run's queued requests in order until one cannot be sent.
-pub fn send<T: Transport>(
+/// Sends a run's queued requests in order until one cannot be sent. An
+/// attempted activity is looked up before it is sent again; a refusal is set
+/// aside; `RateLimited` is not definitive, so such a request stays queued.
+pub async fn send(
     run: &Run,
     session_id: &str,
     issue_id: &str,
     review_state: &str,
-    linear: &mut Linear<T>,
+    linear: &impl LinearApi,
 ) -> Sent {
     let mut sent = Sent {
         count: 0,
@@ -132,14 +175,15 @@ pub fn send<T: Transport>(
         activity_sent: false,
     };
     for (path, mut request) in pending(run) {
-        let outcome = (|| -> Result<(), ApiError> {
-            if request.attempted && already_applied(&request, session_id, linear)? {
-                return Ok(());
-            }
-            request.attempted = true;
-            files::write_json(&path, &request).map_err(|_| ApiError::Configuration)?;
-            apply(&request, session_id, issue_id, review_state, linear)
-        })();
+        let outcome = send_one(
+            &path,
+            &mut request,
+            session_id,
+            issue_id,
+            review_state,
+            linear,
+        )
+        .await;
         match outcome {
             Ok(()) => {
                 let _ = std::fs::remove_file(&path);
@@ -159,38 +203,43 @@ pub fn send<T: Transport>(
     sent
 }
 
-fn already_applied<T: Transport>(
-    request: &Request,
-    session_id: &str,
-    linear: &mut Linear<T>,
-) -> Result<bool, ApiError> {
-    match &request.op {
-        Op::Activity { .. } => linear.activity_exists(session_id, &request.id),
-        // Replacing the plan or the URL list is idempotent, and a state move
-        // reads the issue before it writes.
-        Op::Plan { .. } | Op::ExternalUrls { .. } | Op::IssueState { .. } => Ok(false),
-    }
-}
-
-fn apply<T: Transport>(
-    request: &Request,
+async fn send_one(
+    path: &Path,
+    request: &mut Request,
     session_id: &str,
     issue_id: &str,
     review_state: &str,
-    linear: &mut Linear<T>,
+    linear: &impl LinearApi,
 ) -> Result<(), ApiError> {
+    let checked = match &request.op {
+        Op::Activity { .. } if request.attempted => {
+            linear.activity_exists(session_id, &request.id).await?
+        }
+        // Replacing the plan or the URL list is idempotent, and a state move
+        // reads the issue before it writes.
+        _ => false,
+    };
+    if checked {
+        return Ok(());
+    }
+    request.attempted = true;
+    files::write_json(path, request).map_err(|_| ApiError::Configuration)?;
     match &request.op {
-        Op::Activity { activity } => linear.create_activity(session_id, &request.id, activity),
-        Op::Plan { plan } => linear.set_plan(session_id, plan),
-        Op::ExternalUrls { urls } => linear.set_external_urls(session_id, urls),
+        Op::Activity { activity } => {
+            linear
+                .create_activity(session_id, &request.id, activity)
+                .await
+        }
+        Op::Plan { plan } => linear.set_plan(session_id, plan).await,
+        Op::ExternalUrls { urls } => linear.set_external_urls(session_id, urls).await,
         Op::IssueState { target } => {
-            let issue = linear.issue(issue_id)?;
+            let issue = linear.issue(issue_id).await?;
             let Some(state_id) = target_state(&issue, *target, review_state)? else {
                 return Ok(());
             };
-            linear.set_issue_state(issue_id, &state_id)?;
+            linear.set_issue_state(issue_id, &state_id).await?;
             // The write is confirmed by reading the issue again.
-            if linear.issue(issue_id)?.state.id != state_id {
+            if linear.issue(issue_id).await?.state.id != state_id {
                 return Err(ApiError::RequestFailed);
             }
             Ok(())
@@ -282,6 +331,8 @@ pub fn parse_plan(text: &str) -> Result<Value> {
 mod tests {
     use super::*;
     use crate::linear::api::Content;
+    use std::sync::Mutex;
+
     use crate::linear::api::fake::FakeLinear;
     use crate::run::RunRecord;
 
@@ -291,7 +342,7 @@ mod tests {
         }
     }
 
-    fn setup() -> (tempfile::TempDir, Run, Linear<FakeLinear>, String, String) {
+    fn setup() -> (tempfile::TempDir, Run, Mutex<FakeLinear>, String, String) {
         let dir = tempfile::tempdir().unwrap();
         let run = Run::create(
             dir.path(),
@@ -303,14 +354,13 @@ mod tests {
         .unwrap();
         let mut fake = FakeLinear::default();
         let issue = fake.add_issue("DATA-1", "DATA", "First");
-        let mut linear = Linear::new(fake);
-        let session = linear.open_session(&issue).unwrap();
-        (dir, run, linear, session, issue)
+        let session = fake.delegate_session("DATA-1");
+        (dir, run, Mutex::new(fake), session, issue)
     }
 
-    #[test]
-    fn requests_go_out_in_order_and_are_removed() {
-        let (_dir, run, mut linear, session, issue) = setup();
+    #[tokio::test]
+    async fn requests_go_out_in_order_and_are_removed() {
+        let (_dir, run, linear, session, issue) = setup();
         push(&run, thought("one")).unwrap();
         push(
             &run,
@@ -327,11 +377,11 @@ mod tests {
             },
         )
         .unwrap();
-        let sent = send(&run, &session, &issue, "In Review", &mut linear);
+        let sent = send(&run, &session, &issue, "In Review", &linear).await;
         assert_eq!(sent.count, 4);
         assert!(sent.activity_sent && sent.blocked.is_none());
         assert!(pending(&run).is_empty());
-        let fake = linear.transport();
+        let fake = linear.lock().unwrap();
         let bodies: Vec<Value> = fake.sessions[0]
             .sent("thought")
             .iter()
@@ -349,30 +399,31 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_lost_response_is_checked_by_a_read_and_never_sent_twice() {
-        let (_dir, run, mut linear, session, issue) = setup();
+    #[tokio::test]
+    async fn a_lost_response_is_checked_by_a_read_and_never_sent_twice() {
+        let (_dir, run, linear, session, issue) = setup();
         push(&run, thought("once")).unwrap();
-        linear.transport().lose_next_response = true;
-        let sent = send(&run, &session, &issue, "In Review", &mut linear);
+        linear.lock().unwrap().lose_next_response = true;
+        let sent = send(&run, &session, &issue, "In Review", &linear).await;
         assert_eq!(sent.blocked, Some(ApiError::RequestFailed));
         assert!(pending(&run)[0].1.attempted);
-        let sent = send(&run, &session, &issue, "In Review", &mut linear);
+        let sent = send(&run, &session, &issue, "In Review", &linear).await;
         assert_eq!(sent.count, 1);
-        assert_eq!(linear.transport().sessions[0].sent("thought").len(), 1);
-        assert_eq!(linear.transport().count("HlaActivityFind"), 1);
+        let fake = linear.lock().unwrap();
+        assert_eq!(fake.sessions[0].sent("thought").len(), 1);
+        assert_eq!(fake.count("HlaActivityFind"), 1);
     }
 
-    #[test]
-    fn a_failure_keeps_the_rest_in_order_and_a_refusal_is_set_aside() {
-        let (_dir, run, mut linear, session, issue) = setup();
+    #[tokio::test]
+    async fn a_failure_keeps_the_rest_in_order_and_a_refusal_is_set_aside() {
+        let (_dir, run, linear, session, issue) = setup();
         push(&run, thought("a")).unwrap();
         push(&run, thought("b")).unwrap();
-        linear.transport().fail_next = Some(ApiError::HttpStatus(503));
-        let sent = send(&run, &session, &issue, "In Review", &mut linear);
+        linear.lock().unwrap().fail_next = Some(ApiError::HttpStatus(503));
+        let sent = send(&run, &session, &issue, "In Review", &linear).await;
         assert_eq!((sent.count, pending(&run).len()), (0, 2));
         // An attempted request whose send never reached Linear is read, then sent.
-        let sent = send(&run, &session, &issue, "In Review", &mut linear);
+        let sent = send(&run, &session, &issue, "In Review", &linear).await;
         assert_eq!(sent.count, 2);
 
         push(
@@ -383,7 +434,7 @@ mod tests {
         )
         .unwrap();
         push(&run, thought("after")).unwrap();
-        let sent = send(&run, &session, &issue, "Missing State", &mut linear);
+        let sent = send(&run, &session, &issue, "Missing State", &linear).await;
         assert_eq!(sent.refused.len(), 1);
         assert_eq!(sent.count, 1);
         assert!(
@@ -396,10 +447,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn state_targets_leave_later_states_alone() {
-        let (_dir, _run, mut linear, _session, issue) = setup();
-        let mut detail = linear.issue(&issue).unwrap();
+    #[tokio::test]
+    async fn state_targets_leave_later_states_alone() {
+        let (_dir, _run, linear, _session, issue) = setup();
+        let mut detail = linear.issue(&issue).await.unwrap();
         assert_eq!(
             target_state(&detail, StateTarget::Started, "In Review")
                 .unwrap()

@@ -1,65 +1,101 @@
-//! Progress self-reporting: an agent runs `report` in its own pane, and one
-//! JSON record per pane under `<state>/progress/` feeds the ticker. The
-//! binding is the pane id Herdr hands every pane shell; there is nothing to
-//! mint and no daemon. Outside a Herdr pane the command does nothing.
-
-// Derived from herdr-projects v0.2.11 (https://github.com/eliasstravik/herdr-projects).
-// Copyright (c) 2026 Elias Stravik. MIT License; see NOTICE.
+//! `report`: a worker tells how far it got, from its own pane. The record is
+//! kept under the state folder for the ticker's groups, and the activity is
+//! shown in Herdr as a pane token.
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::files;
-use crate::herdr_cli::{CALL_TIMEOUT, Herdr};
-use crate::paths::{Ctx, Env};
-use crate::runner::Runner;
+use crate::herdr::{self, Herdr, PaneId};
+use crate::paths::Env;
 
-pub const ACTIVITY_COLUMNS: usize = 40;
-pub const ACTIVITY_TTL_MS: u64 = 300_000;
+/// The activity a worker reports when it waits on the coordinator.
 pub const WAITING: &str = "Waiting for you";
-pub const DONE: &str = "Done";
-/// The source Herdr shows for this plugin's pane metadata.
+/// The metadata source of every pane token the plugin reports.
 pub const SOURCE: &str = "herdr-linear-agent";
+pub const TOKEN_TTL_MS: u64 = 300_000;
+const ACTIVITY_COLUMNS: usize = 40;
 
-/// One pane's self-report.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Record {
     pub socket: String,
     pub pane_id: String,
-    /// Pane ids restart from `w1` after a server restart; the terminal id tells
-    /// a stale record from a live pane that reused the id.
     pub terminal_id: String,
     pub activity: String,
+    /// `None` for `--unknown`.
     pub percent: Option<u8>,
-    /// Unix seconds of the last `report`.
+    /// Seconds since the Unix epoch.
     pub reported_at: i64,
 }
 
 impl Record {
     pub fn waiting(&self) -> bool {
-        self.reported_at > 0 && self.activity == WAITING
-    }
-
-    pub fn done(&self) -> bool {
-        self.reported_at > 0 && self.percent == Some(100)
+        self.activity == WAITING
     }
 }
 
-pub fn dir(state_dir: &Path) -> PathBuf {
+fn is_wide(c: char) -> bool {
+    matches!(u32::from(c),
+        0x1100..=0x115F
+        | 0x2E80..=0x303E
+        | 0x3041..=0x33FF
+        | 0x3400..=0x4DBF
+        | 0x4E00..=0x9FFF
+        | 0xA000..=0xA4CF
+        | 0xAC00..=0xD7A3
+        | 0xF900..=0xFAFF
+        | 0xFE30..=0xFE4F
+        | 0xFF00..=0xFF60
+        | 0xFFE0..=0xFFE6
+        | 0x1F300..=0x1F64F
+        | 0x1F900..=0x1F9FF
+        | 0x20000..=0x3FFFD)
+}
+
+fn is_bidi_control(c: char) -> bool {
+    matches!(c, '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
+}
+
+/// Trimmed, without control or bidirectional-override characters, and cut
+/// to `columns` display columns (a wide character counts two).
+pub fn clean(text: &str, columns: usize) -> String {
+    let mut out = String::new();
+    let mut used = 0;
+    for c in text
+        .trim()
+        .chars()
+        .filter(|&c| !c.is_control() && !is_bidi_control(c))
+    {
+        let width = if is_wide(c) { 2 } else { 1 };
+        if used + width > columns {
+            break;
+        }
+        used += width;
+        out.push(c);
+    }
+    out.trim_end().to_string()
+}
+
+fn dir(state_dir: &Path) -> PathBuf {
     state_dir.join("progress")
 }
 
-/// `<pane id>-<short hash of the socket path>.json`: pane ids repeat across sessions.
-pub fn path(state_dir: &Path, socket: &str, pane_id: &str) -> PathBuf {
-    let hash = &files::sha256_hex(socket.as_bytes())[..8];
-    dir(state_dir).join(format!("{}-{hash}.json", pane_id.replace(':', "_")))
-}
-
-pub fn load(state_dir: &Path, socket: &str, pane_id: &str) -> Option<Record> {
-    files::read_json(&path(state_dir, socket, pane_id))
+fn path(state_dir: &Path, socket: &str, pane: &str) -> PathBuf {
+    let pane: String = pane
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let hash = files::sha256_hex(socket.as_bytes());
+    dir(state_dir).join(format!("{pane}-{}.json", &hash[..16]))
 }
 
 pub fn save(state_dir: &Path, record: &Record) -> Result<()> {
@@ -67,234 +103,262 @@ pub fn save(state_dir: &Path, record: &Record) -> Result<()> {
     files::write_json(&path(state_dir, &record.socket, &record.pane_id), record)
 }
 
-/// At most `columns` columns, no control or bidi characters, trimmed.
-pub fn clean(input: &str, columns: usize) -> String {
-    let mut width = 0;
-    input
-        .chars()
-        .filter(|c| {
-            !c.is_control() && !matches!(*c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
-        })
-        .take(120)
-        .take_while(|c| {
-            // East Asian wide characters take two columns; everything else one.
-            let wide = ('\u{1100}'..='\u{115f}').contains(c)
-                || ('\u{2e80}'..='\u{a4cf}').contains(c)
-                || ('\u{ac00}'..='\u{d7a3}').contains(c)
-                || ('\u{f900}'..='\u{faff}').contains(c)
-                || ('\u{fe30}'..='\u{fe4f}').contains(c)
-                || ('\u{ff00}'..='\u{ff60}').contains(c)
-                || ('\u{ffe0}'..='\u{ffe6}').contains(c)
-                || ('\u{1f300}'..='\u{1f64f}').contains(c)
-                || ('\u{1f900}'..='\u{1f9ff}').contains(c)
-                || ('\u{20000}'..='\u{3fffd}').contains(c);
-            width += if wide { 2 } else { 1 };
-            width <= columns
-        })
-        .collect::<String>()
-        .trim()
-        .to_string()
+pub fn load(state_dir: &Path, socket: &str, pane: &str) -> Option<Record> {
+    files::read_json::<Record>(&path(state_dir, socket, pane))
+        .filter(|r| r.socket == socket && r.pane_id == pane)
 }
 
-/// The calling pane, when this process runs inside a Herdr pane: the id
-/// Herdr shows for it and its terminal id. `None` outside Herdr.
-pub struct Current {
-    pub socket: String,
-    pub pane_id: String,
-    pub terminal_id: String,
+/// The pane's record, unless it was written from another terminal than the
+/// pane's current one (a new process in a reused pane id).
+pub fn self_report(state_dir: &Path, socket: &str, pane: &str, terminal: &str) -> Option<Record> {
+    load(state_dir, socket, pane).filter(|r| terminal.is_empty() || r.terminal_id == terminal)
 }
 
-pub fn current(env: &Env, runner: &dyn Runner) -> Option<Current> {
-    if env.var("HERDR_ENV") != Some("1") {
-        return None;
-    }
-    env.var("HERDR_PANE_ID")?;
-    let socket = env.var("HERDR_SOCKET_PATH")?.to_string();
-    let herdr = Herdr::new(env.herdr_bin(), &socket, runner);
-    let result = herdr
-        .call(&["pane", "current", "--current"], CALL_TIMEOUT)
-        .ok()?;
-    let pane = &result["pane"];
-    Some(Current {
-        socket,
-        pane_id: pane["pane_id"].as_str()?.to_string(),
-        terminal_id: pane["terminal_id"].as_str().unwrap_or("").to_string(),
-    })
-}
-
-/// `report --percent N|--unknown --activity "..."`, run by an agent in its
-/// pane. Writes the record and one `hla_activity` pane token with a TTL, so
-/// silence clears the activity after five minutes with no daemon.
-pub fn report(ctx: &Ctx, percent: Option<u8>, activity: &str) -> Result<()> {
-    if percent.is_some_and(|p| p > 100) {
-        bail!("--percent must be 0 to 100");
-    }
-    let Some(pane) = current(ctx.env, ctx.runner) else {
-        println!("not inside a Herdr pane; nothing reported");
-        return Ok(());
-    };
-    let activity = if percent == Some(100) {
-        DONE.to_string()
-    } else {
-        clean(activity, ACTIVITY_COLUMNS)
-    };
-    if activity.is_empty() {
-        bail!("--activity is empty");
-    }
-    let state_dir = ctx.ensure_state_dir()?;
-    let record = Record {
-        socket: pane.socket.clone(),
-        pane_id: pane.pane_id.clone(),
-        terminal_id: pane.terminal_id,
-        activity: activity.clone(),
-        percent,
-        reported_at: jiff::Timestamp::now().as_second(),
-    };
-    save(&state_dir, &record)?;
-    let herdr = Herdr::new(ctx.env.herdr_bin(), &pane.socket, ctx.runner);
-    let token = format!("hla_activity={activity}");
-    let ttl = ACTIVITY_TTL_MS.to_string();
-    match herdr.call(
-        &[
-            "pane",
-            "report-metadata",
-            &pane.pane_id,
-            "--source",
-            SOURCE,
-            "--token",
-            &token,
-            "--ttl-ms",
-            &ttl,
-        ],
-        CALL_TIMEOUT,
-    ) {
-        Ok(_) => println!(
-            "recorded: {}{activity}",
-            percent.map(|p| format!("{p}% · ")).unwrap_or_default()
-        ),
-        Err(error) => println!("recorded; the pane token was not set ({error})"),
-    }
-    Ok(())
-}
-
-/// The record for a pane, or nothing when it is missing, was never reported,
-/// or describes an earlier pane with the same id.
-pub fn self_report(
-    state_dir: &Path,
-    socket: &str,
-    pane_id: &str,
-    terminal_id: &str,
-) -> Option<Record> {
-    let record = load(state_dir, socket, pane_id)?;
-    if !terminal_id.is_empty()
-        && !record.terminal_id.is_empty()
-        && record.terminal_id != terminal_id
-    {
-        return None;
-    }
-    (record.reported_at > 0).then_some(record)
-}
-
-/// Drops records whose pane is no longer listed in the session they belong to.
-/// Only records of `socket` are judged: other sessions' records are theirs.
-pub fn prune(state_dir: &Path, socket: &str, live_pane_ids: &[String]) {
+/// Removes this socket's records of panes that no longer exist.
+pub fn prune(state_dir: &Path, socket: &str, live: &[String]) {
     let Ok(entries) = std::fs::read_dir(dir(state_dir)) else {
         return;
     };
     for entry in entries.flatten() {
-        if let Some(record) = files::read_json::<Record>(&entry.path())
-            && record.socket == socket
-            && !live_pane_ids.contains(&record.pane_id)
-        {
+        let Some(record) = files::read_json::<Record>(&entry.path()) else {
+            continue;
+        };
+        if record.socket == socket && !live.contains(&record.pane_id) {
             let _ = std::fs::remove_file(entry.path());
         }
     }
 }
 
+/// `report`: outside a Herdr pane it does nothing.
+pub async fn report(env: &Env, percent: Option<u8>, activity: &str) -> Result<()> {
+    if percent.is_some_and(|p| p > 100) {
+        bail!("--percent is at most 100");
+    }
+    let var = |key| env.var(key).filter(|v| !v.is_empty());
+    let (Some("1"), Some(pane), Some(socket)) = (
+        var("HERDR_ENV"),
+        var("HERDR_PANE_ID"),
+        var("HERDR_SOCKET_PATH"),
+    ) else {
+        return Ok(());
+    };
+    let client = herdr::Client::new(socket);
+    report_in_pane(
+        &env.state_dir(),
+        &client,
+        socket,
+        &PaneId(pane.into()),
+        percent,
+        activity,
+        jiff::Timestamp::now().as_second(),
+    )
+    .await
+}
+
+pub async fn report_in_pane<H: Herdr>(
+    state_dir: &Path,
+    herdr: &H,
+    socket: &str,
+    caller: &PaneId,
+    percent: Option<u8>,
+    activity: &str,
+    now: i64,
+) -> Result<()> {
+    let activity = clean(activity, ACTIVITY_COLUMNS);
+    let pane = herdr
+        .pane_current(caller)
+        .await
+        .context("Herdr does not know this pane")?;
+    save(
+        state_dir,
+        &Record {
+            socket: socket.into(),
+            pane_id: pane.id.0.clone(),
+            terminal_id: pane.terminal,
+            activity: activity.clone(),
+            percent,
+            reported_at: now,
+        },
+    )?;
+    crate::ticker::poke(state_dir);
+    // The record is what the ticker reads; a token that did not reach Herdr
+    // only leaves the pane's label stale.
+    let _ = herdr
+        .report_metadata(
+            &pane.id,
+            SOURCE,
+            "",
+            &[("hla_activity".into(), activity)],
+            TOKEN_TTL_MS,
+        )
+        .await;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runner::fake::{FakeRunner, ok};
+    use crate::herdr::FakeHerdr;
 
-    #[test]
-    fn activity_is_cleaned_and_capped_at_forty_columns() {
-        assert_eq!(clean("  Reading code\n", 40), "Reading code");
-        assert_eq!(clean(&"x".repeat(60), 40).len(), 40);
-        assert_eq!(clean("a\u{202e}b\u{7}c", 40), "abc");
-        assert_eq!(clean("日本語テキスト", 6), "日本語");
+    const WORK_SOCKET: &str = "/tmp/herdr-work.sock";
+    const SIDE_SOCKET: &str = "/tmp/herdr-side.sock";
+
+    fn progress_of(socket: &str, pane: &str, terminal: &str) -> Record {
+        Record {
+            socket: socket.into(),
+            pane_id: pane.into(),
+            terminal_id: terminal.into(),
+            activity: "Writing the handler".into(),
+            percent: Some(55),
+            reported_at: 1_790_000_000,
+        }
     }
 
     #[test]
-    fn records_round_trip_per_session_and_stale_terminals_are_ignored() {
+    fn an_activity_is_trimmed_stripped_and_cut_to_its_columns() {
+        let table = [
+            ("  Running the suite \n", 40, "Running the suite"),
+            ("Fix\u{7}ing\u{1b} the build", 40, "Fixing the build"),
+            ("left\u{202E}right\u{2066}\u{200F}", 40, "leftright"),
+            ("日本語テキスト", 6, "日本語"),
+            ("日本語テキスト", 7, "日本語"),
+            ("abc def", 4, "abc"),
+        ];
+        for (raw, columns, expected) in table {
+            assert_eq!(clean(raw, columns), expected, "{raw:?} at {columns}");
+        }
+        assert_eq!(clean(&"q".repeat(55), ACTIVITY_COLUMNS), "q".repeat(40));
+        assert_eq!(clean(&"字".repeat(33), ACTIVITY_COLUMNS), "字".repeat(20));
+    }
+
+    #[test]
+    fn records_are_kept_per_socket_and_pane() {
         let state = tempfile::tempdir().unwrap();
-        let record = Record {
-            socket: "/a.sock".into(),
-            pane_id: "w1:p1".into(),
-            terminal_id: "term_1".into(),
-            activity: WAITING.into(),
-            reported_at: 7,
-            ..Record::default()
-        };
-        save(state.path(), &record).unwrap();
-        let other = Record {
-            socket: "/b.sock".into(),
-            pane_id: "w1:p1".into(),
-            terminal_id: "term_9".into(),
-            activity: "Testing".into(),
-            reported_at: 8,
-            ..Record::default()
-        };
-        save(state.path(), &other).unwrap();
-        assert_eq!(load(state.path(), "/a.sock", "w1:p1").unwrap(), record);
-        assert!(
-            self_report(state.path(), "/a.sock", "w1:p1", "term_1")
-                .unwrap()
-                .waiting()
-        );
-        assert!(self_report(state.path(), "/a.sock", "w1:p1", "term_2").is_none());
-        assert!(self_report(state.path(), "/a.sock", "w1:p1", "").is_some());
-        prune(state.path(), "/a.sock", &["w1:p2".into()]);
-        assert!(load(state.path(), "/a.sock", "w1:p1").is_none());
-        assert!(load(state.path(), "/b.sock", "w1:p1").is_some());
+        let mine = progress_of(WORK_SOCKET, "w1:p1", "term-1");
+        save(state.path(), &mine).unwrap();
+        assert_eq!(load(state.path(), WORK_SOCKET, "w1:p1"), Some(mine));
+        assert_eq!(load(state.path(), SIDE_SOCKET, "w1:p1"), None);
+        assert_eq!(load(state.path(), WORK_SOCKET, "w1:p2"), None);
+        assert!(state.path().join("progress").is_dir());
     }
 
     #[test]
-    fn report_writes_the_record_and_a_token_inside_a_pane() {
+    fn a_record_from_an_earlier_terminal_of_the_pane_is_not_its_self_report() {
+        let state = tempfile::tempdir().unwrap();
+        let mine = progress_of(WORK_SOCKET, "w2:p1", "term-7");
+        save(state.path(), &mine).unwrap();
+        let table = [("term-7", true), ("", true), ("term-8", false)];
+        for (terminal, counts) in table {
+            let found = self_report(state.path(), WORK_SOCKET, "w2:p1", terminal);
+            assert_eq!(found.is_some(), counts, "terminal {terminal:?}");
+        }
+    }
+
+    #[test]
+    fn pruning_touches_only_gone_panes_of_the_same_socket() {
+        let state = tempfile::tempdir().unwrap();
+        for (socket, pane) in [
+            (WORK_SOCKET, "w1:p1"),
+            (WORK_SOCKET, "w2:p1"),
+            (SIDE_SOCKET, "w2:p1"),
+        ] {
+            save(state.path(), &progress_of(socket, pane, "term-1")).unwrap();
+        }
+        prune(state.path(), WORK_SOCKET, &["w1:p1".to_string()]);
+        assert!(load(state.path(), WORK_SOCKET, "w1:p1").is_some());
+        assert!(load(state.path(), WORK_SOCKET, "w2:p1").is_none());
+        assert!(load(state.path(), SIDE_SOCKET, "w2:p1").is_some());
+    }
+
+    #[test]
+    fn only_the_exact_waiting_activity_waits() {
+        assert_eq!(WAITING, "Waiting for you");
+        let mut record = progress_of(WORK_SOCKET, "w1:p1", "term-1");
+        assert!(!record.waiting());
+        record.activity = "Waiting for you".into();
+        assert!(record.waiting());
+        record.activity = "Waiting for you to merge".into();
+        assert!(!record.waiting());
+    }
+
+    #[tokio::test]
+    async fn a_report_in_a_pane_saves_its_record_and_sets_the_activity_token() {
         let home = tempfile::tempdir().unwrap();
         let state = home.path().join("state");
-        let env = Env::for_test(
-            home.path(),
-            &[
-                ("HERDR_ENV", "1"),
-                ("HERDR_PANE_ID", "w1:p1"),
-                ("HERDR_SOCKET_PATH", "/s.sock"),
-                ("XDG_STATE_HOME", state.to_str().unwrap()),
-            ],
-        );
-        let runner = FakeRunner::new();
-        runner.on(
-            "pane current",
-            ok(r#"{"result":{"pane":{"pane_id":"w1:p1","terminal_id":"t1"}}}"#),
-        );
-        runner.on("pane report-metadata", ok(""));
-        let ctx = Ctx {
-            env: &env,
-            runner: &runner,
-            detached_ticker: false,
-        };
-        report(&ctx, None, WAITING).unwrap();
-        let record = load(&env.state_dir(), "/s.sock", "w1:p1").unwrap();
-        assert!(record.waiting());
-        assert_eq!(runner.count("--token hla_activity=Waiting for you"), 1);
-        assert!(report(&ctx, Some(101), "x").is_err());
+        let herdr = FakeHerdr::new(home.path());
+        let pane = herdr.add_pane("/wt/api");
 
-        // Outside a pane nothing is written.
-        let outside = Env::for_test(home.path(), &[]);
-        let ctx = Ctx {
-            env: &outside,
-            runner: &runner,
-            detached_ticker: false,
-        };
-        report(&ctx, Some(10), "Reading").unwrap();
+        report_in_pane(
+            &state,
+            &herdr,
+            WORK_SOCKET,
+            &pane,
+            Some(40),
+            " Running tests\u{7} ",
+            1_790_000_123,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            load(&state, WORK_SOCKET, &pane.0),
+            Some(Record {
+                socket: WORK_SOCKET.into(),
+                pane_id: "w1:p1".into(),
+                terminal_id: "term-1".into(),
+                activity: "Running tests".into(),
+                percent: Some(40),
+                reported_at: 1_790_000_123,
+            })
+        );
+        assert_eq!(herdr.requests(), ["pane.current", "pane.report_metadata"]);
+        let [token] = herdr.metadata().try_into().unwrap();
+        assert_eq!(token.pane, pane);
+        assert_eq!(token.source, "herdr-linear-agent");
+        assert_eq!(
+            token.tokens,
+            [("hla_activity".to_string(), "Running tests".to_string())]
+        );
+        assert_eq!(token.ttl_ms, 300_000);
+
+        report_in_pane(
+            &state,
+            &herdr,
+            WORK_SOCKET,
+            &pane,
+            None,
+            "Scoping",
+            1_790_000_200,
+        )
+        .await
+        .unwrap();
+        let unknown = load(&state, WORK_SOCKET, &pane.0).unwrap();
+        assert_eq!(
+            (unknown.percent, unknown.activity.as_str()),
+            (None, "Scoping")
+        );
+    }
+
+    #[tokio::test]
+    async fn outside_a_pane_nothing_is_written_and_a_percent_over_a_hundred_fails() {
+        let home = tempfile::tempdir().unwrap();
+        let partial: [&[(&str, &str)]; 3] = [
+            &[],
+            &[
+                ("HERDR_ENV", "0"),
+                ("HERDR_PANE_ID", "w1:p1"),
+                ("HERDR_SOCKET_PATH", WORK_SOCKET),
+            ],
+            &[("HERDR_ENV", "1"), ("HERDR_PANE_ID", "w1:p1")],
+        ];
+        for vars in partial {
+            let env = Env::for_test(home.path(), vars);
+            report(&env, Some(10), "Reading").await.unwrap();
+            assert!(!env.state_dir().exists(), "{vars:?}");
+        }
+        let env = Env::for_test(home.path(), &[]);
+        let refused = report(&env, Some(101), "Reading").await.unwrap_err();
+        assert!(refused.to_string().contains("at most 100"), "{refused}");
+        report(&env, Some(100), "Done").await.unwrap();
     }
 }

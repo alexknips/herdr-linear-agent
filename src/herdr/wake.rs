@@ -232,7 +232,7 @@ impl Connection<'_> {
 mod tests {
     use super::*;
     use crate::herdr::AgentStatus;
-    use crate::herdr::fake::{FakeHerdr, agent_json, pane_json};
+    use crate::herdr::fake::{FakeHerdrServer, agent_json, pane_json};
 
     async fn wait(
         rx: &mut watch::Receiver<Link>,
@@ -262,7 +262,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_pane_created_during_the_bootstrap_snapshot_is_followed() {
-        let fake = FakeHerdr::start().await;
+        let fake = FakeHerdrServer::start().await;
         fake.set_snapshot(vec![pane_json("w1:p1", "/a")], vec![]);
         let release = fake.hold_snapshot();
         let mut rx = wake(fake.client());
@@ -284,7 +284,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_new_pane_gets_a_status_subscription() {
-        let fake = FakeHerdr::start().await;
+        let fake = FakeHerdrServer::start().await;
         fake.set_snapshot(vec![pane_json("w1:p1", "/a")], vec![]);
         let mut rx = wake(fake.client());
         fake.wait_request(status_for("w1:p1")).await;
@@ -309,7 +309,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_status_lost_during_a_replacement_wakes_after_the_new_ack() {
-        let fake = FakeHerdr::start().await;
+        let fake = FakeHerdrServer::start().await;
         fake.set_snapshot(
             vec![pane_json("w1:p1", "/a")],
             vec![agent_json("w1:p1", "claude", "working", Some("c"))],
@@ -345,7 +345,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_unparseable_event_is_skipped() {
-        let fake = FakeHerdr::start().await;
+        let fake = FakeHerdrServer::start().await;
         let mut rx = wake(fake.client());
         let link = wait(&mut rx, "connected", |l| l.connected).await;
         fake.push_line("this is not json").await;
@@ -365,7 +365,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_refused_status_subscription_is_retried_without_disconnecting() {
-        let fake = FakeHerdr::start().await;
+        let fake = FakeHerdrServer::start().await;
         fake.set_snapshot(vec![pane_json("w1:p1", "/a")], vec![]);
         fake.refuse_status(Some("pane_not_found"));
         let mut rx = wake(fake.client());
@@ -388,7 +388,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_restart_disconnects_and_reconnects() {
-        let mut fake = FakeHerdr::start().await;
+        let mut fake = FakeHerdrServer::start().await;
         fake.set_snapshot(vec![pane_json("w1:p1", "/a")], vec![]);
         let mut rx = wake(fake.client());
         let up = wait(&mut rx, "connected", |l| l.connected).await;

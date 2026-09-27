@@ -6,32 +6,32 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 
 use crate::config::Config;
-use crate::herdr::{self, Client, HerdrError};
-use crate::herdr_cli::{self, Herdr};
-use crate::linear::api::Linear;
+use crate::herdr::{self, Client, Herdr, HerdrError, WorkspaceId};
+use crate::linear::client::LinearApi;
 use crate::linear::credentials::{CredentialManager, CredentialStatus};
-use crate::linear::transport::HttpsTransport;
 use crate::paths::Ctx;
+use crate::process::Cmd;
 use crate::run::{AgentStatus, Run, Status};
-use crate::runner::Cmd;
 use crate::{ticker, worker};
 
 const TITLE: &str = "herdr-linear-agent";
 
-/// Runs a Herdr socket call from an action. Actions run on a blocking thread
-/// of the runtime, where waiting for a future is allowed.
-fn block_on<F: Future>(future: F) -> F::Output {
-    tokio::runtime::Handle::current().block_on(future)
+/// Runs a synchronous credential or OAuth call off the runtime's threads.
+async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+    match tokio::task::spawn_blocking(f).await {
+        Ok(value) => value,
+        Err(error) => std::panic::resume_unwind(error.into_panic()),
+    }
 }
 
 /// Prints `body` and shows it as a notification in the invoking session, or
 /// in the configured one.
-fn tell(ctx: &Ctx, body: &str) {
+async fn tell(ctx: &Ctx<'_>, body: &str) {
     println!("{body}");
     let session = Config::load(&ctx.config_dir())
         .ok()
         .and_then(|c| c.herdr.session);
-    let _ = block_on(async {
+    let shown = async {
         // The session the action was invoked from, when there is one.
         let socket = match ctx.env.var("HERDR_SOCKET_PATH").filter(|s| !s.is_empty()) {
             Some(socket) => socket.into(),
@@ -39,7 +39,8 @@ fn tell(ctx: &Ctx, body: &str) {
         };
         Client::new(socket).notification_show(TITLE, body).await?;
         anyhow::Ok(())
-    });
+    };
+    let _ = shown.await;
 }
 
 /// The actions the plugin manifest declares.
@@ -54,23 +55,23 @@ pub enum Action {
     Doctor,
 }
 
-pub fn run(ctx: &Ctx, action: Action) -> Result<()> {
+pub async fn run(ctx: &Ctx<'_>, action: Action) -> Result<()> {
     let result = match action {
-        Action::Login => login(ctx),
+        Action::Login => login(ctx).await,
         Action::Status => Ok(status_text(ctx)),
-        Action::OpenIssue => open_issue(ctx),
-        Action::FocusRun => focus_run(ctx),
-        Action::Pause => pause(ctx, true),
-        Action::Resume => pause(ctx, false),
-        Action::Doctor => doctor(ctx),
+        Action::OpenIssue => open_issue(ctx).await,
+        Action::FocusRun => focus_run(ctx).await,
+        Action::Pause => pause(ctx, true).await,
+        Action::Resume => pause(ctx, false).await,
+        Action::Doctor => doctor(ctx).await,
     };
     match result {
         Ok(message) => {
-            tell(ctx, &message);
+            tell(ctx, &message).await;
             Ok(())
         }
         Err(error) => {
-            tell(ctx, &format!("{action:?} failed: {error:#}"));
+            tell(ctx, &format!("{action:?} failed: {error:#}")).await;
             Err(error)
         }
     }
@@ -83,27 +84,30 @@ fn credential_lock(ctx: &Ctx) -> Result<std::path::PathBuf> {
 /// Authorizes the app in the browser, stores the token in the Keychain and
 /// checks that the token acts as an app user. A stored credential is revoked
 /// and replaced.
-fn login(ctx: &Ctx) -> Result<String> {
+async fn login(ctx: &Ctx<'_>) -> Result<String> {
     let config = Config::load(&ctx.config_dir())?;
     let lock = credential_lock(ctx)?;
-    let mut manager = CredentialManager::production(
-        config.linear.client_id.clone(),
-        config.linear.callback_port,
-        lock.clone(),
-    )?;
-    if manager.status() != CredentialStatus::SignedOut {
-        manager
-            .logout(true)
-            .context("could not revoke the stored credential")?;
-    }
-    manager.login()?;
-    let manager = CredentialManager::production(
+    let (client_id, port) = (config.linear.client_id.clone(), config.linear.callback_port);
+    let login_lock = lock.clone();
+    blocking(move || -> Result<()> {
+        let mut manager = CredentialManager::production(client_id, port, login_lock)?;
+        if manager.status() != CredentialStatus::SignedOut {
+            manager
+                .logout(true)
+                .context("could not revoke the stored credential")?;
+        }
+        manager.login()?;
+        Ok(())
+    })
+    .await?;
+    let linear = crate::linear::client::Client::production(
         config.linear.client_id.clone(),
         config.linear.callback_port,
         lock,
-    )?;
-    let viewer = Linear::new(HttpsTransport::new(manager)?).viewer()?;
-    ticker::start(ctx)?;
+    )
+    .await?;
+    let viewer = linear.viewer().await?;
+    ticker::start(ctx).await?;
     Ok(format!(
         "Logged in to Linear as the app user {}.",
         if viewer.name.is_empty() {
@@ -172,14 +176,14 @@ pub fn status_text(ctx: &Ctx) -> String {
     lines.join("\n")
 }
 
-fn pause(ctx: &Ctx, paused: bool) -> Result<String> {
+async fn pause(ctx: &Ctx<'_>, paused: bool) -> Result<String> {
     let flag = ctx.ensure_state_dir()?.join("paused");
     if paused {
         std::fs::write(&flag, b"")?;
         Ok("Paused: new issues are not picked up. Running runs continue.".into())
     } else {
         let _ = std::fs::remove_file(&flag);
-        ticker::start(ctx)?;
+        ticker::start(ctx).await?;
         Ok("Resumed: delegated issues are picked up again.".into())
     }
 }
@@ -208,13 +212,14 @@ pub fn run_for_cwd(ctx: &Ctx, cwd: &str) -> Option<Run> {
     })
 }
 
-fn open_issue(ctx: &Ctx) -> Result<String> {
+async fn open_issue(ctx: &Ctx<'_>) -> Result<String> {
     let cwd = invoking_cwd(ctx).context("this action needs a pane of a run")?;
     let run = run_for_cwd(ctx, &cwd).context("this pane does not belong to a run")?;
     let record = run.record()?;
     let out = ctx
         .runner
-        .run(&Cmd::new(crate::files::OPEN_COMMAND, Duration::from_secs(10)).arg(&record.url))?;
+        .run(&Cmd::new(crate::files::OPEN_COMMAND, Duration::from_secs(10)).arg(&record.url))
+        .await?;
     if !out.success() {
         bail!("could not open {}: {}", record.url, out.error_text());
     }
@@ -228,7 +233,7 @@ pub fn key_from_url(url: &str) -> Option<String> {
     crate::run::validate_key(key).ok().map(|_| key.to_string())
 }
 
-fn focus_run(ctx: &Ctx) -> Result<String> {
+async fn focus_run(ctx: &Ctx<'_>) -> Result<String> {
     let url = ctx
         .env
         .var("HERDR_PLUGIN_CLICKED_URL")
@@ -241,19 +246,27 @@ fn focus_run(ctx: &Ctx) -> Result<String> {
         bail!("{key} has no coordinator workspace yet");
     }
     let config = Config::load(&ctx.config_dir())?;
-    let socket = herdr_cli::session_socket(
-        &ctx.env.herdr_bin(),
-        ctx.runner,
-        config.herdr.session.as_deref(),
-    )?;
-    let herdr = Herdr::new(ctx.env.herdr_bin(), socket, ctx.runner);
-    let agents = herdr.agent_list()?;
-    let workspace = worker::find_agent(&record.coordinator, &agents)
-        .map_or(record.coordinator.workspace_id.clone(), |a| {
-            a.workspace_id.clone()
-        });
-    herdr.workspace_focus(&workspace)?;
+    let socket =
+        herdr::session_socket(&ctx.env.herdr_bin(), config.herdr.session.as_deref()).await?;
+    let client = Client::new(socket);
+    focus_coordinator(&client, &record.coordinator).await?;
     Ok(format!("Focused the run of {key}."))
+}
+
+/// Focuses the coordinator's live workspace, or else the recorded one.
+async fn focus_coordinator<H: Herdr>(
+    herdr: &H,
+    coordinator: &crate::run::AgentRecord,
+) -> Result<()> {
+    let snapshot = herdr.snapshot().await?;
+    let workspace = worker::find_agent(coordinator, &snapshot.agents)
+        .and_then(|a| snapshot.panes.get(&a.pane))
+        .map_or_else(
+            || WorkspaceId(coordinator.workspace_id.clone()),
+            |pane| pane.workspace.clone(),
+        );
+    herdr.workspace_focus(&workspace).await?;
+    Ok(())
 }
 
 /// The executable Herdr starts for an agent kind.
@@ -283,18 +296,15 @@ async fn herdr_version(client: Client) -> (Option<String>, Option<HerdrError>) {
 }
 
 /// Checks the setup and lists every problem found.
-fn doctor(ctx: &Ctx) -> Result<String> {
+async fn doctor(ctx: &Ctx<'_>) -> Result<String> {
     let mut ok = Vec::new();
     let mut problems = Vec::new();
     let config = Config::load(&ctx.config_dir());
     // Without a config this is the default session.
     let session = config.as_ref().ok().and_then(|c| c.herdr.session.clone());
-    let socket = block_on(herdr::session_socket(
-        &ctx.env.herdr_bin(),
-        session.as_deref(),
-    ));
+    let socket = herdr::session_socket(&ctx.env.herdr_bin(), session.as_deref()).await;
     let (version, error) = match &socket {
-        Ok(socket) => block_on(herdr_version(Client::new(socket))),
+        Ok(socket) => herdr_version(Client::new(socket)).await,
         Err(_) => (None, None),
     };
     match (&version, &error, &socket) {
@@ -351,9 +361,11 @@ fn doctor(ctx: &Ctx) -> Result<String> {
                 ));
             }
         }
-        match CredentialManager::production_status(ctx.state_dir().join("credentials.lock"))
-            .map(|mut m| m.status())
-        {
+        let lock = ctx.state_dir().join("credentials.lock");
+        let status =
+            blocking(move || CredentialManager::production_status(lock).map(|mut m| m.status()))
+                .await;
+        match status {
             Ok(CredentialStatus::Ready | CredentialStatus::ExpiredOrRefreshNeeded) => {
                 ok.push("Linear credential stored".into())
             }
@@ -395,9 +407,10 @@ fn doctor(ctx: &Ctx) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::herdr::FakeHerdr;
     use crate::paths::Env;
+    use crate::process::fake::FakeRunner;
     use crate::run::RunRecord;
-    use crate::runner::fake::FakeRunner;
 
     #[test]
     fn issue_urls_give_their_key() {
@@ -416,8 +429,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn status_lists_runs_and_panes_map_to_their_run() {
+    #[tokio::test]
+    async fn status_lists_runs_and_panes_map_to_their_run() {
         let home = tempfile::tempdir().unwrap();
         let env = Env::for_test(home.path(), &[]);
         let runner = FakeRunner::new();
@@ -465,9 +478,36 @@ mod tests {
         );
         assert!(run_for_cwd(&ctx, "/elsewhere").is_none());
 
-        pause(&ctx, true).unwrap();
+        pause(&ctx, true).await.unwrap();
         assert!(status_text(&ctx).contains("paused"));
-        pause(&ctx, false).unwrap();
+        pause(&ctx, false).await.unwrap();
         assert!(!status_text(&ctx).contains("paused"));
+    }
+
+    #[tokio::test]
+    async fn focus_prefers_the_coordinators_live_workspace() {
+        let home = tempfile::tempdir().unwrap();
+        let herdr = FakeHerdr::new(home.path());
+        let placed = herdr.workspace_create("/run", "DATA-1 x").await.unwrap();
+        let coordinator = crate::run::AgentRecord {
+            status: AgentStatus::Open,
+            kind: "claude".into(),
+            agent_name: "data-1-coordinator".into(),
+            pane_id: "w1:p1".into(),
+            // Recorded before Herdr renumbered the workspace.
+            workspace_id: "w9".into(),
+            cwd: "/run".into(),
+            ..Default::default()
+        };
+        focus_coordinator(&herdr, &coordinator).await.unwrap();
+        herdr
+            .agent_start("data-1-coordinator", "claude", &placed.pane, &[])
+            .await
+            .unwrap();
+        focus_coordinator(&herdr, &coordinator).await.unwrap();
+        assert_eq!(
+            herdr.focused(),
+            [WorkspaceId("w9".into()), placed.workspace]
+        );
     }
 }

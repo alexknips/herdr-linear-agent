@@ -8,12 +8,12 @@ use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 
 use crate::actions::{self, Action};
-use crate::commands::{self, WorkerStart};
+use crate::commands::{self, Session, WorkerStart};
 use crate::config::Config;
 use crate::files::read_text_arg;
 use crate::herdr;
 use crate::paths::{Ctx, Env};
-use crate::runner::RealRunner;
+use crate::process::RealRunner;
 use crate::{progress, ticker};
 
 #[derive(Parser)]
@@ -177,16 +177,88 @@ fn parse_option(text: &str) -> Result<(String, String), String> {
 }
 
 pub async fn run() -> Result<()> {
-    match Cli::parse().command {
+    let command = Cli::parse().command;
+    let env = Env::from_process()?;
+    let runner = RealRunner;
+    let ctx = Ctx {
+        env: &env,
+        runner: &runner,
+        detached_ticker: true,
+    };
+    match command {
         Command::Debug {
             command: DebugCommand::HerdrWatch { socket },
         } => herdr_watch(socket).await,
-        // The existing commands block (the Linear client is blocking
-        // reqwest), so they must stay off the runtime's worker threads.
-        command => match tokio::task::spawn_blocking(move || run_blocking(command)).await {
-            Ok(result) => result,
-            Err(error) => std::panic::resume_unwind(error.into_panic()),
+        Command::Startup => ticker::start(&ctx).await,
+        Command::Action { action } => actions::run(&ctx, action).await,
+        Command::Ticker { command } => match command {
+            TickerCommand::Start => ticker::start(&ctx).await,
+            TickerCommand::Stop => ticker::stop(&ctx.state_dir()).await,
+            TickerCommand::Status => {
+                println!("{}", ticker::describe(&ctx.state_dir()));
+                Ok(())
+            }
+            TickerCommand::Run => ticker::run(&ctx).await,
         },
+        Command::Skill { key } => commands::skill(key.as_deref()),
+        Command::Context { key } => {
+            // Without Herdr the digest shows the recorded groups.
+            let session = Session::configured(&ctx).await.ok();
+            commands::context(&ctx, session.as_ref(), &key).await
+        }
+        Command::Inbox {
+            command: InboxCommand::Done { key, ids, all },
+        } => commands::inbox_done(&ctx, &key, &ids, all),
+        Command::Plan {
+            command: PlanCommand::Set { key, file },
+        } => commands::plan_set(&ctx, &key, &read_text_arg(&file)?).await,
+        Command::Say(args) => {
+            commands::say(&ctx, &args.key, &read_text_arg(&args.text_file)?).await
+        }
+        Command::Ask { text, options } => {
+            commands::ask(&ctx, &text.key, &read_text_arg(&text.text_file)?, &options).await
+        }
+        Command::Finish(args) => {
+            let text = read_text_arg(&args.text_file)?;
+            let session = Session::configured(&ctx).await?;
+            commands::finish(&ctx, &session, &args.key, &text).await
+        }
+        Command::Worker { command } => worker(&ctx, command).await,
+        Command::Report(args) => {
+            progress::report(&env, args.percent.filter(|_| !args.unknown), &args.activity).await
+        }
+    }
+}
+
+async fn worker(ctx: &Ctx<'_>, command: WorkerCommand) -> Result<()> {
+    let session = Session::configured(ctx).await?;
+    match command {
+        WorkerCommand::Start {
+            key,
+            repo,
+            profile,
+            title,
+            task_file,
+        } => {
+            let args = WorkerStart {
+                repo,
+                profile,
+                title,
+                task: read_text_arg(&task_file)?,
+            };
+            commands::worker_start(ctx, &session, &key, &args)
+                .await
+                .map(|_| ())
+        }
+        WorkerCommand::Prompt { key, id, text_file } => {
+            let text = read_text_arg(&text_file)?;
+            commands::worker_prompt(ctx, &session, &key, &id, &text).await
+        }
+        WorkerCommand::Restart { key, id, profile } => {
+            commands::worker_restart(ctx, &session, &key, &id, profile.as_deref())
+                .await
+                .map(|_| ())
+        }
     }
 }
 
@@ -229,73 +301,6 @@ async fn herdr_watch(socket: Option<PathBuf>) -> Result<()> {
         println!("{line}");
     }
     Ok(())
-}
-
-fn run_blocking(command: Command) -> Result<()> {
-    let env = Env::from_process()?;
-    let runner = RealRunner;
-    let ctx = Ctx {
-        env: &env,
-        runner: &runner,
-        detached_ticker: true,
-    };
-    match command {
-        Command::Debug { .. } => unreachable!("handled on the runtime"),
-        Command::Startup => ticker::start(&ctx),
-        Command::Action { action } => actions::run(&ctx, action),
-        Command::Ticker { command } => match command {
-            TickerCommand::Start => ticker::start(&ctx),
-            TickerCommand::Stop => ticker::stop(&ctx.state_dir()),
-            TickerCommand::Status => {
-                println!("{}", ticker::describe(&ctx.state_dir()));
-                Ok(())
-            }
-            TickerCommand::Run => ticker::run(&ctx),
-        },
-        Command::Skill { key } => commands::skill(key.as_deref()),
-        Command::Context { key } => commands::context(&ctx, &key),
-        Command::Inbox {
-            command: InboxCommand::Done { key, ids, all },
-        } => commands::inbox_done(&ctx, &key, &ids, all),
-        Command::Plan {
-            command: PlanCommand::Set { key, file },
-        } => commands::plan_set(&ctx, &key, &read_text_arg(&file)?),
-        Command::Say(args) => commands::say(&ctx, &args.key, &read_text_arg(&args.text_file)?),
-        Command::Ask { text, options } => {
-            commands::ask(&ctx, &text.key, &read_text_arg(&text.text_file)?, &options)
-        }
-        Command::Finish(args) => {
-            commands::finish(&ctx, &args.key, &read_text_arg(&args.text_file)?)
-        }
-        Command::Worker { command } => match command {
-            WorkerCommand::Start {
-                key,
-                repo,
-                profile,
-                title,
-                task_file,
-            } => commands::worker_start(
-                &ctx,
-                &key,
-                &WorkerStart {
-                    repo,
-                    profile,
-                    title,
-                    task: read_text_arg(&task_file)?,
-                },
-            )
-            .map(|_| ()),
-            WorkerCommand::Prompt { key, id, text_file } => {
-                commands::worker_prompt(&ctx, &key, &id, &read_text_arg(&text_file)?)
-            }
-            WorkerCommand::Restart { key, id, profile } => {
-                commands::worker_restart(&ctx, &key, &id, profile.as_deref()).map(|_| ())
-            }
-        },
-        Command::Report(args) => {
-            progress::report(&ctx, args.percent.filter(|_| !args.unknown), &args.activity)
-        }
-    }
 }
 
 #[cfg(test)]
