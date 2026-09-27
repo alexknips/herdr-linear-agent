@@ -914,3 +914,39 @@ fn a_claim_without_a_session_still_decides_its_coordinator() {
             .any(|a| a["content"]["body"] == "Picked up DATA-1.")
     );
 }
+
+#[test]
+fn pre_trust_marks_claude_folders_trusted_only_when_enabled() {
+    let trusted = |world: &World| -> Vec<String> {
+        let config: Value = serde_json::from_str(
+            &std::fs::read_to_string(world.home.path().join(".claude.json")).unwrap(),
+        )
+        .unwrap();
+        config["projects"]
+            .as_object()
+            .map(|p| p.keys().cloned().collect())
+            .unwrap_or_default()
+    };
+
+    let mut world = World::new();
+    std::fs::write(world.home.path().join(".claude.json"), "{}").unwrap();
+    world.started_run();
+    assert!(trusted(&world).is_empty(), "off by default");
+
+    let mut world = World::with_config(|c| c + "\n[claude]\npre_trust = true\n");
+    std::fs::write(world.home.path().join(".claude.json"), "{}").unwrap();
+    world.started_run();
+    let run_dir = world
+        .run("DATA-1")
+        .canonical_dir()
+        .to_string_lossy()
+        .into_owned();
+    assert_eq!(trusted(&world), std::slice::from_ref(&run_dir));
+    let w = world.start_worker("api");
+    world.tick();
+    let all = trusted(&world);
+    assert!(
+        all.contains(&w.agent.cwd) && all.contains(&w.repo_path),
+        "{all:?}"
+    );
+}

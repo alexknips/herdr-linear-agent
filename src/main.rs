@@ -1,5 +1,6 @@
 mod actions;
 mod agents;
+mod claude_trust;
 mod cli;
 mod commands;
 mod config;

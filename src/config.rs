@@ -27,6 +27,8 @@ pub struct Config {
     #[serde(default)]
     pub notifications: Notifications,
     #[serde(default)]
+    pub claude: Claude,
+    #[serde(default)]
     pub repositories: BTreeMap<String, Repository>,
     #[serde(default)]
     pub profiles: BTreeMap<String, Profile>,
@@ -96,6 +98,15 @@ impl Default for Notifications {
     fn default() -> Self {
         Notifications { herdr: true }
     }
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields, default)]
+pub struct Claude {
+    /// Before starting Claude Code in a run folder or a worktree, mark the
+    /// folder (and the worktree's main checkout) trusted in `~/.claude.json`,
+    /// so the session does not stop at its workspace trust dialog.
+    pub pre_trust: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]

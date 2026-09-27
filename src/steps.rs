@@ -957,41 +957,32 @@ pub fn launch(t: &Tick, run: &Run, nudged: &mut HashMap<String, String>) -> Resu
     let c = record.coordinator.clone();
     if c.status == AgentStatus::Pending && !c.profile.is_empty() && record.routing.is_none() {
         place_coordinator(t, run, &record)?;
-    } else if c.status == AgentStatus::Open {
-        let profile = t
-            .config
-            .profile(&c.profile)
-            .map(crate::agents::profile_args)
-            .unwrap_or_default();
-        if let Some(next) = launch_agent(
+    } else if c.status == AgentStatus::Open
+        && let Some(next) = launch_agent(
             t,
             run,
             &c,
-            &profile,
             &coordinator::launch_prompt(&run.key, c.resume),
             "the coordinator",
+            &[&c.cwd],
             &mut may_start,
-        )? {
-            run.update(|r| r.coordinator = next)?;
-        }
+        )?
+    {
+        run.update(|r| r.coordinator = next)?;
     }
     for w in worker::list(run)
         .into_iter()
         .filter(|w| w.agent.status == AgentStatus::Open)
     {
-        let profile = t
-            .config
-            .profile(&w.agent.profile)
-            .map(crate::agents::profile_args)
-            .unwrap_or_default();
         let before = w.agent.clone();
         if let Some(next) = launch_agent(
             t,
             run,
             &w.agent,
-            &profile,
             &worker::launch_prompt(&run.key, &w.id),
             &format!("worker {}", w.id),
+            // Claude Code checks a worktree's trust at its main checkout.
+            &[&w.agent.cwd, &w.repo_path],
             &mut may_start,
         )? {
             let started =
@@ -1071,9 +1062,9 @@ fn launch_agent(
     t: &Tick,
     run: &Run,
     record: &AgentRecord,
-    profile_args: &[String],
     prompt: &str,
     who: &str,
+    trust_dirs: &[&str],
     may_start: &mut bool,
 ) -> Result<Option<AgentRecord>> {
     let live = t.live(record);
@@ -1108,7 +1099,11 @@ fn launch_agent(
             if !std::mem::take(may_start) {
                 return Ok(None);
             }
-            let mut args = profile_args.to_vec();
+            let mut args = t
+                .config
+                .profile(&record.profile)
+                .map(agents::profile_args)
+                .unwrap_or_default();
             if record.resume
                 && let Some(resume) = agents::resume_args(&record.kind, &record.agent_session)
             {
@@ -1116,6 +1111,15 @@ fn launch_agent(
             }
             next.launch_attempts += 1;
             next.last_state_change = files::now();
+            if record.kind == "claude"
+                && t.config.claude.pre_trust
+                && let Err(error) = crate::claude_trust::trust(t.ctx.env, trust_dirs)
+            {
+                t.log.line(&format!(
+                    "{}: could not pre-trust {who}'s folder for Claude Code: {error:#}",
+                    run.key
+                ));
+            }
             match t
                 .herdr
                 .agent_start(&record.agent_name, &record.kind, &record.pane_id, &args)
