@@ -155,6 +155,9 @@ pub struct RunRecord {
     pub timeout_asked: bool,
     /// The coordinator's pane is gone and a resume question was asked.
     pub coordinator_lost: bool,
+    /// A person pressed stop: no prompt or heartbeat goes out until they
+    /// reply again. Inbox items are still written.
+    pub stopped: bool,
 }
 
 #[derive(Debug, Clone)]

@@ -950,3 +950,39 @@ fn the_trust_dialog_is_accepted_only_when_enabled() {
         "{all:?}"
     );
 }
+
+#[test]
+fn a_stop_holds_prompts_until_the_next_reply() {
+    let mut world = World::new();
+    let pane = world.started_run();
+    world
+        .fake()
+        .add_prompt("DATA-1", "user-1", "", Some("stop"));
+    world.tick();
+    assert!(world.run("DATA-1").record().unwrap().stopped);
+
+    crate::inbox::write(
+        &world.run("DATA-1"),
+        "worker",
+        "w1",
+        "w1 is idle without a report",
+    )
+    .unwrap();
+    world.age_coordinator("DATA-1", 120);
+    world.tick();
+    assert_eq!(
+        world.prompts_to(&pane).len(),
+        1,
+        "only the launch prompt while stopped"
+    );
+
+    world.fake().add_prompt("DATA-1", "user-1", "Go on.", None);
+    world.tick();
+    world.age_coordinator("DATA-1", 120);
+    world.tick();
+    assert!(!world.run("DATA-1").record().unwrap().stopped);
+    assert_eq!(
+        world.prompts_to(&pane).last().unwrap(),
+        crate::coordinator::NUDGE_REPLY
+    );
+}

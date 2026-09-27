@@ -170,6 +170,12 @@ pub fn digest(
     let _ = writeln!(out, "Run: {} {} ({state})", record.identifier, record.title);
     let _ = writeln!(out, "Issue: {}", record.url);
     let _ = writeln!(out, "Folder: {}", run.dir.display());
+    if record.stopped {
+        let _ = writeln!(
+            out,
+            "Note: a person stopped this run in Linear; do not continue until they reply."
+        );
+    }
     if record.timeout_asked {
         let _ = writeln!(
             out,

@@ -583,6 +583,7 @@ pub fn relay(t: &Tick, run: &Run, prompts: &[Prompt]) -> Result<()> {
         }
         if prompt.signal.as_deref() == Some("stop") {
             let stopped = interrupt_agents(t, run);
+            run.update(|r| r.stopped = true)?;
             outbox::push(
                 run,
                 Op::Activity {
@@ -607,6 +608,7 @@ pub fn relay(t: &Tick, run: &Run, prompts: &[Prompt]) -> Result<()> {
         )?;
         let resume = prompt.body.trim().eq_ignore_ascii_case("resume");
         run.update(|r| {
+            r.stopped = false;
             if r.timeout_asked {
                 r.timeout_asked = false;
                 r.timeout_since = files::now();
@@ -1148,7 +1150,7 @@ fn launch_agent(
 fn nudge(t: &Tick, run: &Run, nudged: &mut HashMap<String, String>) -> Result<()> {
     let record = run.record()?;
     let c = &record.coordinator;
-    if c.status != AgentStatus::Open || c.prompt_pending || record.timeout_asked {
+    if c.status != AgentStatus::Open || c.prompt_pending || record.timeout_asked || record.stopped {
         return Ok(());
     }
     let seen = inbox::seen(run);
@@ -1195,7 +1197,7 @@ fn nudge(t: &Tick, run: &Run, nudged: &mut HashMap<String, String>) -> Result<()
 /// from going stale; past `run_timeout_hours` a person is asked whether to go on.
 pub fn heartbeat(t: &Tick, run: &Run) -> Result<()> {
     let record = run.record()?;
-    if record.session_id.is_empty() {
+    if record.session_id.is_empty() || record.stopped {
         return Ok(());
     }
     if files::seconds_since(&record.last_activity, t.now) >= HEARTBEAT_SECS
