@@ -9,6 +9,7 @@
 //! is held.
 
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use serde_json::{Value, json};
 use tokio::sync::oneshot;
@@ -17,7 +18,7 @@ use zeroize::Zeroizing;
 pub use super::api::LinearApi;
 use super::credentials::{CredentialError, CredentialManager};
 use super::transport::{
-    CONNECT_TIMEOUT, GRAPHQL_ENDPOINT, MAX_RESPONSE_BYTES, REQUEST_TIMEOUT, decode,
+    CONNECT_TIMEOUT, GRAPHQL_ENDPOINT, MAX_RESPONSE_BYTES, REQUEST_TIMEOUT, RateHeaders, decode,
     json_content_type, verified,
 };
 use super::{ApiError, VerifiedReadOutcome};
@@ -60,6 +61,8 @@ pub struct Client {
     http: reqwest::Client,
     endpoint: &'static str,
     jobs: std::sync::mpsc::Sender<Job>,
+    /// The rate-limit headers of the responses not taken yet.
+    headers: Arc<Mutex<Vec<RateHeaders>>>,
 }
 
 impl Client {
@@ -122,6 +125,7 @@ impl Client {
             http,
             endpoint,
             jobs,
+            headers: Arc::default(),
         })
     }
 
@@ -140,10 +144,12 @@ impl Client {
         .map_err(|_| ApiError::Configuration)?;
         let http = self.http.clone();
         let endpoint = self.endpoint;
+        let headers = self.headers.clone();
         let runtime = tokio::runtime::Handle::current();
         let (answer, answered) = oneshot::channel();
         let job: Job = Box::new(move |lease| {
-            let send = |token: &str| runtime.block_on(post(&http, endpoint, token, &body));
+            let send =
+                |token: &str| runtime.block_on(post(&http, endpoint, token, &body, &headers));
             let result = if write {
                 lease.write(&mut |token| send(token))
             } else {
@@ -168,6 +174,10 @@ impl LinearApi for Client {
     ) -> Result<Value, ApiError> {
         self.request(operation, query, variables, write).await
     }
+
+    fn take_headers(&self) -> Vec<RateHeaders> {
+        std::mem::take(&mut *self.headers.lock().unwrap_or_else(PoisonError::into_inner))
+    }
 }
 
 async fn post(
@@ -175,6 +185,7 @@ async fn post(
     endpoint: &str,
     token: &str,
     body: &[u8],
+    headers: &Mutex<Vec<RateHeaders>>,
 ) -> Result<Value, ApiError> {
     use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderValue};
 
@@ -192,6 +203,10 @@ async fn post(
         .send()
         .await
         .map_err(|_| ApiError::RequestFailed)?;
+    headers
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .push(RateHeaders::parse(response.headers()));
     let status = response.status().as_u16();
     let json_content = json_content_type(
         response
@@ -228,6 +243,10 @@ impl LinearApi for std::sync::Mutex<super::api::fake::FakeLinear> {
             .unwrap()
             .execute(operation, query, variables, write);
         async move { result }
+    }
+
+    fn take_headers(&self) -> Vec<RateHeaders> {
+        std::mem::take(&mut self.lock().unwrap().received)
     }
 }
 

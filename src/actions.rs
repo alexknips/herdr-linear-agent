@@ -9,6 +9,7 @@ use crate::config::Config;
 use crate::herdr::{self, Client, Herdr, HerdrError, WorkspaceId};
 use crate::linear::client::LinearApi;
 use crate::linear::credentials::{CredentialManager, CredentialStatus};
+use crate::linear::transport::RateHeaders;
 use crate::paths::Ctx;
 use crate::process::Cmd;
 use crate::run::{AgentStatus, Run, Status};
@@ -295,6 +296,24 @@ async fn herdr_version(client: Client) -> (Option<String>, Option<HerdrError>) {
     }
 }
 
+/// The budget one viewer read reports; `None` when the read fails or a
+/// value is missing.
+async fn linear_budget(ctx: &Ctx<'_>, config: &Config) -> Option<String> {
+    let linear = crate::linear::client::Client::production(
+        config.linear.client_id.clone(),
+        config.linear.callback_port,
+        ctx.state_dir().join("credentials.lock"),
+    )
+    .await
+    .ok()?;
+    linear.viewer().await.ok()?;
+    let mut budget = RateHeaders::default();
+    for headers in linear.take_headers() {
+        budget.observe(&headers);
+    }
+    budget.describe()
+}
+
 /// Checks the setup and lists every problem found.
 async fn doctor(ctx: &Ctx<'_>) -> Result<String> {
     let mut ok = Vec::new();
@@ -365,6 +384,10 @@ async fn doctor(ctx: &Ctx<'_>) -> Result<String> {
         let status =
             blocking(move || CredentialManager::production_status(lock).map(|mut m| m.status()))
                 .await;
+        let stored = matches!(
+            status,
+            Ok(CredentialStatus::Ready | CredentialStatus::ExpiredOrRefreshNeeded)
+        );
         match status {
             Ok(CredentialStatus::Ready | CredentialStatus::ExpiredOrRefreshNeeded) => {
                 ok.push("Linear credential stored".into())
@@ -374,6 +397,15 @@ async fn doctor(ctx: &Ctx<'_>) -> Result<String> {
             )),
             Err(error) => problems.push(format!("Linear credential: {error}")),
         }
+        let budget = if stored {
+            linear_budget(ctx, config).await
+        } else {
+            None
+        };
+        ok.push(format!(
+            "Linear budget: {}",
+            budget.as_deref().unwrap_or("unknown")
+        ));
     }
     match ticker::lock_state(&ctx.state_dir()) {
         ticker::LockState::Held(info) if info.version == crate::VERSION => {

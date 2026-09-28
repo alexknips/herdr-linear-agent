@@ -14,11 +14,53 @@ use std::sync::Arc;
 use jiff::{SignedDuration, Timestamp};
 use tokio::sync::{Notify, mpsc, watch};
 
+use super::ApiError;
 use super::api::{self, IssueDetail, IssueRef, IssueStatus, RunUpdate};
 use super::client::LinearApi;
+use super::transport::RateHeaders;
 use crate::config;
 use crate::outbox;
 use crate::run::Run;
+
+/// Runs per batch of the run read until a batch has measured one run's cost.
+const FIRST_BATCH: usize = 10;
+/// A batch of the run read is kept under this many points, half the
+/// per-query limit.
+const BATCH_POINTS: u64 = 5_000;
+/// The longest pause after a rate limit that gave no reset time.
+const MAX_PAUSE: SignedDuration = SignedDuration::from_secs(300);
+
+/// What one read cost the last time it ran.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Cost {
+    requests: u64,
+    points: u64,
+}
+
+impl Cost {
+    /// Assumed for a read that has not been measured.
+    const UNMEASURED: Cost = Cost {
+        requests: 1,
+        points: 0,
+    };
+
+    /// The cost of the responses a read got; `None` when none arrived.
+    fn of(headers: &[RateHeaders]) -> Option<Cost> {
+        (!headers.is_empty()).then(|| Cost {
+            requests: headers.len() as u64,
+            points: headers.iter().filter_map(|h| h.cost).sum(),
+        })
+    }
+}
+
+/// The parts of a step, which run in an order that depends on the budget.
+#[derive(Clone, Copy)]
+enum Did {
+    Viewer,
+    Intake,
+    RunRead,
+    Flush,
+}
 
 /// The last successful poll of the delegated issues.
 #[derive(Debug, Clone, PartialEq)]
@@ -93,6 +135,24 @@ pub struct LinearTask {
     review_state: String,
     intake_interval: SignedDuration,
     run_read_interval: SignedDuration,
+    /// The intervals in effect: the configured ones, stretched while the
+    /// budget is short.
+    intake_every: SignedDuration,
+    read_every: SignedDuration,
+    /// Linear's budget as the latest responses reported it.
+    budget: RateHeaders,
+    intake_cost: Cost,
+    read_cost: Cost,
+    /// Points one run adds to a batch of the run read, once measured.
+    run_points: Option<u64>,
+    /// Fewer than 20% of the requests or of the points remain.
+    short: bool,
+    /// No read or write goes out before this.
+    paused_until: Option<Timestamp>,
+    /// Rate limits in a row that gave no reset time.
+    pauses: u32,
+    /// A request of this step was rate-limited.
+    limited: bool,
     level: LinearLevel,
     last_intake: Option<Timestamp>,
     last_read: Option<Timestamp>,
@@ -113,11 +173,23 @@ fn due(last: Option<Timestamp>, interval: SignedDuration, now: Timestamp) -> boo
 
 impl LinearTask {
     pub fn new(linear: &config::Linear) -> Self {
+        let intake_interval = seconds(linear.intake_interval_seconds);
+        let run_read_interval = seconds(linear.run_read_interval_seconds);
         LinearTask {
             teams: linear.teams.clone(),
             review_state: linear.review_state.clone(),
-            intake_interval: seconds(linear.intake_interval_seconds),
-            run_read_interval: seconds(linear.run_read_interval_seconds),
+            intake_interval,
+            run_read_interval,
+            intake_every: intake_interval,
+            read_every: run_read_interval,
+            budget: RateHeaders::default(),
+            intake_cost: Cost::UNMEASURED,
+            read_cost: Cost::UNMEASURED,
+            run_points: None,
+            short: false,
+            paused_until: None,
+            pauses: 0,
+            limited: false,
             level: LinearLevel::default(),
             last_intake: None,
             last_read: None,
@@ -144,17 +216,26 @@ impl LinearTask {
         std::mem::take(&mut self.log)
     }
 
-    /// When the next interval is due.
+    #[cfg(test)]
+    pub fn budget(&self) -> &RateHeaders {
+        &self.budget
+    }
+
+    /// When the next interval is due, or the pause ends.
     pub fn next_due(&self, now: Timestamp) -> Timestamp {
-        let intake = self.last_intake.map_or(now, |at| at + self.intake_interval);
-        let read = self.last_read.map_or(now, |at| at + self.run_read_interval);
-        intake.min(read)
+        let intake = self.last_intake.map_or(now, |at| at + self.intake_every);
+        let read = self.last_read.map_or(now, |at| at + self.read_every);
+        let next = intake.min(read);
+        self.paused_until.map_or(next, |until| next.max(until))
     }
 
     /// One round: the viewer while unknown, the delegated poll and the run
-    /// read when their intervals are due, then the flush. Each event goes to
-    /// `events` as soon as it happened, so the reconciler sees a run's flush
-    /// as soon as it finishes. It neither sleeps nor reads the clock.
+    /// read when their intervals are due, then the flush; while the budget
+    /// is short the flush goes first and the run read before the delegated
+    /// poll. A rate limit ends the round and pauses every read and write.
+    /// Each event goes to `events` as soon as it happened, so the reconciler
+    /// sees a run's flush as soon as it finishes. It neither sleeps nor reads
+    /// the clock.
     pub async fn step_into(
         &mut self,
         client: &impl LinearApi,
@@ -176,32 +257,194 @@ impl LinearTask {
             let _ = events.send(LinearEvent::WritesRecovered { issue_id }).await;
         }
 
+        if self.paused_until.is_some_and(|until| now < until) {
+            return;
+        }
+        self.paused_until = None;
+        self.limited = false;
+        let order = if self.short {
+            [Did::Flush, Did::Viewer, Did::RunRead, Did::Intake]
+        } else {
+            [Did::Viewer, Did::Intake, Did::RunRead, Did::Flush]
+        };
         // The viewer is retried on the run-read interval; run reads wait for it.
-        let read_due = due(self.last_read, self.run_read_interval, now);
-        if read_due {
-            self.last_read = Some(now);
-            if self.level.app_user.is_none()
-                && let Ok(viewer) = client.viewer().await
-            {
-                self.level.app_user = Some(viewer.id);
+        let read_due = due(self.last_read, self.read_every, now);
+        for op in order {
+            if self.limited {
+                break;
             }
-        }
-        if due(self.last_intake, self.intake_interval, now) {
-            self.last_intake = Some(now);
-            match client.delegated_issues(&self.teams).await {
-                Ok(issues) => {
-                    self.level.delegated = Some(Delegated {
-                        read_at: now,
-                        issues,
-                    })
+            match op {
+                Did::Viewer if read_due && self.level.app_user.is_none() => {
+                    self.last_read = Some(now);
+                    let viewer = client.viewer().await;
+                    self.observe(client);
+                    match viewer {
+                        Ok(viewer) => self.level.app_user = Some(viewer.id),
+                        Err(error) => {
+                            self.hit(&error);
+                        }
+                    }
                 }
-                Err(error) => self.log.push(format!("intake: {error}")),
+                Did::Intake if due(self.last_intake, self.intake_every, now) => {
+                    self.last_intake = Some(now);
+                    self.intake(client, now).await;
+                }
+                Did::RunRead if read_due && self.level.app_user.is_some() => {
+                    self.last_read = Some(now);
+                    self.read_runs(client, queries, now, events).await;
+                }
+                Did::Flush => self.flush(client, queries, now, events).await,
+                _ => {}
             }
         }
-        if read_due && self.level.app_user.is_some() {
-            self.read_runs(client, queries, now, events).await;
+        self.observe(client);
+        if self.limited {
+            self.pause(now);
+        } else {
+            self.pauses = 0;
         }
-        self.flush(client, queries, now, events).await;
+        self.retime(now);
+    }
+
+    /// Takes the headers of the responses since the last call into the
+    /// budget.
+    fn observe(&mut self, client: &impl LinearApi) -> Vec<RateHeaders> {
+        let headers = client.take_headers();
+        for h in &headers {
+            self.budget.observe(h);
+        }
+        headers
+    }
+
+    /// Whether `error` is a rate limit, which ends the step.
+    fn hit(&mut self, error: &ApiError) -> bool {
+        let limited = *error == ApiError::RateLimited;
+        self.limited |= limited;
+        limited
+    }
+
+    async fn intake(&mut self, client: &impl LinearApi, now: Timestamp) {
+        let result = client.delegated_issues(&self.teams).await;
+        let spent = self.observe(client);
+        match result {
+            Ok(issues) => {
+                self.intake_cost = Cost::of(&spent).unwrap_or(self.intake_cost);
+                self.level.delegated = Some(Delegated {
+                    read_at: now,
+                    issues,
+                });
+            }
+            Err(error) => {
+                if !self.hit(&error) {
+                    self.log.push(format!("intake: {error}"));
+                }
+            }
+        }
+    }
+
+    /// Pauses every read and write until the latest reset known, or else
+    /// for the run-read interval doubled on each rate limit in a row, at
+    /// most 5 minutes.
+    fn pause(&mut self, now: Timestamp) {
+        let until = match self.budget.reset().filter(|reset| *reset > now) {
+            Some(reset) => {
+                self.pauses = 0;
+                reset
+            }
+            None => {
+                let wait = self
+                    .run_read_interval
+                    .checked_mul(1 << self.pauses.min(20))
+                    .unwrap_or(MAX_PAUSE)
+                    .min(MAX_PAUSE);
+                self.pauses += 1;
+                now + wait
+            }
+        };
+        self.paused_until = Some(until);
+        self.log.push(format!(
+            "Linear rate-limited the requests ({}): every read and write waits {:#}, until {:.0}",
+            self.budget.summary(),
+            until.duration_since(now),
+            until
+        ));
+    }
+
+    /// Stretches the read intervals while fewer than 20% of the requests or
+    /// of the points remain, so that the reads until the reset, at their
+    /// measured cost, use at most 90% of the remainder; never past that
+    /// reset. Logs when the budget becomes short and when it recovers.
+    fn retime(&mut self, now: Timestamp) {
+        let rate = |cost: fn(&Cost) -> u64| {
+            cost(&self.intake_cost) as f64 / self.intake_interval.as_secs_f64()
+                + cost(&self.read_cost) as f64 / self.run_read_interval.as_secs_f64()
+        };
+        let dimensions = [
+            (self.budget.requests, rate(|c| c.requests)),
+            (self.budget.complexity, rate(|c| c.points)),
+        ];
+        let mut factor: f64 = 1.0;
+        let mut reset: Option<Timestamp> = None;
+        for (allowance, per_second) in dimensions {
+            let (Some(limit), Some(remaining), Some(at)) =
+                (allowance.limit, allowance.remaining, allowance.reset)
+            else {
+                continue;
+            };
+            if at <= now || remaining.saturating_mul(5) >= limit {
+                continue;
+            }
+            let usable = (remaining - remaining / 10) as f64;
+            let needed = per_second * at.duration_since(now).as_secs_f64();
+            factor = factor.max(if usable > 0.0 {
+                needed / usable
+            } else {
+                f64::INFINITY
+            });
+            reset = reset.max(Some(at));
+        }
+        let longest = reset.map_or(SignedDuration::MAX, |at| at.duration_since(now));
+        let stretch = |interval: SignedDuration| {
+            let millis = (interval.as_millis() as f64 * factor).round() as i64;
+            SignedDuration::from_millis(millis)
+                .min(longest)
+                .max(interval)
+        };
+        self.intake_every = stretch(self.intake_interval);
+        self.read_every = stretch(self.run_read_interval);
+        let short = reset.is_some();
+        if short != self.short {
+            self.short = short;
+            self.log.push(format!(
+                "Linear budget is {} ({}): the intake poll runs every {:#} and the run read every {:#}",
+                if short { "short" } else { "no longer short" },
+                self.budget.summary(),
+                self.intake_every,
+                self.read_every
+            ));
+        }
+    }
+
+    /// Runs per batch of the run read: as many as keep the batch under
+    /// 5,000 points by the last measurement.
+    fn batch_size(&self) -> usize {
+        self.run_points.map_or(FIRST_BATCH, |points| {
+            usize::try_from((BATCH_POINTS - 1) / points.max(1))
+                .unwrap_or(usize::MAX)
+                .max(1)
+        })
+    }
+
+    /// Takes a measured cost per run, and logs it when it changed.
+    fn measure_run(&mut self, points: u64) {
+        if self.run_points == Some(points) {
+            return;
+        }
+        self.run_points = Some(points);
+        self.log.push(format!(
+            "Linear run read costs {points} points per run; up to {} runs per query",
+            self.batch_size()
+        ));
     }
 
     fn session_of(&self, query: &RunQuery) -> Option<String> {
@@ -230,10 +473,33 @@ impl LinearTask {
                 cursor: query.prompt_cursor.clone(),
             })
             .collect();
-        let updates = client.read_runs(&batch).await;
+        let mut spent = Vec::new();
+        let mut updates = Vec::with_capacity(batch.len());
+        let mut rest = &batch[..];
+        while !rest.is_empty() && !self.limited {
+            let (part, later) = rest.split_at(self.batch_size().min(rest.len()));
+            rest = later;
+            let results = client.read_runs(part).await;
+            let headers = self.observe(client);
+            // Only a batch answered by one request measured its runs.
+            if let [one] = headers[..]
+                && let Some(points) = one.cost
+                && results.iter().all(Result::is_ok)
+            {
+                self.measure_run(points.div_ceil(part.len() as u64));
+            }
+            spent.extend(headers);
+            for result in &results {
+                if let Err(error) = result {
+                    self.hit(error);
+                }
+            }
+            updates.extend(results);
+        }
         for ((query, _), update) in with_session.iter().zip(updates) {
             let update = match update {
                 Ok(update) => update,
+                Err(ApiError::RateLimited) => continue,
                 Err(error) => {
                     self.log.push(format!("{}: {error}", query.key()));
                     continue;
@@ -243,8 +509,10 @@ impl LinearTask {
                 .issue_updated_at
                 .as_deref()
                 .is_none_or(|at| at.is_empty() || at != update.issue.updated_at);
-            let detail = if stale {
-                self.detail(client, query).await
+            let detail = if stale && !self.limited {
+                let detail = self.detail(client, query).await;
+                spent.extend(self.observe(client));
+                detail
             } else {
                 None
             };
@@ -260,10 +528,12 @@ impl LinearTask {
         // A fresh claim without a session still needs the detail for
         // `issue.md` and routing; its state comes from the detail.
         for (query, _) in without {
-            if !query.issue_updated_at.as_deref().unwrap_or("").is_empty() {
+            if self.limited || !query.issue_updated_at.as_deref().unwrap_or("").is_empty() {
                 continue;
             }
-            let Some(detail) = self.detail(client, query).await else {
+            let detail = self.detail(client, query).await;
+            spent.extend(self.observe(client));
+            let Some(detail) = detail else {
                 continue;
             };
             let update = RunUpdate {
@@ -284,6 +554,9 @@ impl LinearTask {
                 })
                 .await;
         }
+        if !self.limited {
+            self.read_cost = Cost::of(&spent).unwrap_or(self.read_cost);
+        }
     }
 
     async fn detail(
@@ -294,7 +567,9 @@ impl LinearTask {
         match client.issue(&query.issue_id).await {
             Ok(detail) => Some(Box::new(detail)),
             Err(error) => {
-                self.log.push(format!("{}: {error}", query.key()));
+                if !self.hit(&error) {
+                    self.log.push(format!("{}: {error}", query.key()));
+                }
                 None
             }
         }
@@ -310,12 +585,16 @@ impl LinearTask {
         events: &mpsc::Sender<LinearEvent>,
     ) {
         for query in queries {
+            if self.limited {
+                break;
+            }
             let key = query.key();
             let run = Run {
                 dir: query.run_dir.clone(),
                 key: key.clone(),
             };
-            let blocked = if outbox::pending(&run).is_empty() {
+            let pending = !outbox::pending(&run).is_empty();
+            let blocked = if !pending {
                 false
             } else if let Some(session) = self.session_for_flush(client, query, events).await {
                 let sent =
@@ -336,6 +615,7 @@ impl LinearTask {
                 }
                 match &sent.blocked {
                     Some(error) => {
+                        self.hit(error);
                         self.log
                             .push(format!("{key}: Linear write failed, will retry: {error}"));
                         true
@@ -395,10 +675,12 @@ impl LinearTask {
                 Some(session)
             }
             Err(error) => {
-                self.log.push(format!(
-                    "{}: could not create the session: {error}",
-                    query.key()
-                ));
+                if !self.hit(&error) {
+                    self.log.push(format!(
+                        "{}: could not create the session: {error}",
+                        query.key()
+                    ));
+                }
                 None
             }
         }
@@ -450,8 +732,9 @@ impl LinearTask {
 mod tests {
     use super::*;
     use crate::linear::ApiError;
-    use crate::linear::api::fake::FakeLinear;
+    use crate::linear::api::fake::{self, FakeLinear};
     use crate::linear::api::{Activity, Content};
+    use crate::linear::transport::Allowance;
     use crate::outbox::Op;
     use crate::run::RunRecord;
     use std::sync::Mutex;
@@ -472,6 +755,29 @@ mod tests {
         let (events, mut sent) = mpsc::channel(64);
         task.step_into(linear, queries, now, &events).await;
         std::iter::from_fn(|| sent.try_recv().ok()).collect()
+    }
+
+    /// The headers of an account with `requests` of 5,000 requests and
+    /// `points` of 2,000,000 points left until `reset`. The delegated poll
+    /// costs 100 points, each run of a run-read batch `per_run`, anything
+    /// else 1.
+    fn account(requests: u64, points: u64, reset: Timestamp, per_run: u64) -> fake::Headers {
+        Box::new(move |operation, variables| {
+            let allowance = |limit, remaining| Allowance {
+                limit: Some(limit),
+                remaining: Some(remaining),
+                reset: Some(reset),
+            };
+            RateHeaders {
+                requests: allowance(5_000, requests),
+                complexity: allowance(2_000_000, points),
+                cost: Some(match operation {
+                    "HlaDelegatedIssues" => 100,
+                    "HlaRuns" => per_run * fake::runs(variables) as u64,
+                    _ => 1,
+                }),
+            }
+        })
     }
 
     fn task() -> LinearTask {
@@ -541,6 +847,24 @@ mod tests {
                 fake.count("HlaDelegatedIssues"),
                 fake.count("HlaRuns"),
             )
+        }
+
+        /// The number of runs in each `HlaRuns` request, oldest first.
+        fn batches(&self) -> Vec<usize> {
+            self.fake()
+                .calls
+                .iter()
+                .filter(|(name, _, _)| name == "HlaRuns")
+                .map(|(_, variables, _)| fake::runs(variables))
+                .collect()
+        }
+
+        /// The operations called since the first `from` calls, in order.
+        fn calls_since(&self, from: usize) -> Vec<String> {
+            self.fake().calls[from..]
+                .iter()
+                .map(|(name, _, _)| name.clone())
+                .collect()
         }
 
         fn failed(&self, n: usize) -> usize {
@@ -649,7 +973,10 @@ mod tests {
         assert_eq!(s.failed(0), 1);
         assert_eq!(
             task.take_log(),
-            ["DATA-1: Linear write failed, will retry: Linear rate-limited the request"]
+            [
+                "DATA-1: Linear write failed, will retry: Linear rate-limited the request",
+                "Linear rate-limited the requests (the budget is unknown): every read and write waits 5s, until 2026-09-28T00:00:07Z"
+            ]
         );
         assert!(s.fake().sessions[0].sent("thought").is_empty());
     }
@@ -905,5 +1232,180 @@ mod tests {
         drop(queries_tx);
         wake.notify_one();
         running.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reads_keep_their_intervals_with_plenty_of_budget() {
+        let s = setup(&["DATA-1"], true);
+        s.fake().headers = Some(account(4_900, 1_900_000, at(3600), 10));
+        let queries = [s.query(0, Some("session-1"), Some(UPDATED))];
+        let mut task = task();
+
+        step(&mut task, &s.linear, &queries, at(0)).await;
+        assert_eq!(
+            s.calls_since(0),
+            ["HlaViewer", "HlaDelegatedIssues", "HlaRuns"]
+        );
+        assert_eq!(task.budget().requests.remaining, Some(4_900));
+        assert_eq!(task.budget().complexity.remaining, Some(1_900_000));
+        assert_eq!(task.next_due(at(0)), at(5));
+        step(&mut task, &s.linear, &queries, at(3)).await;
+        assert_eq!(s.calls_since(3), Vec::<String>::new());
+        step(&mut task, &s.linear, &queries, at(5)).await;
+        assert_eq!(s.calls_since(3), ["HlaDelegatedIssues", "HlaRuns"]);
+        assert_eq!(task.next_due(at(5)), at(10));
+        assert_eq!(
+            task.take_log(),
+            ["Linear run read costs 10 points per run; up to 499 runs per query"]
+        );
+    }
+
+    #[tokio::test]
+    async fn at_19_percent_the_reads_are_stretched_and_writes_go_first() {
+        let s = setup(&["DATA-1"], true);
+        // 380,000 of 2,000,000 points is 19%; 90% of it is 342,000. Normal
+        // reads until the reset would cost (100 + 1,800) / 5 s * 1,800 s =
+        // 684,000, twice that, so both 5 s intervals become 10 s.
+        s.fake().headers = Some(account(4_000, 380_000, at(1800), 1_800));
+        let queries = [s.query(0, Some("session-1"), Some(UPDATED))];
+        let mut task = task();
+
+        step(&mut task, &s.linear, &queries, at(0)).await;
+        assert_eq!(task.next_due(at(0)), at(10));
+        assert_eq!(
+            task.take_log(),
+            [
+                "Linear run read costs 1800 points per run; up to 2 runs per query",
+                "Linear budget is short (4000/5000 requests, 380000/2000000 points, resets 2026-09-28T00:30:00Z): the intake poll runs every 10s and the run read every 10s"
+            ]
+        );
+        let calls = s.fake().calls.len();
+        step(&mut task, &s.linear, &queries, at(5)).await;
+        assert_eq!(s.calls_since(calls), Vec::<String>::new());
+
+        outbox::push(&s.runs[0], thought("due")).unwrap();
+        step(&mut task, &s.linear, &queries, at(10)).await;
+        assert_eq!(
+            s.calls_since(calls),
+            ["HlaActivityCreate", "HlaRuns", "HlaDelegatedIssues"]
+        );
+        assert_eq!(task.take_log(), Vec::<String>::new(), "no line per read");
+
+        s.fake().headers = Some(account(4_000, 1_900_000, at(1800), 1_800));
+        step(&mut task, &s.linear, &queries, at(20)).await;
+        assert_eq!(task.next_due(at(20)), at(25));
+        assert_eq!(
+            task.take_log(),
+            [
+                "Linear budget is no longer short (4000/5000 requests, 1900000/2000000 points, resets 2026-09-28T00:30:00Z): the intake poll runs every 5s and the run read every 5s"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rate_limit_with_a_reset_pauses_reads_and_writes_until_the_reset() {
+        let s = setup(&["DATA-1"], true);
+        s.fake().headers = Some(account(4_000, 1_900_000, at(60), 10));
+        let queries = [s.query(0, Some("session-1"), Some(UPDATED))];
+        let mut task = task();
+        step(&mut task, &s.linear, &queries, at(0)).await;
+        task.take_log();
+
+        outbox::push(&s.runs[0], thought("held")).unwrap();
+        s.fake().fail_next = Some(ApiError::RateLimited);
+        let calls = s.fake().calls.len();
+        step(&mut task, &s.linear, &queries, at(5)).await;
+        assert_eq!(
+            s.calls_since(calls),
+            ["HlaDelegatedIssues"],
+            "the rate limit ends the step"
+        );
+        assert_eq!(task.next_due(at(5)), at(60));
+        assert_eq!(
+            task.take_log(),
+            [
+                "Linear rate-limited the requests (4000/5000 requests, 1900000/2000000 points, resets 2026-09-28T00:01:00Z): every read and write waits 55s, until 2026-09-28T00:01:00Z"
+            ]
+        );
+
+        let calls = s.fake().calls.len();
+        for t in [10, 30, 59] {
+            step(&mut task, &s.linear, &queries, at(t)).await;
+        }
+        assert_eq!(s.fake().calls.len(), calls, "nothing before the reset");
+        assert_eq!(outbox::pending(&s.runs[0]).len(), 1);
+
+        step(&mut task, &s.linear, &queries, at(60)).await;
+        assert_eq!(
+            s.calls_since(calls),
+            ["HlaDelegatedIssues", "HlaRuns", "HlaActivityCreate"]
+        );
+        assert!(outbox::pending(&s.runs[0]).is_empty());
+        assert_eq!(task.next_due(at(60)), at(65));
+    }
+
+    #[tokio::test]
+    async fn a_rate_limit_without_a_reset_doubles_the_pause_up_to_5_minutes() {
+        let s = setup(&["DATA-1"], true);
+        let queries = [s.query(0, Some("session-1"), Some(UPDATED))];
+        let mut task = task();
+        step(&mut task, &s.linear, &queries, at(0)).await;
+
+        let mut now = at(5);
+        for wait in [5, 10, 20, 40, 80, 160, 300, 300] {
+            s.fake().fail_next = Some(ApiError::RateLimited);
+            let calls = s.fake().calls.len();
+            step(&mut task, &s.linear, &queries, now).await;
+            assert_eq!(s.calls_since(calls), ["HlaDelegatedIssues"]);
+            let until = now + SignedDuration::from_secs(wait);
+            assert_eq!(task.next_due(now), until, "after waiting {wait}s");
+            now = until;
+        }
+        assert_eq!(
+            task.take_log().last().unwrap(),
+            "Linear rate-limited the requests (the budget is unknown): every read and write waits 5m, until 2026-09-28T00:15:20Z"
+        );
+
+        let calls = s.fake().calls.len();
+        step(&mut task, &s.linear, &queries, now).await;
+        assert_eq!(s.calls_since(calls), ["HlaDelegatedIssues", "HlaRuns"]);
+        let later = now + SignedDuration::from_secs(5);
+        s.fake().fail_next = Some(ApiError::RateLimited);
+        step(&mut task, &s.linear, &queries, later).await;
+        assert_eq!(
+            task.next_due(later),
+            later + SignedDuration::from_secs(5),
+            "a read in between starts over at the interval"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_run_read_is_split_to_stay_under_5000_points() {
+        let keys: Vec<String> = (1..=12).map(|n| format!("DATA-{n}")).collect();
+        let keys: Vec<&str> = keys.iter().map(String::as_str).collect();
+        let s = setup(&keys, true);
+        s.fake().headers = Some(account(4_900, 1_900_000, at(3600), 1_200));
+        let sessions: Vec<String> = (1..=12).map(|n| format!("session-{n}")).collect();
+        let queries: Vec<RunQuery> = (0..12)
+            .map(|n| s.query(n, Some(&sessions[n]), Some(UPDATED)))
+            .collect();
+        let mut task = task();
+
+        let events = step(&mut task, &s.linear, &queries, at(0)).await;
+        assert_eq!(events.len(), 12);
+        assert_eq!(s.batches(), [10, 2], "10 runs before a measurement");
+        assert_eq!(
+            task.take_log(),
+            ["Linear run read costs 1200 points per run; up to 4 runs per query"]
+        );
+
+        let events = step(&mut task, &s.linear, &queries, at(5)).await;
+        assert_eq!(events.len(), 12);
+        assert_eq!(s.batches()[2..], [4, 4, 4], "4 x 1,200 = 4,800 points");
+        assert_eq!(
+            task.take_log(),
+            Vec::<String>::new(),
+            "the cost is unchanged"
+        );
     }
 }

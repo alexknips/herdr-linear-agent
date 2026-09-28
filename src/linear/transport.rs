@@ -8,6 +8,8 @@
 
 use std::time::Duration;
 
+use jiff::Timestamp;
+use reqwest::header::HeaderMap;
 use serde_json::Value;
 use zeroize::Zeroizing;
 
@@ -18,6 +20,86 @@ pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_ERROR_MESSAGE_CHARS: usize = 200;
+
+/// One of Linear's two hourly allowances as a response reported it. A value
+/// whose header is missing or does not parse is `None`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Allowance {
+    pub limit: Option<u64>,
+    pub remaining: Option<u64>,
+    pub reset: Option<Timestamp>,
+}
+
+/// The rate-limit headers of one response, or Linear's budget as the latest
+/// responses reported it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RateHeaders {
+    pub requests: Allowance,
+    pub complexity: Allowance,
+    /// `X-Complexity`: the points this query cost.
+    pub cost: Option<u64>,
+}
+
+impl RateHeaders {
+    pub fn parse(headers: &HeaderMap) -> Self {
+        let text = |name: &str| {
+            headers
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(str::trim)
+        };
+        let count = |name: &str| text(name).and_then(|v| v.parse::<u64>().ok());
+        let allowance = |kind: &str| Allowance {
+            limit: count(&format!("x-ratelimit-{kind}-limit")),
+            remaining: count(&format!("x-ratelimit-{kind}-remaining")),
+            reset: text(&format!("x-ratelimit-{kind}-reset"))
+                .and_then(|v| v.parse::<i64>().ok())
+                .and_then(|ms| Timestamp::from_millisecond(ms).ok()),
+        };
+        RateHeaders {
+            requests: allowance("requests"),
+            complexity: allowance("complexity"),
+            cost: count("x-complexity"),
+        }
+    }
+
+    /// Takes every value `newer` knows and keeps the others.
+    pub fn observe(&mut self, newer: &RateHeaders) {
+        let take = |old: &mut Allowance, new: &Allowance| {
+            old.limit = new.limit.or(old.limit);
+            old.remaining = new.remaining.or(old.remaining);
+            old.reset = new.reset.or(old.reset);
+        };
+        take(&mut self.requests, &newer.requests);
+        take(&mut self.complexity, &newer.complexity);
+        self.cost = newer.cost.or(self.cost);
+    }
+
+    /// The latest reset known.
+    pub fn reset(&self) -> Option<Timestamp> {
+        self.requests.reset.max(self.complexity.reset)
+    }
+
+    /// `<n>/<limit> requests, <n>/<limit> points, resets <time>`, or `None`
+    /// while a value is unknown.
+    pub fn describe(&self) -> Option<String> {
+        let (r, c) = (&self.requests, &self.complexity);
+        Some(format!(
+            "{}/{} requests, {}/{} points, resets {:.0}",
+            r.remaining?,
+            r.limit?,
+            c.remaining?,
+            c.limit?,
+            self.reset()?
+        ))
+    }
+
+    /// `describe`, or `the budget is unknown`.
+    pub fn summary(&self) -> String {
+        self.describe()
+            .unwrap_or_else(|| "the budget is unknown".into())
+    }
+}
 
 /// Exactly one `application/json` content type, parameters allowed.
 pub(crate) fn json_content_type<'a>(mut values: impl Iterator<Item = &'a str>) -> bool {
@@ -165,6 +247,91 @@ mod tests {
             ApiError::RateLimited.to_string(),
             "Linear rate-limited the request"
         );
+    }
+
+    #[test]
+    fn rate_limit_headers_parse_into_counts_and_reset_times() {
+        use reqwest::header::{HeaderName, HeaderValue};
+        let headers: HeaderMap = [
+            ("x-ratelimit-requests-limit", "5000"),
+            ("x-ratelimit-requests-remaining", " 4999 "),
+            ("x-ratelimit-requests-reset", "1790550000000"),
+            ("x-ratelimit-complexity-limit", "2000000"),
+            ("x-ratelimit-complexity-remaining", "many"),
+            ("x-ratelimit-complexity-reset", "1790550000500"),
+            ("x-complexity", "251"),
+        ]
+        .into_iter()
+        .map(|(name, value)| {
+            (
+                HeaderName::from_static(name),
+                HeaderValue::from_static(value),
+            )
+        })
+        .collect();
+        let parsed = RateHeaders::parse(&headers);
+        assert_eq!(
+            parsed.requests,
+            Allowance {
+                limit: Some(5000),
+                remaining: Some(4999),
+                reset: Some("2026-09-27T23:00:00Z".parse().unwrap()),
+            }
+        );
+        assert_eq!(parsed.complexity.limit, Some(2_000_000));
+        assert_eq!(parsed.complexity.remaining, None, "unparsable");
+        assert_eq!(
+            parsed.complexity.reset,
+            Some("2026-09-27T23:00:00.5Z".parse().unwrap())
+        );
+        assert_eq!(parsed.cost, Some(251));
+        assert_eq!(
+            RateHeaders::parse(&HeaderMap::new()),
+            RateHeaders::default()
+        );
+
+        let mut known = parsed;
+        known.observe(&RateHeaders {
+            requests: Allowance {
+                remaining: Some(4998),
+                ..Allowance::default()
+            },
+            ..RateHeaders::default()
+        });
+        assert_eq!(
+            (known.requests.limit, known.requests.remaining),
+            (Some(5000), Some(4998)),
+            "a missing value keeps the previous one"
+        );
+    }
+
+    #[test]
+    fn the_budget_is_described_when_every_value_is_known() {
+        let mut budget = RateHeaders::default();
+        assert_eq!(budget.describe(), None);
+        assert_eq!(budget.summary(), "the budget is unknown");
+        let reset = "2026-09-28T01:00:00.250Z".parse().unwrap();
+        budget.observe(&RateHeaders {
+            requests: Allowance {
+                limit: Some(5_000),
+                remaining: Some(4_321),
+                reset: Some(reset),
+            },
+            complexity: Allowance {
+                limit: Some(2_000_000),
+                remaining: Some(1_999_000),
+                reset: None,
+            },
+            cost: Some(12),
+        });
+        assert_eq!(
+            budget.describe().as_deref(),
+            Some("4321/5000 requests, 1999000/2000000 points, resets 2026-09-28T01:00:00Z")
+        );
+        budget.observe(&RateHeaders::default());
+        assert_eq!(budget.requests.remaining, Some(4_321), "headers missing");
+        budget.complexity = Allowance::default();
+        assert_eq!(budget.describe(), None);
     }
 
     #[test]
