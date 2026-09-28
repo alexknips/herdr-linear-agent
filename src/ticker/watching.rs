@@ -144,11 +144,12 @@ impl Reconciler {
                 self.report_pane(d, snapshot, &next.pane_id, &display, state, now)
                     .await;
             }
-            if next != *c || lost {
+            let back = live.pane_exists && record.coordinator_lost;
+            if next != *c || lost || back {
                 let before = c.clone();
                 self.update_and_push(run, move |r| {
                     apply_tracked(&mut r.coordinator, &before, &next);
-                    r.coordinator_lost |= lost;
+                    r.coordinator_lost = (r.coordinator_lost || lost) && !back;
                     ops
                 })
                 .await?;

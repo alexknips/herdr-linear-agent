@@ -356,6 +356,7 @@ An agent in Herdr is the recorded agent only when pane id, working directory, ki
 - Same pane, cwd, kind and name: found.
 - Same pane, cwd and kind, empty name: found (a natively resumed agent lost its name). The ticker renames it to the recorded name (`agent.rename`).
 - Same pane, another name, cwd or kind: not ours.
+- The working directory matches when the agent's `cwd` or `foreground_cwd` is the recorded one, compared with symlinks resolved (Herdr reports `/tmp` as `/private/tmp`). A missing kind is not a mismatch: Herdr reports an agent it is still launching without one. Measured on Herdr 0.9.1 during the first end-to-end run of the rewrite, where the old exact comparison declared a freshly started coordinator lost. `src/worker:a_cwd_herdr_reports_with_symlinks_resolved_is_the_same_place`
 - `tests/worker:identity_is_pane_cwd_kind_and_name`
 
 `live_state(record, view, now, state_dir, socket)` returns `Live`:
@@ -631,7 +632,7 @@ For an `open` coordinator:
 
 1. Track it.
 2. When it needs a person and was not reported: ask for a person (`The coordinator`) and set `blocked_reported`.
-3. When its pane is gone and it is not already lost: queue the elicitation `The coordinator's pane for <KEY> is gone. <how>` with option `Resume`=`resume`, and show the notification `<KEY> coordinator is gone` with body `<how>`. `<how>` is `Reply \`resume\` to start it again with its previous session.` when the session id is non-empty and the kind has resume arguments, else `Reply \`resume\` to start a new coordinator.` Set `coordinator_lost`. The ticker never restarts it by itself.
+3. When its pane is gone and it is not already lost: queue the elicitation `The coordinator's pane for <KEY> is gone. <how>` with option `Resume`=`resume`, and show the notification `<KEY> coordinator is gone` with body `<how>`. `<how>` is `Reply \`resume\` to start it again with its previous session.` when the session id is non-empty and the kind has resume arguments, else `Reply \`resume\` to start a new coordinator.` Set `coordinator_lost`. The ticker never restarts it by itself. When the recorded coordinator is seen in its pane again, `coordinator_lost` clears, so nudges resume. `tests/scenarios:a_coordinator_seen_again_in_its_pane_is_no_longer_lost_and_gets_its_reply`
 4. When the pane exists: report pane metadata with display `<KEY> · coordinator` and state `needs you` (when it needs a person), else the agent status, else `starting`.
 5. Save the record when it changed.
 

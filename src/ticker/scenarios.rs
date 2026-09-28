@@ -1422,3 +1422,22 @@ async fn a_run_under_every_lag_knob_writes_each_fact_once() {
     assert_eq!(heartbeats, 1);
     assert_eq!(world.sessions(), 1);
 }
+
+#[tokio::test]
+async fn a_coordinator_seen_again_in_its_pane_is_no_longer_lost_and_gets_its_reply() {
+    let mut world = World::sample();
+    let pane = world.running_issue().await;
+    world
+        .run(KEY)
+        .update(|r| r.coordinator_lost = true)
+        .unwrap();
+
+    world.message(KEY, "user-1", "Try again, please.", None);
+    world.later(120);
+    world.settle().await;
+    assert!(!world.record(KEY).coordinator_lost);
+    assert_eq!(
+        to(&world, &pane).last().map(String::as_str),
+        Some(NUDGE_REPLY)
+    );
+}

@@ -344,9 +344,21 @@ pub fn find_agent<'a>(record: &AgentRecord, agents: &'a [Agent]) -> Option<&'a A
     })
 }
 
+/// Herdr reports an agent it is still launching without a kind, and reports
+/// directories with symlinks resolved, so neither may count as a mismatch.
 fn same_place(record: &AgentRecord, agent: &Agent) -> bool {
-    agent.cwd.as_deref() == Some(record.cwd.as_str())
-        && agent.kind.as_deref() == Some(record.kind.as_str())
+    let kind = agent.kind.as_deref().is_none_or(|k| k == record.kind);
+    let resolved = std::fs::canonicalize(&record.cwd).ok();
+    let here = |dir: &String| {
+        *dir == record.cwd
+            || resolved
+                .as_ref()
+                .is_some_and(|r| std::fs::canonicalize(dir).ok().as_ref() == Some(r))
+    };
+    kind && [&agent.cwd, &agent.foreground_cwd]
+        .into_iter()
+        .flatten()
+        .any(here)
 }
 
 /// The recorded agent in another pane: Herdr renumbered it.
@@ -1054,11 +1066,47 @@ last_group = "waiting"
                 ),
                 false,
             ),
+            (
+                "still launching, kind not detected yet",
+                Agent {
+                    kind: None,
+                    launch_pending: true,
+                    ..ours_in("w1:p1", HerdrStatus::Unknown)
+                },
+                true,
+            ),
+            (
+                "only the foreground cwd is the worktree",
+                Agent {
+                    cwd: Some("/elsewhere".into()),
+                    foreground_cwd: Some(WORKTREE.into()),
+                    ..ours_in("w1:p1", HerdrStatus::Working)
+                },
+                true,
+            ),
         ];
         for (case, seen, ours) in table {
             let found = find_agent(&record, std::slice::from_ref(&seen));
             assert_eq!(found.is_some(), ours, "{case}");
         }
+    }
+
+    #[test]
+    fn a_cwd_herdr_reports_with_symlinks_resolved_is_the_same_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("run");
+        std::fs::create_dir(&real).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let record = AgentRecord {
+            cwd: link.to_string_lossy().into_owned(),
+            ..api_worker_agent("w1:p1")
+        };
+        let seen = Agent {
+            cwd: Some(real.canonicalize().unwrap().to_string_lossy().into_owned()),
+            ..ours_in("w1:p1", HerdrStatus::Idle)
+        };
+        assert!(find_agent(&record, std::slice::from_ref(&seen)).is_some());
     }
 
     #[test]
