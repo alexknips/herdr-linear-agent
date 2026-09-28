@@ -848,14 +848,27 @@ Items for the coordinator in `runs/<KEY>/inbox/`.
 
 | Operation | Behavior |
 | --- | --- |
-| `write(run, kind, subject, summary)` | writes an item under the run lock and returns its id, which ends with `-<kind>-<subject>-<n>` (`-worker-w1-1` for the first); ids are unique |
-| `unhandled(run)` | items not yet done, oldest first; `summary` has newlines replaced by spaces (`second line`) |
-| `mark_seen(run, ids)` / `seen(run)` | the ids shown to the coordinator |
-| `done(run, ids, all)` | moves the named items, or all with `all`, to `inbox/done/`; returns the count |
-| `prune_done(run)` | prunes `inbox/done/` (policy: open question) |
+| `write(run, kind, subject, summary)` | writes `inbox/<id>.md` under the run lock and returns its id, `<UTC time>-<kind>-<subject>-<n>` where `n` is a per-run counter in `.state/inbox-counter.json` (`-worker-w1-1` for the first); ids are unique |
+| `unhandled(run)` | items not yet done, oldest first (by `created`, then by `n` as a number, then by id); `summary` has newlines replaced by spaces (`second line`) |
+| `mark_seen(run, ids)` / `seen(run)` | the ids the last `context` showed, in `.state/inbox-seen.json`; each `context` replaces the set (a digest shows every unhandled item) |
+| `done(run, ids, all)` | moves the named items and, with `all`, the items in `seen`, to `inbox/done/`; returns the count. Items written after the last `context` stay |
+| `prune_done(run)` | removes items in `inbox/done/` older than 30 days; moves files in `inbox/` that are not items of this build to `inbox/done/` and returns their names, which the ticker logs once each (decision 19) |
 
-- An id containing `/`, `..`, starting with `.`, or empty is refused. `tests/inbox:hostile_ids_are_refused`
-- `tests/inbox:items_are_written_listed_marked_seen_and_moved_to_done`
+- An item file is `inbox/<id>.md` (a done one `inbox/done/<id>.md`) holding TOML front matter and nothing else: a `+++` line, one line per key in the order `id`, `kind`, `subject`, `created` (RFC 3339 UTC to the second), `summary`, and a closing `+++` line. For example:
+
+  ```
+  +++
+  id = "20260928T020313Z-worker-w1-1"
+  kind = "worker"
+  subject = "w1"
+  created = "2026-09-28T02:03:14Z"
+  summary = "w1 (testing) is idle without a report; check its pane wH:p1."
+  +++
+  ```
+
+  There is no `seq` field; the order comes from `created` and the id's counter. A file that does not parse in this format, or whose `id` does not match its name, is not an item, and only such a file is set aside by `prune_done`. `.state/inbox-counter.json` holds the last `n` as a JSON number (`3`); `.state/inbox-seen.json` holds the shown ids as a pretty JSON array. This is the released build's format, so run folders it wrote keep their pending items (decision 19). `src/inbox.rs:items_written_by_the_released_build_are_read_and_handled`
+- An id containing `/`, `..`, starting with `.`, or empty is refused before anything moves: `` `<id>` is not an inbox item id ``. `src/inbox.rs:ids_that_could_leave_the_folder_are_refused`
+- **Changed on purpose (THLA-7):** `inbox done --all` moves only the items the coordinator has been shown, so an item written while it worked is never handled unseen. The command prints `<n> item(s) handled`, followed by `; <m> new item(s) since your last context, run context` when unseen items remain. Named ids still move as named. `src/inbox.rs:done_all_moves_only_the_items_context_showed`, `src/commands.rs:done_all_leaves_the_items_written_after_the_last_context`
 
 Kinds and subjects written by the ticker: `issue`/`issue`, `reply`/`reply`, `worker`/`<id>`.
 
@@ -933,7 +946,7 @@ All take `<KEY>`. `plan set`, `say`, `ask`, `finish` and the worker commands req
 | --- | --- | --- |
 | `skill [KEY]` | prints `assets/COORDINATOR.md` with `{bin}` and `{key}` replaced (`<ISSUE-KEY>` without a key) | the sheet |
 | `context <KEY>` | `ticker start`; prints the digest; marks the shown inbox ids seen; the run need not be active | the digest |
-| `inbox done <KEY> [ids] [--all]` | moves items to done; error `name the inbox item ids, or pass --all` with neither | `<n> item(s) handled` |
+| `inbox done <KEY> [ids] [--all]` | moves the named items, and with `--all` the items the last `context` showed, to done; error `name the inbox item ids, or pass --all` with neither | `<n> item(s) handled`, plus `; <m> new item(s) since your last context, run context` when unseen items remain |
 | `plan set <KEY> --file` | parses the checklist, queues the plan | `the plan is queued for Linear` |
 | `say <KEY> --text-file` | queues a thought with the trimmed text; empty: `the text is empty` | `queued for the Linear session` |
 | `ask <KEY> --text-file [--option label=value]...` | queues an elicitation; options add `select`; empty: `the question is empty` | `the question is queued for the Linear session; end your turn, the answer arrives in your inbox` |
@@ -1047,7 +1060,7 @@ The inputs did not pin these. Each line is the rule the rewrite follows. A rule 
 1. `last_group` stores `waiting_on_you`, `working`, `reported` or `idle`. An unknown stored value reads as none, so the next group is always a transition.
 2. **Kept:** the stop file is `ticker.stop` and the log is `ticker.log`, capped at 1 MB. When a write would pass the cap, the older half of the file is dropped at a line boundary. A running ticker is described as `ticker <version> running since <started> (pid <pid>)`.
 3. Progress records use the metadata `source` `herdr-linear-agent`. **Kept:** a record is `state/progress/<pane>-<hash>.json` and sets the pane token `hla_activity` with a 300 s TTL. The record holds `pane`, `terminal`, `percent` (or null for `--unknown`), `activity` and `at`. The percent is not sent as a token.
-4. An inbox item is `inbox/<id>.json` with the fields `id`, `kind`, `created`, `worker` (optional) and `body`. Ids are `i<n>` from a counter kept under the run lock. `inbox done` moves an item to `inbox/done/`. **Kept:** done items older than 30 days are pruned. The digest's headings are `## Issue`, `## Conversation`, `## Repositories`, `## Worker profiles`, `## Workers` and `## Inbox`. A worker line is `<id> <repo> <group>`, followed by `PR <url>` when one is known. An inbox line starts with its id.
+4. **Kept:** an inbox item is `inbox/<id>.md`: TOML front matter between `+++` lines with the keys `id`, `kind`, `subject`, `created` and `summary`, in that order, and no body. Ids are `<UTC time>-<kind>-<subject>-<n>`, `n` from a counter kept under the run lock (see [The inbox](#the-inbox)). `inbox done` moves an item to `inbox/done/`. **Kept:** done items older than 30 days are pruned. The digest's headings are `## Issue`, `## Conversation`, `## Repositories`, `## Worker profiles`, `## Workers` and `## Inbox`. A worker line is `<id> <repo> <group>`, followed by `PR <url>` when one is known. An inbox line starts with its id.
 5. The `Start worker` action is queued when a worker's launch prompt is delivered, not when `worker start` returns. Its parameter is `<id> <repo>: <title>`.
 6. A launch attempt is one failed placement or one failed `agent.start`, including `agent_not_ready`; `NotSent` and `OutcomeUnknown` are not attempts. After 3 attempts the agent is `Failed` with the last error. The ticker then posts the error activity `Could not start the <role> agent: <error>`, where the role is `coordinator` or `worker <id>`. `agent.start` gets `timeout_ms` 30000.
 7. `worker prompt` sends the given text itself with `agent.prompt`. It fails with `worker <id> is not running` when the worker is not `open` or has no pane. It is refused while the worker waits on a dialog, as the tests pin.

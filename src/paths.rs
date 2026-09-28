@@ -1,168 +1,185 @@
-//! Where herdr-linear-agent keeps its files, and the environment it reads.
+//! Where the plugin keeps its config and state, and the process environment
+//! it reads them from.
 //!
-//! Config and state follow the XDG Base Directory specification on every
-//! platform, macOS included: an absolute `$XDG_CONFIG_HOME` or
-//! `$XDG_STATE_HOME` wins; an unset or relative one falls back to
-//! `~/.config` and `~/.local/state`. Herdr's `HERDR_PLUGIN_*_DIR` variables are
-//! deliberately not used: agent panes do not receive them, and an agent must
-//! resolve the same paths as the plugin's own commands.
-//!
-//! Nothing here reads the process environment directly: callers pass an
-//! `Env`, so resolution is testable.
+//! Agents run in panes that never see `HERDR_PLUGIN_STATE_DIR` or
+//! `HERDR_PLUGIN_CONFIG_DIR`, and they must find the same folders as the
+//! ticker, so both come from the XDG variables and `HOME` alone.
 
-// Derived from herdr-projects v0.2.11 (https://github.com/eliasstravik/herdr-projects).
-// Copyright (c) 2026 Elias Stravik. MIT License; see NOTICE.
+use std::collections::HashMap;
+use std::path::PathBuf;
 
-use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
-
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 
 use crate::process::Runner;
 
-pub const APP: &str = "herdr-linear-agent";
+const APP: &str = "herdr-linear-agent";
 
+/// A snapshot of the variables the plugin reads. Tests build one by hand so
+/// they never depend on the real environment.
 #[derive(Debug, Clone)]
 pub struct Env {
-    vars: BTreeMap<String, String>,
     pub home: PathBuf,
+    vars: HashMap<String, String>,
 }
 
 impl Env {
-    pub fn from_process() -> Result<Self> {
-        let vars: BTreeMap<String, String> = std::env::vars().collect();
-        let home = vars
-            .get("HOME")
-            .filter(|h| !h.is_empty())
-            .map(PathBuf::from)
-            .context("HOME is not set")?;
-        Ok(Env { vars, home })
+    pub fn from_process() -> Result<Env> {
+        let vars: HashMap<String, String> = std::env::vars_os()
+            .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
+            .collect();
+        let home = match vars.get("HOME") {
+            Some(home) if !home.is_empty() => PathBuf::from(home),
+            _ => bail!("HOME is not set, so the config and state folders are unknown"),
+        };
+        Ok(Env { home, vars })
     }
 
     #[cfg(test)]
-    pub fn for_test(home: &Path, vars: &[(&str, &str)]) -> Self {
+    pub fn for_test(home: &std::path::Path, vars: &[(&str, &str)]) -> Env {
+        let vars = vars.iter().map(|&(k, v)| (k.into(), v.into()));
         Env {
-            vars: vars
-                .iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect(),
-            home: home.to_path_buf(),
+            home: home.into(),
+            vars: vars.collect(),
         }
     }
 
-    /// A variable's value; an empty value counts as unset.
     pub fn var(&self, key: &str) -> Option<&str> {
-        self.vars
-            .get(key)
-            .map(String::as_str)
-            .filter(|v| !v.is_empty())
+        self.vars.get(key).map(String::as_str)
     }
 
-    fn xdg(&self, key: &str, fallback: &str) -> PathBuf {
-        match self.var(key) {
-            Some(value) if Path::new(value).is_absolute() => PathBuf::from(value),
-            _ => self.home.join(fallback),
+    /// The plugin's folder under `$<var>` when that is absolute, else under
+    /// `~/<default>`.
+    fn app_dir(&self, var: &str, default: &str) -> PathBuf {
+        self.var(var)
+            .map(PathBuf::from)
+            .filter(|base| base.is_absolute())
+            .unwrap_or_else(|| self.home.join(default))
+            .join(APP)
+    }
+
+    pub fn config_dir(&self) -> PathBuf {
+        self.app_dir("XDG_CONFIG_HOME", ".config")
+    }
+
+    pub fn state_dir(&self) -> PathBuf {
+        self.app_dir("XDG_STATE_HOME", ".local/state")
+    }
+
+    pub fn herdr_bin(&self) -> String {
+        match self.var("HERDR_BIN_PATH") {
+            Some(bin) if !bin.is_empty() => bin.to_string(),
+            _ => "herdr".to_string(),
         }
     }
-
-    /// `$XDG_CONFIG_HOME/herdr-linear-agent`: `config.toml`, written by the user.
-    pub fn config_dir(&self) -> PathBuf {
-        self.xdg("XDG_CONFIG_HOME", ".config").join(APP)
-    }
-
-    /// `$XDG_STATE_HOME/herdr-linear-agent`: runs, the ticker's lock and log,
-    /// progress records and the credential lock.
-    pub fn state_dir(&self) -> PathBuf {
-        self.xdg("XDG_STATE_HOME", ".local/state").join(APP)
-    }
-
-    /// `HERDR_BIN_PATH` when set, else `herdr` on `PATH`.
-    pub fn herdr_bin(&self) -> String {
-        self.var("HERDR_BIN_PATH").unwrap_or("herdr").to_string()
-    }
 }
 
-/// This binary's own path with symbolic links resolved, so a path written into
-/// AGENTS.md or a brief survives a link changing.
-pub fn binary() -> Result<PathBuf> {
-    let exe = std::env::current_exe().context("could not find this binary's own path")?;
-    Ok(std::fs::canonicalize(&exe).unwrap_or(exe))
-}
-
-/// What every subcommand works from: the environment and the runner all
-/// external commands go through.
+/// What a command runs with: the environment, the child-process runner, and
+/// whether `ticker start` may spawn a real ticker (never in tests).
 pub struct Ctx<'a> {
     pub env: &'a Env,
     pub runner: &'a dyn Runner,
-    /// False in tests, so commands that ensure a ticker never spawn a process.
     pub detached_ticker: bool,
 }
 
 impl Ctx<'_> {
-    pub fn state_dir(&self) -> PathBuf {
-        self.env.state_dir()
-    }
-
     pub fn config_dir(&self) -> PathBuf {
         self.env.config_dir()
     }
 
-    pub fn runs_dir(&self) -> PathBuf {
-        self.state_dir().join("runs")
+    pub fn state_dir(&self) -> PathBuf {
+        self.env.state_dir()
     }
 
-    /// Creates the state directory (mode 0700) when it is missing.
-    pub fn ensure_state_dir(&self) -> Result<PathBuf> {
-        let dir = self.state_dir();
-        if !dir.is_dir() {
-            use std::os::unix::fs::DirBuilderExt;
-            std::fs::DirBuilder::new()
-                .recursive(true)
-                .mode(0o700)
-                .create(&dir)
-                .with_context(|| format!("could not create {}", dir.display()))?;
-        }
-        Ok(dir)
+    pub fn runs_dir(&self) -> PathBuf {
+        self.env.state_dir().join("runs")
     }
+
+    /// The state directory, created when missing.
+    pub fn ensure_state_dir(&self) -> Result<PathBuf> {
+        let state = self.env.state_dir();
+        std::fs::create_dir_all(&state)
+            .map_err(|e| anyhow!("cannot create the state folder {}: {e}", state.display()))?;
+        Ok(state)
+    }
+}
+
+/// The absolute path of the running executable.
+pub fn binary() -> Result<PathBuf> {
+    std::env::current_exe().context("could not find the path of this executable")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::process::fake::FakeRunner;
+    use std::path::Path;
 
     #[test]
-    fn xdg_absolute_values_win_and_relative_ones_fall_back() {
-        let home = Path::new("/h");
-        let env = Env::for_test(
+    fn folders_follow_absolute_xdg_values_and_default_under_home() {
+        let home = Path::new("/home/ann");
+        // Herdr's plugin folder variables are never read.
+        let defaults = Env::for_test(
+            home,
+            &[
+                ("HERDR_PLUGIN_STATE_DIR", "/plugin/state"),
+                ("HERDR_PLUGIN_CONFIG_DIR", "/plugin/config"),
+            ],
+        );
+        assert_eq!(
+            defaults.config_dir(),
+            Path::new("/home/ann/.config/herdr-linear-agent")
+        );
+        assert_eq!(
+            defaults.state_dir(),
+            Path::new("/home/ann/.local/state/herdr-linear-agent")
+        );
+
+        let set = Env::for_test(
             home,
             &[("XDG_CONFIG_HOME", "/cfg"), ("XDG_STATE_HOME", "/st")],
         );
-        assert_eq!(env.config_dir(), PathBuf::from("/cfg/herdr-linear-agent"));
-        assert_eq!(env.state_dir(), PathBuf::from("/st/herdr-linear-agent"));
+        assert_eq!(set.config_dir(), Path::new("/cfg/herdr-linear-agent"));
+        assert_eq!(set.state_dir(), Path::new("/st/herdr-linear-agent"));
 
-        let env = Env::for_test(
-            home,
-            &[("XDG_CONFIG_HOME", "relative"), ("XDG_STATE_HOME", "")],
+        for bad in ["", "relative/dir", "./x"] {
+            let env = Env::for_test(home, &[("XDG_CONFIG_HOME", bad), ("XDG_STATE_HOME", bad)]);
+            assert_eq!(env.config_dir(), defaults.config_dir(), "{bad:?}");
+            assert_eq!(env.state_dir(), defaults.state_dir(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn the_herdr_binary_comes_from_a_non_empty_variable() {
+        let home = Path::new("/h");
+        assert_eq!(Env::for_test(home, &[]).herdr_bin(), "herdr");
+        assert_eq!(
+            Env::for_test(home, &[("HERDR_BIN_PATH", "")]).herdr_bin(),
+            "herdr"
         );
         assert_eq!(
-            env.config_dir(),
-            PathBuf::from("/h/.config/herdr-linear-agent")
-        );
-        assert_eq!(
-            env.state_dir(),
-            PathBuf::from("/h/.local/state/herdr-linear-agent")
+            Env::for_test(home, &[("HERDR_BIN_PATH", "/opt/herdr/bin/herdr")]).herdr_bin(),
+            "/opt/herdr/bin/herdr"
         );
     }
 
     #[test]
-    fn herdr_bin_prefers_the_variable() {
+    fn the_context_puts_runs_under_the_state_dir_and_creates_it_on_demand() {
+        let home = tempfile::tempdir().unwrap();
+        let env = Env::for_test(home.path(), &[]);
+        let runner = FakeRunner::new();
+        let ctx = Ctx {
+            env: &env,
+            runner: &runner,
+            detached_ticker: false,
+        };
+        let state = home.path().join(".local/state/herdr-linear-agent");
+        assert_eq!(ctx.runs_dir(), state.join("runs"));
         assert_eq!(
-            Env::for_test(Path::new("/h"), &[("HERDR_BIN_PATH", "/opt/herdr")]).herdr_bin(),
-            "/opt/herdr"
+            ctx.config_dir(),
+            home.path().join(".config/herdr-linear-agent")
         );
-        assert_eq!(
-            Env::for_test(Path::new("/h"), &[("HERDR_BIN_PATH", "")]).herdr_bin(),
-            "herdr"
-        );
+        assert!(!state.exists());
+        assert_eq!(ctx.ensure_state_dir().unwrap(), state);
+        assert!(state.is_dir());
     }
 }

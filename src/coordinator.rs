@@ -85,7 +85,7 @@ pub fn pending_record(record: &RunRecord, profile: &str, kind: &str) -> AgentRec
         status: AgentStatus::Pending,
         profile: profile.to_string(),
         kind: kind.to_string(),
-        agent_name: names::coordinator(&record.identifier, &record.issue_id),
+        agent_name: names::agent_name(&record.identifier, &record.issue_id, "coordinator"),
         ..AgentRecord::default()
     }
 }
@@ -472,6 +472,7 @@ mod tests {
         }
         assert_eq!(shown, [item]);
 
+        inbox::mark_seen(&f.run, &shown).unwrap();
         inbox::done(&f.run, &[], true).unwrap();
         let (_, shown) = digest(&f.run, &sample_config(), "/bin/hla", &[]).unwrap();
         assert!(shown.is_empty());

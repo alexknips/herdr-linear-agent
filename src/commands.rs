@@ -110,8 +110,23 @@ pub fn inbox_done(ctx: &Ctx, key: &str, ids: &[String], all: bool) -> Result<()>
     }
     let moved = inbox::done(&run, ids, all)?;
     ticker::poke(&ctx.state_dir());
-    println!("{moved} item(s) handled");
+    println!("{}", done_message(&run, moved));
     Ok(())
+}
+
+/// `--all` leaves the items written after the last `context`; the message
+/// says how many, so the coordinator reads them before it ends its turn.
+fn done_message(run: &Run, moved: usize) -> String {
+    let seen = inbox::seen(run);
+    let new = inbox::unhandled(run)
+        .iter()
+        .filter(|item| !seen.contains(&item.id))
+        .count();
+    if new == 0 {
+        format!("{moved} item(s) handled")
+    } else {
+        format!("{moved} item(s) handled; {new} new item(s) since your last context, run context")
+    }
 }
 
 pub async fn plan_set(ctx: &Ctx<'_>, key: &str, text: &str) -> Result<()> {
@@ -377,7 +392,7 @@ pub async fn worker_start<H: Herdr>(
             w.agent.status = AgentStatus::Pending;
             w.agent.profile = args.profile.clone();
             w.agent.kind = profile.kind.clone();
-            w.agent.agent_name = names::worker(key, &record.issue_id, &w.id);
+            w.agent.agent_name = names::agent_name(key, &record.issue_id, &w.id);
         },
     )?;
     let base = format!("origin/{}", repo.base);
@@ -1117,6 +1132,26 @@ mod tests {
         say(&setup.ctx(), "DATA-1", "Nobody listens.")
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn done_all_leaves_the_items_written_after_the_last_context() {
+        let setup = Setup::new(|c| c);
+        let run = setup.run();
+        inbox::write(&run, "worker", "w1", "shown").unwrap();
+        context(&setup.ctx(), Some(&setup.session), "DATA-1")
+            .await
+            .unwrap();
+        let later = inbox::write(&run, "worker", "w2", "later").unwrap();
+        inbox_done(&setup.ctx(), "DATA-1", &[], true).unwrap();
+        let left: Vec<String> = inbox::unhandled(&run).into_iter().map(|i| i.id).collect();
+        assert_eq!(left, std::slice::from_ref(&later));
+        assert_eq!(
+            done_message(&run, 1),
+            "1 item(s) handled; 1 new item(s) since your last context, run context"
+        );
+        inbox_done(&setup.ctx(), "DATA-1", std::slice::from_ref(&later), false).unwrap();
+        assert_eq!(done_message(&run, 1), "1 item(s) handled");
     }
 
     #[tokio::test]

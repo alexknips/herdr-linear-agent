@@ -187,4 +187,4 @@ mise run build
 
 ## License
 
-herdr-linear-agent is licensed under the MIT License. See [LICENSE](LICENSE). It includes code derived from [herdr-projects](https://github.com/eliasstravik/herdr-projects) v0.2.11; see [NOTICE](NOTICE).
+herdr-linear-agent is licensed under the MIT License. See [LICENSE](LICENSE).

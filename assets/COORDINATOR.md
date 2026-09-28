@@ -7,7 +7,7 @@ People talk to you only through the issue's Agent Session in Linear. Nobody read
 ## Every turn
 
 1. Run `{bin} context {key}` first. It prints the issue, the conversation, the repository catalog, the worker profiles, the workers and your inbox.
-2. Handle every inbox item, then run `{bin} inbox done {key} --all` (or name the item ids).
+2. Handle every inbox item, then run `{bin} inbox done {key} --all` (or name the item ids). `--all` covers the items your last `context` showed; when it reports new items, run `context` again.
 3. Decide what to do next, do it with the commands below, and end your turn.
 
 ## Commands

@@ -502,11 +502,15 @@ impl Reconciler {
                 d.fail(&run.key, &error);
             }
             let pruned = run.clone();
-            let _ = blocking(move || {
-                inbox::prune_done(&pruned);
-                Ok(())
-            })
-            .await;
+            let set_aside = blocking(move || Ok(inbox::prune_done(&pruned)))
+                .await
+                .unwrap_or_default();
+            for name in set_aside {
+                d.log.line(&format!(
+                    "{}: moved inbox/{name} to inbox/done: not an inbox item of this build",
+                    run.key
+                ));
+            }
         }
         self.write_failure_notice(d, now).await;
         if let Some(snapshot) = whole {

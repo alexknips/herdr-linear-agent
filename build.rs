@@ -1,30 +1,36 @@
-// Derived from herdr-projects v0.2.11 (https://github.com/eliasstravik/herdr-projects).
-// Copyright (c) 2026 Elias Stravik. MIT License; see NOTICE.
+//! Sets the two halves of the binary's version:
+//!
+//! - `HLA_RELEASE_VERSION`: the contents of `.release-version`;
+//! - `HLA_BUILD_ID`: the short git hash (`nogit` outside a checkout) and the
+//!   build time in Unix seconds, joined by `.`.
+//!
+//! No `rerun-if-changed` line is printed on purpose: Cargo then runs this
+//! again whenever a file of the package changes, so every rebuilt binary gets
+//! a new build id and a running ticker of an older build is replaced.
 
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-// No rerun-if-changed lines on purpose: cargo then reruns this script whenever
-// any file in the package changes, so a rebuilt binary always gets a new build
-// id and `ticker start` replaces a ticker that runs an older build.
-//
-// The release version comes from `.release-version`, which the Release PR
-// workflow writes; Cargo.toml's version is not bumped by releases.
 fn main() {
-    let release = std::fs::read_to_string(".release-version").expect(".release-version is missing");
-    println!("cargo:rustc-env=HLA_RELEASE_VERSION={}", release.trim());
+    let release = std::fs::read_to_string(".release-version")
+        .expect("cannot read .release-version")
+        .trim()
+        .to_string();
+    assert!(!release.is_empty(), ".release-version is empty");
+
     let hash = Command::new("git")
         .args(["rev-parse", "--short", "HEAD"])
         .output()
         .ok()
-        .filter(|o| o.status.success())
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+        .filter(|out| out.status.success())
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+        .filter(|hash| !hash.is_empty() && hash.chars().all(|c| c.is_ascii_hexdigit()))
         .unwrap_or_else(|| "nogit".to_string());
-    let secs = SystemTime::now()
+    let built = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    println!("cargo:rustc-env=HLA_BUILD_ID={hash}.{secs}");
+
+    println!("cargo:rustc-env=HLA_RELEASE_VERSION={release}");
+    println!("cargo:rustc-env=HLA_BUILD_ID={hash}.{built}");
 }
