@@ -80,6 +80,8 @@ Tools: asked to run `ls -la /` and read `../CLAUDE.md`, the reduced Claude Code 
 
 What remains is listed in README.md ("Routing agent kinds"). The items that could only be tested by writing to the user's config (Claude Code's `~/.claude/CLAUDE.md`, Codex's `~/.codex/AGENTS.md`) are marked there from the docs; the Codex one always loads, and it is empty on this machine.
 
+In the scratch Linear team (THLA-12, a documentation-only issue, candidates `coordinator` and `coordinator-docs`, the routing agent on `claude` haiku), the ticker picked the issue up 4.8 s after it was created, the routing agent chose `coordinator-docs` (recorded as `chosen by the routing agent`), the run's `AGENTS.md` carried that profile's instructions after the pointer to the sheet, and no routing folder was left in the temporary directory.
+
 The binary's own recipes ran once each against the real CLIs (`cargo test -- --ignored routing_live`): `claude` picked a candidate in 4.6 s and `codex` in 6.5 s, and the temporary folders were gone afterwards.
 
 `opencode` 2.0.15 is not registered: it has no login on this machine (only an `OPENAI_API_KEY` from the environment, which the plugin does not use), so no call could be measured. Its docs and a model-free check show that `OPENCODE_DISABLE_PROJECT_CONFIG=1` with `--standalone` drops the project layer, while the global config, plugins, MCP servers and `~/.config/opencode/AGENTS.md` stay, and `opencode run` has no schema option.
