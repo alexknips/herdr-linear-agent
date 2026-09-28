@@ -1463,3 +1463,50 @@ async fn a_worker_idle_right_after_its_launch_prompt_is_not_reported_idle() {
     world.settle().await;
     assert!(idle(&world), "a minute without any change is idle");
 }
+
+#[tokio::test]
+async fn only_a_person_editing_the_issue_writes_an_issue_item() {
+    let mut world = World::sample();
+    world.running_issue().await;
+    let issue_items = |world: &World| {
+        world
+            .inbox(KEY)
+            .iter()
+            .filter(|i| i.contains("The issue was edited in Linear"))
+            .count()
+    };
+    assert_eq!(
+        issue_items(&world),
+        0,
+        "the agent's activities are not edits"
+    );
+
+    world.message(KEY, "user-1", "Please also add a README.", None);
+    world.later(5);
+    world.settle().await;
+    assert!(world.text(KEY, "conversation.md").contains("add a README"));
+    assert_eq!(
+        issue_items(&world),
+        0,
+        "a reply in the session is not an edit"
+    );
+    assert!(
+        world
+            .text(KEY, "issue.md")
+            .contains("Please also add a README."),
+        "issue.md still lists every comment"
+    );
+
+    world
+        .fake()
+        .add_comment(KEY, "someone", "Note the API change in #12.");
+    world.later(5);
+    world.settle().await;
+    assert_eq!(issue_items(&world), 1, "a person's comment on the issue is");
+
+    world.fake().issue_mut(KEY)["description"] = json!("A new description.");
+    world.fake().issue_mut(KEY)["updatedAt"] = json!("2027-01-01T00:00:00.000Z");
+    world.later(5);
+    world.settle().await;
+    assert_eq!(issue_items(&world), 2, "an edited description is");
+}

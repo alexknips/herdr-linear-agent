@@ -356,12 +356,15 @@ impl Run {
 }
 
 /// The parts of an issue a person edits, hashed to tell a real edit from an
-/// `updatedAt` change the plugin's own writes caused.
+/// `updatedAt` change the plugin's own writes caused. Session comments are
+/// left out: the agent's activities show as comments, and replies are
+/// relayed on their own.
 pub fn issue_hash(issue: &IssueDetail) -> String {
     let labels: Vec<&str> = issue.labels.iter().map(|l| l.name.as_str()).collect();
     let comments: Vec<String> = issue
         .comments
         .iter()
+        .filter(|c| !c.in_session)
         .map(|c| format!("{}\n{}\n{}", c.author, c.created_at, c.body))
         .collect();
     files::sha256_hex(

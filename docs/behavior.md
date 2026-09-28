@@ -573,7 +573,7 @@ For every active run with a session, per update, in this order. A read that star
 3. `updatedAt` differs from `issue_updated_at`: refresh the issue.
 4. Relay the prompts.
 
-`refresh_issue`: read the issue, rewrite `issue.md`, store `issue_updated_at`, `issue_hash`, `title`, `labels`. When the hash changed, write an inbox item (`issue`, `issue`): `The issue was edited in Linear; issue.md is updated.` A change the plugin caused (a state move) changes `updatedAt` but not the hash, so it writes no item.
+`refresh_issue`: read the issue, rewrite `issue.md`, store `issue_updated_at`, `issue_hash`, `title`, `labels`. When the hash changed, write an inbox item (`issue`, `issue`): `The issue was edited in Linear; issue.md is updated.` A change the plugin caused (a state move) changes `updatedAt` but not the hash, so it writes no item. The hash also leaves out the comments of agent session threads (a root with `isArtificialAgentSessionRoot` or no user, and its children) and comments this app wrote: Linear shows every activity and every session reply as an issue comment, and replies reach the coordinator as `reply` items. `issue.md` still lists every comment. `tests/scenarios:only_a_person_editing_the_issue_writes_an_issue_item`
 
 `close_run`:
 

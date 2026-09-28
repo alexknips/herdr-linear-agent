@@ -45,7 +45,7 @@ const ISSUE_QUERY: &str = r#"query HlaIssue($id: String!) {
       states { nodes { id name type position } }
     }
     labels { nodes { name parent { name } } }
-    comments(first: 50) { nodes { body createdAt user { name } } }
+    comments(first: 50) { nodes { id parentId isArtificialAgentSessionRoot body createdAt user { name isMe } } }
   }
 }"#;
 
@@ -156,6 +156,10 @@ pub struct Comment {
     pub author: String,
     pub created_at: String,
     pub body: String,
+    /// Part of an agent session's thread (its root, an activity, or a reply)
+    /// or written by this app, rather than a person's comment on the issue.
+    #[serde(default)]
+    pub in_session: bool,
 }
 
 /// Everything the run folder's `issue.md` and the routing rules need.
@@ -604,6 +608,15 @@ fn parse_issue(issue: &Value) -> Result<IssueDetail, ApiError> {
     let states = nodes(field(team, "states")?)
         .map(parse_state)
         .collect::<Result<Vec<_>, _>>()?;
+    // Linear's bot opens each agent session's thread with a root comment of
+    // its own; the app's activities and the session's replies are its children.
+    let session_roots: Vec<&str> = nodes(&issue["comments"])
+        .filter(|c| {
+            c["isArtificialAgentSessionRoot"] == true
+                || (c["user"].is_null() && c["parentId"].is_null())
+        })
+        .filter_map(|c| c["id"].as_str())
+        .collect();
     Ok(IssueDetail {
         id: text(issue, "id")?,
         identifier: text(issue, "identifier")?,
@@ -634,7 +647,13 @@ fn parse_issue(issue: &Value) -> Result<IssueDetail, ApiError> {
             .collect::<Result<_, ApiError>>()?,
         comments: nodes(&issue["comments"])
             .map(|c| {
+                let in_session = session_roots.contains(&c["id"].as_str().unwrap_or(""))
+                    || c["parentId"]
+                        .as_str()
+                        .is_some_and(|p| session_roots.contains(&p))
+                    || c["user"]["isMe"] == true;
                 Ok(Comment {
+                    in_session,
                     author: c["user"]["name"]
                         .as_str()
                         .unwrap_or("(unknown)")
@@ -720,6 +739,9 @@ pub mod fake {
         pub headers: Option<Headers>,
         /// Headers of the responses not taken yet.
         pub received: Vec<RateHeaders>,
+        /// Session threads (root, activities, replies) do not show as issue
+        /// comments and so do not move `updatedAt`, for tests that count reads.
+        pub no_session_comments: bool,
         clock: i64,
     }
 
@@ -807,12 +829,72 @@ pub mod fake {
             let created_at = self.tick_clock();
             self.sessions.push(FakeSession {
                 id: id.clone(),
-                issue_id,
+                issue_id: issue_id.clone(),
                 status: "pending".into(),
                 created_at,
                 ..FakeSession::default()
             });
+            // Linear's bot opens the session's thread on the issue.
+            self.comment(
+                &issue_id,
+                json!({
+                    "id": format!("root-{id}"), "parentId": null, "isArtificialAgentSessionRoot": true,
+                    "user": null, "body": "This thread is for an agent session with herdr-agent."
+                }),
+            );
             id
+        }
+
+        /// Adds a comment to the issue and moves its `updatedAt`, as Linear
+        /// does for every comment, session activities and replies included.
+        fn comment(&mut self, issue_id: &str, mut node: Value) {
+            let in_thread = node["parentId"].is_string() || node["user"].is_null();
+            if self.no_session_comments && in_thread {
+                return;
+            }
+            let at = self.tick_clock();
+            node["createdAt"] = json!(at);
+            let issue = self
+                .issues
+                .iter_mut()
+                .find(|i| i["id"] == issue_id)
+                .expect("fake issue");
+            issue["comments"]["nodes"]
+                .as_array_mut()
+                .expect("comment nodes")
+                .push(node);
+            issue["updatedAt"] = json!(at);
+        }
+
+        /// A person's comment on the issue, outside any session.
+        pub fn add_comment(&mut self, identifier: &str, author: &str, body: &str) {
+            let issue_id = self.issue(identifier)["id"].as_str().unwrap().to_string();
+            let n = self.clock;
+            self.comment(
+                &issue_id,
+                json!({
+                    "id": format!("comment-{n}"), "parentId": null, "isArtificialAgentSessionRoot": false,
+                    "user": { "name": author, "isMe": false }, "body": body
+                }),
+            );
+        }
+
+        fn session_comment(&mut self, session_id: &str, author: &str, is_me: bool, body: &str) {
+            let n = self.clock;
+            let issue_id = self
+                .sessions
+                .iter()
+                .find(|s| s.id == session_id)
+                .map(|s| s.issue_id.clone())
+                .expect("fake session");
+            self.comment(
+                &issue_id,
+                json!({
+                    "id": format!("comment-{n}"), "parentId": format!("root-{session_id}"),
+                    "isArtificialAgentSessionRoot": false,
+                    "user": { "name": author, "isMe": is_me }, "body": body
+                }),
+            );
         }
 
         /// The session Linear creates by itself when the issue is delegated.
@@ -845,6 +927,8 @@ pub mod fake {
                 "id": format!("prompt-{n}"), "type": "prompt", "createdAt": created, "signal": signal,
                 "user": { "id": user_id }, "content": { "type": "prompt", "body": body }
             }));
+            let session_id = session.id.clone();
+            self.session_comment(&session_id, user_id, false, body);
         }
 
         pub fn count(&self, operation: &str) -> usize {
@@ -937,6 +1021,11 @@ pub mod fake {
                         activity["signal"] = Value::Null;
                     }
                     session.activities.push(activity);
+                    if input["ephemeral"] != true {
+                        let body = input["content"]["body"].as_str().unwrap_or("").to_string();
+                        let session_id = input["agentSessionId"].as_str().unwrap_or("").to_string();
+                        self.session_comment(&session_id, "herdr-agent", true, &body);
+                    }
                     Ok(
                         json!({ "agentActivityCreate": { "success": true, "agentActivity": { "id": input["id"] } } }),
                     )

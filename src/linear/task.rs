@@ -803,6 +803,7 @@ mod tests {
     fn setup(keys: &[&str], sessions: bool) -> Setup {
         let dir = tempfile::tempdir().unwrap();
         let mut fake = FakeLinear::default();
+        fake.no_session_comments = true;
         let mut runs = Vec::new();
         let mut issues = Vec::new();
         for key in keys {

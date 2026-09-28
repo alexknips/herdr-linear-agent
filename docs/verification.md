@@ -54,7 +54,3 @@ The first integration test ran on 2026-09-26 and 2026-09-27 with Herdr 0.9.1 and
 | A freshly started coordinator was judged lost: Herdr reports an agent it is still launching without a kind, and reports directories with symlinks resolved. | #37 |
 | `inbox done --all` moved an item the coordinator had not been shown yet (a worker's report). | #39 |
 | A worker idle before its launch prompt reached it was reported idle without a report and restarted; the restart then failed because `worktree.open` was sent without the checkout as `cwd`. | #40 |
-
-## Observations
-
-- Every agent activity and every reply in the session is also a comment on the issue, so each one changes the issue's hash and writes an "issue was edited" inbox item. The first test had the same behavior; the coordinator handles those items quickly, but they are noise.
