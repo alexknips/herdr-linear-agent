@@ -163,7 +163,6 @@ A worker's brief and report live inside its worktree because the worker runs the
 ## Working with other plugins
 
 - Worktree setup and cleanup are left to other plugins. [lamngockhuong/herdr-worktree-setup](https://github.com/lamngockhuong/herdr-worktree-setup) can copy `.env` files and run setup commands for new worktrees. [poislagarde/herdr-worktree-cleanup](https://github.com/poislagarde/herdr-worktree-cleanup) removes clean checkouts when their space closes; add `.herdr-linear-agent/` to its `disposable.gitignore`, or worker checkouts stay.
-- herdr-linear-agent can run next to herdr-projects: its state directory, branch prefix and pane tokens (`hla_*`) are its own, and it never replaces the Agents view. Remove herdr-projects' progress hooks if they would prime this plugin's agents too.
 
 ## Security notes
 
