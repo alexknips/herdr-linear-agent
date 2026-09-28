@@ -29,6 +29,13 @@
       automerge: true,
     },
     {
+      description: 'Keep reqwest on the version oauth2 depends on, so only one reqwest is compiled; lift this when oauth2 moves to a newer reqwest',
+      matchPackageNames: [
+        'reqwest',
+      ],
+      allowedVersions: '<0.13',
+    },
+    {
       description: 'Do not automerge major updates',
       matchUpdateTypes: [
         'major',
