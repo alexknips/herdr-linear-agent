@@ -43,13 +43,27 @@ pub fn sheet(bin: &str, key: &str) -> String {
         .replace("{key}", key)
 }
 
-pub fn agents_md(bin: &str, record: &RunRecord) -> String {
+pub fn agents_md(bin: &str, record: &RunRecord, instructions: Option<&str>) -> String {
     format!(
         "# herdr-linear-agent run {key}\n\n\
          If your working directory is this folder, you are the coordinator of the herdr-linear-agent run for the Linear issue {key} ({title}).\n\n\
          Run `{bin} skill {key}` now and follow the sheet it prints. Then run `{bin} context {key}` at the start of every turn.\n",
         key = record.identifier,
         title = record.title.replace('\n', " "),
+    ) + &profile_section(&record.coordinator.profile, "the sheet", instructions)
+}
+
+/// A profile's own `instructions`, after the built-in rules they may not
+/// override; nothing when the profile has none.
+pub fn profile_section(profile: &str, rules: &str, instructions: Option<&str>) -> String {
+    let Some(instructions) = instructions.filter(|t| !t.trim().is_empty()) else {
+        return String::new();
+    };
+    format!(
+        "\n## Profile instructions\n\n\
+         These come from the `{profile}` profile in the plugin's config and add to {rules}. \
+         Where they disagree with {rules}, follow {rules}.\n\n{}\n",
+        instructions.trim()
     )
 }
 
@@ -63,10 +77,15 @@ pub fn settings_local(bin: &str) -> serde_json::Value {
 
 /// Writes `AGENTS.md`, the `CLAUDE.md` link and the allow-list. Rewritten at
 /// every launch, so an updated binary's path is what the coordinator sees.
-pub fn write_priming(run: &Run, record: &RunRecord, bin: &str) -> Result<()> {
+pub fn write_priming(
+    run: &Run,
+    record: &RunRecord,
+    bin: &str,
+    instructions: Option<&str>,
+) -> Result<()> {
     write_atomic(
         &run.dir.join("AGENTS.md"),
-        agents_md(bin, record).as_bytes(),
+        agents_md(bin, record, instructions).as_bytes(),
     )?;
     let claude = run.dir.join("CLAUDE.md");
     if std::fs::read_link(&claude).ok().as_deref() != Some(Path::new("AGENTS.md")) {
@@ -312,7 +331,7 @@ mod tests {
     fn priming_points_the_coordinator_at_the_binary_and_allows_only_agent_commands() {
         let f = folder("Fix the\nlogin");
         std::os::unix::fs::symlink("elsewhere.md", f.run.dir.join("CLAUDE.md")).unwrap();
-        write_priming(&f.run, &f.record, BIN).unwrap();
+        write_priming(&f.run, &f.record, BIN, None).unwrap();
 
         let agents = std::fs::read_to_string(f.run.dir.join("AGENTS.md")).unwrap();
         let expected = [
@@ -357,7 +376,7 @@ mod tests {
         }
 
         // A second placement keeps the link and rewrites the text.
-        write_priming(&f.run, &f.record, "/usr/local/bin/hla").unwrap();
+        write_priming(&f.run, &f.record, "/usr/local/bin/hla", None).unwrap();
         assert!(
             std::fs::read_to_string(f.run.dir.join("CLAUDE.md"))
                 .unwrap()

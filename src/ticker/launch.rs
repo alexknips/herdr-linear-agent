@@ -349,7 +349,12 @@ impl Reconciler {
     ) -> Result<()> {
         // Rewritten at every placement, so an updated binary's path is what
         // the coordinator sees.
-        coordinator::write_priming(run, record, &self.bin)?;
+        let instructions = d
+            .config
+            .profiles
+            .get(&record.coordinator.profile)
+            .and_then(|p| p.instructions.as_deref());
+        coordinator::write_priming(run, record, &self.bin, instructions)?;
         let cwd = run.canonical_dir().to_string_lossy().into_owned();
         let label = coordinator::workspace_label(record);
         if let Some(found) = placed_before(snapshot, &record.coordinator, &cwd) {

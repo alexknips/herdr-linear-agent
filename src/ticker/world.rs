@@ -84,6 +84,20 @@ fn files_under(dir: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
     found
 }
 
+/// The script body of a fake `claude` routing agent that reads its input
+/// and picks `name`, in Claude Code's JSON result shape.
+pub fn answer_with(name: &str) -> String {
+    format!("cat > /dev/null\necho '{{\"structured_output\":{{\"coordinator\":\"{name}\"}}}}'\n")
+}
+
+fn write_router(bin: &Path, body: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(bin).unwrap();
+    let path = bin.join("claude");
+    std::fs::write(&path, format!("#!/bin/sh\n{body}")).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
 fn env_in(home: &Path, path: &str) -> Env {
     let root = home.to_string_lossy().into_owned();
     Env::for_test(
@@ -114,21 +128,20 @@ impl World {
     }
 
     /// A World whose config is the shared sample with its repositories under
-    /// the World's home, no routing agent, and `edit` applied.
+    /// the World's home and `edit` applied. Its routing agent is a fake
+    /// `claude` that picks `coordinator`; [`World::router`] replaces it.
     pub fn with(edit: impl FnOnce(String) -> String) -> World {
         let home = tempfile::tempdir().unwrap();
         let root = home.path().to_string_lossy().into_owned();
-        let env = env_in(home.path(), "/usr/bin:/bin");
+        let bin = home.path().join("bin");
+        let env = env_in(home.path(), &format!("{}:/usr/bin:/bin", bin.display()));
         let text = crate::config::tests::SAMPLE
-            .replace("path = \"/src/", &format!("path = \"{root}/src/"))
-            .replace(
-                "\n[routing.agent]\nprofile = \"router\"\ntimeout_seconds = 60\n",
-                "\n",
-            );
+            .replace("path = \"/src/", &format!("path = \"{root}/src/"));
         let text = edit(text);
         std::fs::create_dir_all(env.config_dir()).unwrap();
         std::fs::write(env.config_dir().join("config.toml"), &text).unwrap();
         let config = Config::parse(&text).unwrap();
+        write_router(&bin, &answer_with("coordinator"));
         let runner = FakeRunner::new();
         runner.on("git -C", fail(128, "not a git repository"));
         runner.on("fetch origin", ok(""));
@@ -412,23 +425,9 @@ impl World {
         self.reconciler.next_deadline(&deps, self.now)
     }
 
-    /// Puts `dir` in front of the `PATH` the ticker hands its children.
-    pub fn put_on_path(&mut self, dir: &Path) {
-        self.env = env_in(
-            self.home.path(),
-            &format!("{}:/usr/bin:/bin", dir.display()),
-        );
-    }
-
-    /// An executable script under the World's `bin` folder.
-    pub fn script(&self, name: &str, text: &str) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
-        let bin = self.home.path().join("bin");
-        std::fs::create_dir_all(&bin).unwrap();
-        let path = bin.join(name);
-        std::fs::write(&path, text).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        bin
+    /// Replaces the fake routing agent with a script body (after its shebang).
+    pub fn router(&self, body: &str) {
+        write_router(&self.home.path().join("bin"), body);
     }
 
     pub fn pause_intake(&self) {

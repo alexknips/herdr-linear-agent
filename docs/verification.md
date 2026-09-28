@@ -55,3 +55,32 @@ The first integration test ran on 2026-09-26 and 2026-09-27 with Herdr 0.9.1 and
 | A freshly started coordinator was judged lost: Herdr reports an agent it is still launching without a kind, and reports directories with symlinks resolved. | #37 |
 | `inbox done --all` moved an item the coordinator had not been shown yet (a worker's report). | #39 |
 | A worker idle before its launch prompt reached it was reported idle without a report and restarted; the restart then failed because `worktree.open` was sent without the checkout as `cwd`. | #40 |
+
+## Routing agent context (2026-09-28)
+
+The routing agent picks a coordinator from a closed list, and the binary re-checks the answer, so its context is cut for cost, speed and a steadier choice, not for safety. Each registered kind was run the same way: the fixed instruction, a 3-line issue on standard input, and a schema with 3 candidates. Each call ran 3 times with only the minimal headless flags (baseline) and 3 times with the recipe in `src/routing.rs` (reduced), in a fresh empty folder, with the real HOME, config dirs and environment. All twelve calls picked the same candidate.
+
+| Kind | Variant | Input tokens (avg) | Cost (avg) | Time (avg) |
+| --- | --- | --- | --- | --- |
+| `claude` (Claude Code 2.1.280, haiku) | baseline | 32,058 | $0.0410 | 15.1 s |
+| | reduced | 1,280 | $0.0033 | 5.7 s |
+| `codex` (codex-cli 0.156.1, gpt-5.6-luna) | baseline | 17,711 | not reported (ChatGPT login) | 9.4 s |
+| | reduced | 1,505 | not reported | 7.3 s |
+
+About 6 s of every codex call is fixed start-up time. The baseline's cost varies with prompt caching: the first claude baseline call wrote 32,051 cache tokens and cost $0.071.
+
+Marker test. The markers were in the parent of the working directory, in folders the calls could otherwise see: `CLAUDE.md`, `CLAUDE.local.md`, `AGENTS.md`, `.claude/rules`, `.claude/skills`, `.claude/agents`, `.claude/commands`, a `.claude/settings.json` with hooks and a project MCP server; for Codex, `.git`, `AGENTS.md`, a skill, and a project `.codex/config.toml` with an MCP server, a `developer_instructions` marker and hooks. The user's real config was not written.
+
+| Kind | Baseline saw | Reduced saw |
+| --- | --- | --- |
+| `claude` | the parent's `CLAUDE.md`, `CLAUDE.local.md` and rule markers; its hooks and MCP server ran; the user's real skills and agent types | nothing: no marker, no hook or MCP side effect, no skill |
+| `codex` | the project config, skill, `AGENTS.md` and both hook markers; its tools and the marker MCP server | nothing |
+
+Tools: asked to run `ls -la /` and read `../CLAUDE.md`, the reduced Claude Code call answered that only its structured-output tool exists, and the reduced Codex call could not run a command. The baselines tried and were denied, or ran them. The working directory held only the recipe's files after each reduced call; neither reduced call wrote a session file.
+
+What remains is listed in README.md ("Routing agent kinds"). The items that could only be tested by writing to the user's config (Claude Code's `~/.claude/CLAUDE.md`, Codex's `~/.codex/AGENTS.md`) are marked there from the docs; the Codex one always loads, and it is empty on this machine.
+
+The binary's own recipes ran once each against the real CLIs (`cargo test -- --ignored routing_live`): `claude` picked a candidate in 4.6 s and `codex` in 6.5 s, and the temporary folders were gone afterwards.
+
+`opencode` 2.0.15 is not registered: it has no login on this machine (only an `OPENAI_API_KEY` from the environment, which the plugin does not use), so no call could be measured. Its docs and a model-free check show that `OPENCODE_DISABLE_PROJECT_CONFIG=1` with `--standalone` drops the project layer, while the global config, plugins, MCP servers and `~/.config/opencode/AGENTS.md` stay, and `opencode run` has no schema option.
+

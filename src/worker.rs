@@ -279,6 +279,8 @@ pub struct BriefInput<'a> {
     pub task: &'a str,
     pub restart: bool,
     pub binary: &'a str,
+    /// The worker profile's `instructions`, added after the built-in rules.
+    pub instructions: Option<&'a str>,
 }
 
 pub fn compose_brief(input: &BriefInput) -> String {
@@ -307,6 +309,11 @@ pub fn compose_brief(input: &BriefInput) -> String {
         );
     }
     text.push_str(include_str!("../assets/WORKER.md").trim_end());
+    text.push_str(&crate::coordinator::profile_section(
+        &w.agent.profile,
+        "the rules above",
+        input.instructions,
+    ));
     text.push_str(&format!(
         "\n\n## Progress\n\n\
          Tell the plugin how far you are whenever your activity changes:\n\n\
@@ -759,6 +766,7 @@ mod tests {
                 task: "\n  Change the session handler.  \n",
                 restart,
                 binary: "/bin/hla",
+                instructions: None,
             })
         };
         let rules = include_str!("../assets/WORKER.md").lines().next().unwrap();
@@ -786,6 +794,31 @@ mod tests {
         }
         assert!(restarted.ends_with("Change the session handler.\n"));
         assert!(!brief(false).contains("previous attempt"));
+        assert!(!restarted.contains("## Profile instructions"));
+
+        let with_own = compose_brief(&BriefInput {
+            issue_key: "DATA-1",
+            issue_title: "Fix login",
+            issue_url: "https://linear.app/acme/issue/DATA-1",
+            worker: &worker,
+            task: "Change the session handler.",
+            restart: false,
+            binary: "/bin/hla",
+            instructions: Some("Run `make check` before you commit.\n"),
+        });
+        let last_rule = include_str!("../assets/WORKER.md")
+            .trim_end()
+            .lines()
+            .last()
+            .unwrap();
+        let rules_end = with_own.find(last_rule).unwrap() + last_rule.len();
+        let own = with_own.find("## Profile instructions").unwrap();
+        let task = with_own.find("## Task").unwrap();
+        assert!(rules_end < own && own < task, "{with_own}");
+        assert!(with_own.contains(
+            "These come from the `standard` profile in the plugin's config and add to the rules above. \
+             Where they disagree with the rules above, follow the rules above.\n\nRun `make check` before you commit.\n"
+        ));
     }
 
     #[test]

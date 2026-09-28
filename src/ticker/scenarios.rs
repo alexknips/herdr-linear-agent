@@ -6,7 +6,6 @@ use serde_json::{Value, json};
 
 use super::world::World;
 use crate::commands::{self, WorkerStart};
-use crate::config::Size;
 use crate::coordinator::{NUDGE_INBOX, NUDGE_REPLY};
 use crate::herdr::PaneId;
 use crate::linear::api::fake::APP_USER;
@@ -71,12 +70,8 @@ async fn a_delegated_issue_is_claimed_placed_started_and_prompted_once() {
 
     let (run, c) = (world.run(KEY), world.record(KEY));
     assert_eq!(
-        (
-            c.size,
-            c.size_source.as_str(),
-            c.coordinator.profile.as_str()
-        ),
-        (Size::S, "estimate", "coordinator-light")
+        (c.routing_source.as_str(), c.coordinator.profile.as_str()),
+        ("chosen by the routing agent", "coordinator")
     );
     assert_eq!(
         c.coordinator.status,
@@ -86,7 +81,7 @@ async fn a_delegated_issue_is_claimed_placed_started_and_prompted_once() {
     assert!(run.issue_md().is_file() && run.dir.join("AGENTS.md").is_file());
     let expected = [
         "Picked up DATA-1.",
-        "The coordinator uses the `coordinator-light` profile (size S from the estimate).",
+        "The coordinator uses the `coordinator` profile (chosen by the routing agent).",
     ];
     assert_eq!(world.bodies(KEY, "thought"), expected);
     assert_eq!(world.issue_state(KEY), "In Progress");
@@ -105,7 +100,17 @@ async fn a_delegated_issue_is_claimed_placed_started_and_prompted_once() {
     let start = &world.herdr.starts()[0];
     assert_eq!(start.name, "data-1-coordinator");
     assert!(
-        ends_with(&start.args, &["--model", "sonnet"]),
+        ends_with(
+            &start.args,
+            &[
+                "--model",
+                "opus",
+                "--effort",
+                "high",
+                "--permission-mode",
+                "auto"
+            ]
+        ),
         "{:?}",
         start.args
     );
@@ -182,25 +187,46 @@ async fn without_a_session_the_claim_still_decides_and_a_lost_decision_is_made_a
 }
 
 #[tokio::test]
-async fn an_unsized_issue_is_sized_by_the_routing_agent() {
-    let mut world =
-        World::with(|c| c + "\n[routing.agent]\nprofile = \"router\"\ntimeout_seconds = 60\n");
-    let answer = r#"{"structured_output":{"size":"XS"}}"#;
-    let bin = world.script(
-        "claude",
-        &format!("#!/bin/sh\ncat > /dev/null\necho '{answer}'\n"),
-    );
-    world.put_on_path(&bin);
+async fn the_routing_agent_picks_a_candidate_and_its_instructions_reach_agents_md() {
+    let mut world = World::sample();
+    world.router(&crate::ticker::world::answer_with("coordinator-light"));
     world.delegate(KEY, "Tiny", None);
     world.settle().await;
-    let sized = world.record(KEY);
+    let record = world.record(KEY);
     assert_eq!(
-        (sized.size, sized.size_source, sized.coordinator.profile),
         (
-            Size::XS,
-            "agent".to_string(),
-            "coordinator-light".to_string()
+            record.coordinator.profile.as_str(),
+            record.routing_source.as_str()
+        ),
+        ("coordinator-light", "chosen by the routing agent")
+    );
+    assert!(
+        world.bodies(KEY, "thought").contains(
+            &"The coordinator uses the `coordinator-light` profile (chosen by the routing agent)."
+                .to_string()
         )
+    );
+    let agents_md = world.text(KEY, "AGENTS.md");
+    let sheet = agents_md.find("skill DATA-1").expect("the sheet pointer");
+    let own = agents_md
+        .find("## Profile instructions")
+        .expect("the profile's section");
+    assert!(sheet < own, "{agents_md}");
+    assert!(agents_md.contains("Prefer one worker. Ask before you split the work."));
+    assert!(agents_md.contains("Where they disagree with the sheet, follow the sheet."));
+}
+
+#[tokio::test]
+async fn a_name_outside_the_candidates_falls_back_to_the_default() {
+    let mut world = World::sample();
+    world.router(&crate::ticker::world::answer_with("deep"));
+    world.delegate(KEY, "Anything", None);
+    world.settle().await;
+    let record = world.record(KEY);
+    assert_eq!(record.coordinator.profile, "coordinator");
+    assert_eq!(
+        record.routing_source,
+        "the default: the routing agent's answer was not valid (`deep` is not a candidate)"
     );
 }
 
@@ -1336,17 +1362,18 @@ async fn a_waiting_self_report_wakes_the_ticker_when_it_expires() {
 
 #[tokio::test]
 async fn a_routing_agent_that_never_reads_its_input_times_out() {
-    let mut world =
-        World::with(|c| c + "\n[routing.agent]\nprofile = \"router\"\ntimeout_seconds = 1\n");
-    let bin = world.script("claude", "#!/bin/sh\nsleep 30\n");
-    world.put_on_path(&bin);
+    let mut world = World::with(|c| c.replace("timeout_seconds = 60", "timeout_seconds = 1"));
+    world.router("sleep 30\n");
     world.delegate(KEY, "Huge", None);
     world.fake().issue_mut(KEY)["description"] = json!("x".repeat(1 << 20));
     world.settle().await;
     let routed = world.record(KEY);
     assert_eq!(
-        (routed.size, routed.size_source.as_str()),
-        (Size::Unknown, "agent (timed out)")
+        (
+            routed.coordinator.profile.as_str(),
+            routed.routing_source.as_str()
+        ),
+        ("coordinator", "the default: the routing agent timed out")
     );
 }
 

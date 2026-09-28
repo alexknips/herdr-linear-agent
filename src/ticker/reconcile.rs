@@ -27,7 +27,7 @@ use jiff::{SignedDuration, Timestamp};
 use tokio::sync::{Notify, mpsc, watch};
 
 use super::Log;
-use crate::config::{Config, Size};
+use crate::config::Config;
 use crate::herdr::{Herdr, HerdrError, Link, PaneId, Placed, Snapshot};
 use crate::linear::api::{Activity, Content};
 use crate::linear::task::{LinearEvent, LinearLevel, RunQuery};
@@ -137,17 +137,9 @@ pub(super) enum Effect {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum RoutingOutcome {
-    Answered(Size),
-    TimedOut,
-    /// The agent could not be started or waited for.
-    Failed(String),
-}
-
-#[derive(Debug, Clone, PartialEq)]
 pub struct RoutingDone {
     pub key: String,
-    pub outcome: RoutingOutcome,
+    pub choice: crate::routing::Choice,
 }
 
 /// What woke the pass, each handled exactly once.

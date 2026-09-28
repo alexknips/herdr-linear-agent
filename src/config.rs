@@ -1,7 +1,7 @@
 //! `$XDG_CONFIG_HOME/herdr-linear-agent/config.toml`, written by the user.
 //!
 //! The config is the only place that names Linear teams, repositories, agent
-//! profiles (kind, model, effort, approval flags), routing rules, limits and
+//! profiles (kind, model, effort, approval flags), the routing candidates, limits and
 //! the Herdr session. Agents choose among these by name; they never pass a
 //! raw flag.
 
@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 
-use crate::agents;
+use crate::{agents, routing};
 
 pub const FILE_NAME: &str = "config.toml";
 pub const DEFAULT_CALLBACK_PORT: u16 = 43871;
@@ -147,101 +147,29 @@ pub struct Profile {
     pub args: Vec<String>,
     #[serde(default)]
     pub description: String,
+    /// Markdown the plugin adds to the agent's instructions for work under
+    /// this profile, after the built-in sheet. Only people write it here.
+    #[serde(default)]
+    pub instructions: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Routing {
-    /// The coordinator profile when no rule matches.
+    /// The profile of the routing agent that picks each issue's coordinator.
+    pub agent: String,
+    /// The coordinator profiles the routing agent may pick from.
+    pub coordinators: Vec<String>,
+    /// The coordinator when the routing agent gives no valid answer.
     pub default: String,
-    /// The label group whose label names are sizes.
-    #[serde(default)]
-    pub size_label_group: Option<String>,
-    /// The profiles a coordinator may start workers with.
-    pub workers: Vec<String>,
-    #[serde(default)]
-    pub agent: Option<RoutingAgent>,
-    #[serde(default)]
-    pub rules: Vec<Rule>,
-}
-
-#[derive(Debug, Clone, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub struct RoutingAgent {
-    pub profile: String,
     #[serde(default = "default_routing_timeout")]
     pub timeout_seconds: u64,
+    /// The profiles a coordinator may start workers with.
+    pub workers: Vec<String>,
 }
 
 fn default_routing_timeout() -> u64 {
     120
-}
-
-#[derive(Debug, Clone, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub struct Rule {
-    #[serde(default)]
-    pub sizes: Vec<Size>,
-    #[serde(default)]
-    pub teams: Vec<String>,
-    #[serde(default)]
-    pub labels_any: Vec<String>,
-    pub coordinator: String,
-}
-
-/// An issue's size, from its estimate, a size label or the routing agent.
-/// The variants are T-shirt sizes, spelled as people write them.
-#[allow(clippy::upper_case_acronyms)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
-pub enum Size {
-    XS,
-    S,
-    M,
-    L,
-    XL,
-    XXL,
-    XXXL,
-    #[default]
-    #[serde(rename = "unknown")]
-    Unknown,
-}
-
-impl Size {
-    pub const KNOWN: [Size; 7] = [
-        Size::XS,
-        Size::S,
-        Size::M,
-        Size::L,
-        Size::XL,
-        Size::XXL,
-        Size::XXXL,
-    ];
-
-    pub fn name(self) -> &'static str {
-        match self {
-            Size::XS => "XS",
-            Size::S => "S",
-            Size::M => "M",
-            Size::L => "L",
-            Size::XL => "XL",
-            Size::XXL => "XXL",
-            Size::XXXL => "XXXL",
-            Size::Unknown => "unknown",
-        }
-    }
-
-    pub fn parse(text: &str) -> Option<Size> {
-        Self::KNOWN
-            .into_iter()
-            .chain([Size::Unknown])
-            .find(|s| s.name() == text)
-    }
-}
-
-impl std::fmt::Display for Size {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.name())
-    }
 }
 
 impl Config {
@@ -332,30 +260,30 @@ impl Config {
         }
 
         let routing = &self.routing;
+        let agent = self.profile(&routing.agent).context("routing.agent")?;
+        ensure!(
+            routing::registered(&agent.kind),
+            "routing.agent: the `{}` kind cannot be a routing agent",
+            agent.kind
+        );
+        ensure!(
+            !routing.coordinators.is_empty(),
+            "routing.coordinators lists no profile"
+        );
+        for name in &routing.coordinators {
+            self.profile(name).context("routing.coordinators")?;
+        }
         self.profile(&routing.default).context("routing.default")?;
+        ensure!(
+            routing.timeout_seconds >= 1,
+            "routing.timeout_seconds must be at least 1"
+        );
         ensure!(
             !routing.workers.is_empty(),
             "routing.workers lists no profile"
         );
         for name in &routing.workers {
             self.profile(name).context("routing.workers")?;
-        }
-        for (n, rule) in routing.rules.iter().enumerate() {
-            self.profile(&rule.coordinator)
-                .with_context(|| format!("routing.rules[{n}].coordinator"))?;
-        }
-        if let Some(agent) = &routing.agent {
-            let profile = self
-                .profile(&agent.profile)
-                .context("routing.agent.profile")?;
-            ensure!(
-                matches!(profile.kind.as_str(), "claude" | "codex"),
-                "routing.agent.profile must be a `claude` or `codex` profile: only they return schema-checked JSON headless"
-            );
-            ensure!(
-                agent.timeout_seconds >= 1,
-                "routing.agent.timeout_seconds must be at least 1"
-            );
         }
         Ok(())
     }
@@ -435,6 +363,9 @@ description = "default coordinator"
 kind = "claude"
 model = "sonnet"
 description = "small issues"
+instructions = """
+Prefer one worker. Ask before you split the work.
+"""
 
 [profiles.router]
 kind = "claude"
@@ -455,17 +386,11 @@ args = ["-s", "workspace-write"]
 description = "cross-module changes"
 
 [routing]
+agent = "router"
+coordinators = ["coordinator", "coordinator-light"]
 default = "coordinator"
-size_label_group = "size"
-workers = ["standard", "deep"]
-
-[routing.agent]
-profile = "router"
 timeout_seconds = 60
-
-[[routing.rules]]
-sizes = ["XS", "S"]
-coordinator = "coordinator-light"
+workers = ["standard", "deep"]
 "#;
 
     #[test]
@@ -475,7 +400,19 @@ coordinator = "coordinator-light"
         assert_eq!(config.linear.review_state, "In Review");
         assert_eq!(config.limits, Limits::default());
         assert!(config.notifications.herdr);
-        assert_eq!(config.routing.rules[0].sizes, [Size::XS, Size::S]);
+        assert_eq!(
+            config.routing.coordinators,
+            ["coordinator", "coordinator-light"]
+        );
+        assert_eq!(
+            config
+                .profile("coordinator-light")
+                .unwrap()
+                .instructions
+                .as_deref(),
+            Some("Prefer one worker. Ask before you split the work.\n")
+        );
+        assert_eq!(config.profile("coordinator").unwrap().instructions, None);
         assert_eq!(config.worker_profile("deep").unwrap().kind, "codex");
         assert!(config.worker_profile("coordinator").is_err());
         assert!(
@@ -502,7 +439,21 @@ coordinator = "coordinator-light"
             "workers = [\"missing\"]",
         );
         bad("path = \"/src/api\"", "path = \"src/api\"");
-        bad("profile = \"router\"", "profile = \"deep-x\"");
+        bad("agent = \"router\"", "agent = \"deep-x\"");
+        bad(
+            "coordinators = [\"coordinator\", \"coordinator-light\"]",
+            "coordinators = [\"coordinator\", \"missing\"]",
+        );
+        bad(
+            "coordinators = [\"coordinator\", \"coordinator-light\"]",
+            "coordinators = []",
+        );
+        bad("timeout_seconds = 60", "timeout_seconds = 0");
+        // The size-based routing is gone.
+        bad(
+            "default = \"coordinator\"",
+            "default = \"coordinator\"\nsize_label_group = \"size\"",
+        );
         bad("[herdr]", "[herdr]\nunknown = 1");
         // Effort only for kinds with an effort flag.
         let cursor = SAMPLE.replace(
@@ -550,10 +501,14 @@ coordinator = "coordinator-light"
     }
 
     #[test]
-    fn sizes_parse_and_print() {
-        assert_eq!(Size::parse("XXL"), Some(Size::XXL));
-        assert_eq!(Size::parse("unknown"), Some(Size::Unknown));
-        assert_eq!(Size::parse("huge"), None);
-        assert_eq!(Size::M.to_string(), "M");
+    fn a_routing_agent_must_be_a_registered_kind() {
+        let text = SAMPLE.replace(
+            "[profiles.router]\nkind = \"claude\"\nmodel = \"haiku\"",
+            "[profiles.router]\nkind = \"cursor\"",
+        );
+        assert_eq!(
+            Config::parse(&text).unwrap_err().to_string(),
+            "routing.agent: the `cursor` kind cannot be a routing agent"
+        );
     }
 }

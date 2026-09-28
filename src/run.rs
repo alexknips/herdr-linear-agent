@@ -22,7 +22,6 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::config::Size;
 use crate::files::{self, write_atomic};
 use crate::herdr::Placed;
 use crate::linear::api::{ExternalUrl, IssueDetail};
@@ -171,9 +170,9 @@ pub struct RunRecord {
     pub issue_updated_at: String,
     /// A hash of the snapshot parts a person edits (not the state).
     pub issue_hash: String,
-    pub size: Size,
-    /// Where the size came from: `estimate`, `label`, `agent` or `default`.
-    pub size_source: String,
+    /// Where the coordinator profile came from: the routing agent or the
+    /// default, with the reason.
+    pub routing_source: String,
     pub coordinator: AgentRecord,
     /// Prompts created after this timestamp have not been read yet.
     pub prompt_cursor: String,
@@ -449,7 +448,7 @@ mod tests {
     }
 
     #[test]
-    fn a_record_with_an_older_builds_routing_job_still_reads() {
+    fn a_record_with_an_older_builds_routing_fields_still_reads() {
         let dir = tempfile::tempdir().unwrap();
         let record = RunRecord {
             identifier: "DATA-1".into(),
@@ -458,14 +457,14 @@ mod tests {
         let run = Run::create(dir.path(), record).unwrap();
         std::fs::write(
             run.record_path(),
-            r#"{"identifier":"DATA-1","size_source":"agent",
+            r#"{"identifier":"DATA-1","size":"S","size_source":"agent",
                 "routing":{"pid":4242,"started":"2026-01-01T00:00:00Z","output":""}}"#,
         )
         .unwrap();
         let record = run.record().unwrap();
         assert_eq!(
-            (record.identifier.as_str(), record.size_source.as_str()),
-            ("DATA-1", "agent")
+            (record.identifier.as_str(), record.routing_source.as_str()),
+            ("DATA-1", "")
         );
     }
 

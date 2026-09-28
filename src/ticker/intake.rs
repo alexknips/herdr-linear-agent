@@ -5,10 +5,8 @@ use anyhow::Result;
 use jiff::Timestamp;
 
 use super::reconcile::{
-    Deps, Reconciler, RoutingDone, RoutingOutcome, blocking, inbox_item, thought, update_run,
-    update_worker,
+    Deps, Reconciler, RoutingDone, blocking, inbox_item, thought, update_run, update_worker,
 };
-use crate::config::Size;
 use crate::herdr::{Herdr, Snapshot, WorkspaceId};
 use crate::linear::api::{Activity, Content, IssueDetail, IssueRef, Prompt, RunUpdate};
 use crate::linear::task::{LinearEvent, LinearLevel};
@@ -564,48 +562,35 @@ impl Reconciler {
         self.route(d, run, detail).await
     }
 
-    /// Decides the size from the estimate or a size label, or starts the
-    /// routing agent in its own task.
+    /// Starts the routing agent in its own task; its choice comes back as a
+    /// `RoutingDone`.
     async fn route<H: Herdr>(
         &mut self,
         d: &Deps<'_, H>,
         run: &Run,
         detail: &IssueDetail,
     ) -> Result<()> {
-        if let Some((size, source)) = routing::known_size(d.config, detail) {
-            return self.decide(d, run, size, source).await;
-        }
-        let Some(agent) = &d.config.routing.agent else {
-            return self.decide(d, run, Size::Unknown, "default").await;
-        };
-        let profile = d.config.profile(&agent.profile)?.clone();
-        let timeout = std::time::Duration::from_secs(agent.timeout_seconds);
-        let state_dir = run.state_dir();
+        let routing = &d.config.routing;
+        let profile = d.config.profile(&routing.agent)?.clone();
+        let candidates = routing::candidates(d.config);
+        let timeout = std::time::Duration::from_secs(routing.timeout_seconds);
         let issue = detail.clone();
         let path = d.ctx.env.var("PATH").map(str::to_string);
+        let parent = std::env::temp_dir();
         let key = run.key.clone();
         let done = self.routing_done.clone();
         self.routing.insert(key.clone());
         tokio::spawn(async move {
-            let outcome = match routing::spawn(&profile, &state_dir, path.as_deref()).await {
-                Err(error) => RoutingOutcome::Failed(format!("{error:#}")),
-                Ok((output, mut child)) => {
-                    let answered =
-                        tokio::time::timeout(timeout, routing::answer(&mut child, &issue)).await;
-                    match answered {
-                        Ok(Ok(_)) => {
-                            let text = std::fs::read_to_string(&output).unwrap_or_default();
-                            RoutingOutcome::Answered(routing::parse_output(&text))
-                        }
-                        Ok(Err(error)) => RoutingOutcome::Failed(error.to_string()),
-                        Err(_) => {
-                            let _ = child.kill().await;
-                            RoutingOutcome::TimedOut
-                        }
-                    }
-                }
-            };
-            let _ = done.send(RoutingDone { key, outcome }).await;
+            let choice = routing::choose(
+                &profile,
+                &candidates,
+                &issue,
+                timeout,
+                path.as_deref(),
+                &parent,
+            )
+            .await;
+            let _ = done.send(RoutingDone { key, choice }).await;
         });
         Ok(())
     }
@@ -615,52 +600,39 @@ impl Reconciler {
         let Ok(run) = Run::load(&d.ctx.runs_dir(), &done.key) else {
             return;
         };
-        let (size, source) = match done.outcome {
-            RoutingOutcome::Answered(size) => (size, "agent"),
-            RoutingOutcome::TimedOut => (Size::Unknown, "agent (timed out)"),
-            RoutingOutcome::Failed(error) => {
-                d.log.line(&format!("{}: {error}", run.key));
-                (Size::Unknown, "agent")
-            }
-        };
-        if let Err(error) = self.decide(d, &run, size, source).await {
+        if let routing::Choice::Default(routing::Fallback::Failed(error)) = &done.choice {
+            d.log
+                .line(&format!("{}: the routing agent failed: {error}", run.key));
+        }
+        if let Err(error) = self.decide(d, &run, &done.choice).await {
             d.fail(&run.key, &error);
         }
     }
 
-    /// Picks the coordinator profile and reserves the coordinator's launch.
+    /// Records the coordinator profile and reserves the coordinator's launch.
     async fn decide<H: Herdr>(
         &mut self,
         d: &Deps<'_, H>,
         run: &Run,
-        size: Size,
-        source: &str,
+        choice: &routing::Choice,
     ) -> Result<()> {
         let record = run.record()?;
         if !record.coordinator.profile.is_empty() || record.status != Status::Active {
             return Ok(());
         }
-        let name = routing::coordinator_profile(d.config, size, &record.team_key, &record.labels)
-            .to_string();
+        let name = choice.profile(d.config).to_string();
         let profile = d.config.profile(&name)?;
         let mut pending = coordinator::pending_record(&record, &name, &profile.kind);
         pending.agent_session = record.coordinator.agent_session.clone();
-        let stored_source = source.to_string();
-        let why = match (size, source) {
-            (Size::Unknown, "default") => "size unknown".to_string(),
-            (Size::Unknown, source) => format!("size unknown after the routing {source}"),
-            (size, "agent") => format!("size {size} from the routing agent"),
-            (size, source) => format!("size {size} from the {source}"),
-        };
+        let source = choice.source();
         self.update_and_push(run, move |r| {
             if !r.coordinator.profile.is_empty() {
                 return Vec::new();
             }
-            r.size = size;
-            r.size_source = stored_source;
+            r.routing_source = source.clone();
             r.coordinator = pending;
             vec![thought(format!(
-                "The coordinator uses the `{name}` profile ({why})."
+                "The coordinator uses the `{name}` profile ({source})."
             ))]
         })
         .await
