@@ -41,7 +41,8 @@ The first integration test ran on 2026-09-26 and 2026-09-27 with Herdr 0.9.1 and
 | Limits | THLA-9, THLA-10 | With `max_agents = 3`, THLA-10's worker was refused until THLA-9 closed, then started. |
 | Worker restart | THLA-10 | After the fix below, `worker restart` reopened the kept worktree and the run finished. |
 | Stop | THLA-8 | `Stopped 2 agent(s) as asked...` was posted, the worktree and branch stayed, and no prompt reached the agents until a reply. |
-| Close | THLA-7 to THLA-10 | Done or Canceled closed the run and its workspaces within about 4 s. |
+| Issue edits | THLA-11 | After #42, an agent activity (04:15:21) and a reply in the session (04:15:59) wrote no "issue was edited" item, while a person's plain comment on the issue (04:17:06) wrote one; `issue.md` listed all of them. A reply in the session did not move the issue's `updatedAt`; the activity and the plain comment did. |
+| Close | THLA-7 to THLA-11 | Done or Canceled closed the run and its workspaces within about 4 s. |
 
 ## Bugs the test found
 
