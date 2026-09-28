@@ -409,9 +409,15 @@ impl Herdr for FakeHerdr {
         model.placed(pane, Some(path))
     }
 
-    async fn worktree_open(&self, path: &str) -> Result<Placed, HerdrError> {
+    async fn worktree_open(&self, cwd: &str, path: &str) -> Result<Placed, HerdrError> {
         let mut model = self.model();
         model.request("worktree.open")?;
+        if cwd.is_empty() {
+            return Err(HerdrError::Api {
+                code: "not_git_worktree".into(),
+                message: "Herdr worktree actions require a workspace inside a Git work tree".into(),
+            });
+        }
         let pane = model.new_workspace(path, path);
         model.placed(pane, Some(path.into()))
     }

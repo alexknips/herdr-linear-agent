@@ -329,9 +329,11 @@ impl Reconciler {
                 }
             }
         }
-        self.prompt_coordinator(d, snapshot, run, &record).await?;
+        self.prompt_coordinator(d, snapshot, run, &record, now)
+            .await?;
         for w in &workers {
-            self.prompt_worker(d, snapshot, run, &record, w).await?;
+            self.prompt_worker(d, snapshot, run, &record, w, now)
+                .await?;
         }
         Ok(())
     }
@@ -430,6 +432,7 @@ impl Reconciler {
         snapshot: &Snapshot,
         run: &Run,
         record: &RunRecord,
+        now: Timestamp,
     ) -> Result<()> {
         let c = &record.coordinator;
         if c.status != AgentStatus::Open
@@ -447,7 +450,13 @@ impl Reconciler {
         let text = coordinator::launch_prompt(&run.key, c.resume);
         delivered(d.herdr.agent_prompt(&agent.pane, &text).await)?;
         self.prompted.insert(run.key.clone());
-        update_run(run, |r| r.coordinator.prompt_pending = false).await?;
+        let seq = agent.state_change_seq;
+        update_run(run, move |r| {
+            r.coordinator.prompt_pending = false;
+            r.coordinator.prompted_at = now.to_string();
+            r.coordinator.prompted_seq = seq;
+        })
+        .await?;
         Ok(())
     }
 
@@ -460,6 +469,7 @@ impl Reconciler {
         run: &Run,
         record: &RunRecord,
         w: &worker::Worker,
+        now: Timestamp,
     ) -> Result<()> {
         if w.agent.status != AgentStatus::Open || !w.agent.prompt_pending || record.stopped {
             return Ok(());
@@ -472,9 +482,14 @@ impl Reconciler {
         self.launched.remove(&AgentKey::worker(&run.key, &w.id));
         let prompt = worker::launch_prompt(&run.key, &w.id);
         delivered(d.herdr.agent_prompt(&agent.pane, &prompt).await)?;
+        let seq = agent.state_change_seq;
         let id = w.id.clone();
         self.guarded(run, move |run, lock| {
-            let w = worker::update_held(run, lock, &id, |w| w.agent.prompt_pending = false)?;
+            let w = worker::update_held(run, lock, &id, |w| {
+                w.agent.prompt_pending = false;
+                w.agent.prompted_at = now.to_string();
+                w.agent.prompted_seq = seq;
+            })?;
             Ok(((), vec![worker::start_action(&w)]))
         })
         .await

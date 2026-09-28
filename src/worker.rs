@@ -24,6 +24,9 @@ pub const BLOCKED_SECS: i64 = 30;
 pub const LAUNCH_DIALOG_SECS: i64 = 60;
 /// A `Waiting for you` self-report counts for this long.
 pub const SELF_REPORT_SECS: i64 = 5 * 60;
+/// How long an idle status right after the launch prompt still counts as
+/// the agent picking the prompt up.
+const JUST_PROMPTED_SECS: i64 = 60;
 
 /// `workers/<id>.toml`. Every field is defaulted, so records written by an
 /// older build still load.
@@ -387,6 +390,9 @@ pub struct Live {
     pub state_secs: i64,
     /// The worker's own progress record, when it is recent.
     pub self_report: Option<progress::Record>,
+    /// The launch prompt went out less than a minute ago and the agent has
+    /// not changed state since, so an idle status is from before the prompt.
+    pub just_prompted: bool,
 }
 
 pub fn live_state(
@@ -420,6 +426,11 @@ pub fn live_state(
     };
     live.pane_exists = true;
     live.agent_state = live.agent.as_ref().map(|a| a.status);
+    live.just_prompted = live.agent.as_ref().is_some_and(|a| {
+        !record.prompted_at.is_empty()
+            && a.state_change_seq == record.prompted_seq
+            && files::seconds_since(&record.prompted_at, now) < JUST_PROMPTED_SECS
+    });
     if let Some(status) = live.agent_state
         && status.as_str() == record.last_state
     {
@@ -508,6 +519,16 @@ pub fn group(worker: &Worker, live: &Live) -> Group {
         Group::Working
     } else if reported {
         Group::Reported
+    } else if worker.agent.prompt_pending
+        || live.just_prompted
+        || live
+            .self_report
+            .as_ref()
+            .is_some_and(|r| r.percent != Some(100))
+    {
+        // Idle without a report, but not stuck: the prompt has not reached
+        // the agent yet, or its own progress record says it is under way.
+        Group::Working
     } else {
         Group::Idle
     }
@@ -1301,6 +1322,47 @@ last_group = "waiting"
                 api_worker(Open, "h", false),
                 in_pane(Some(Done), 0),
                 Group::Reported,
+            ),
+            (
+                "idle before its launch prompt went out",
+                api_worker(Open, "", true),
+                in_pane(Some(Idle), 0),
+                Group::Working,
+            ),
+            (
+                "idle right after its launch prompt",
+                api_worker(Open, "", false),
+                Live {
+                    just_prompted: true,
+                    ..in_pane(Some(Idle), 0)
+                },
+                Group::Working,
+            ),
+            (
+                "idle with a recent self-report under way",
+                api_worker(Open, "", false),
+                Live {
+                    self_report: Some(progress::Record {
+                        activity: "Writing tests".into(),
+                        percent: Some(40),
+                        ..progress::Record::default()
+                    }),
+                    ..in_pane(Some(Idle), 0)
+                },
+                Group::Working,
+            ),
+            (
+                "idle with a self-report at 100 percent",
+                api_worker(Open, "", false),
+                Live {
+                    self_report: Some(progress::Record {
+                        activity: "Done".into(),
+                        percent: Some(100),
+                        ..progress::Record::default()
+                    }),
+                    ..in_pane(Some(Idle), 0)
+                },
+                Group::Idle,
             ),
             (
                 "idle without a report",

@@ -45,7 +45,13 @@ pub trait Herdr: Send + Sync {
         base: &str,
     ) -> impl Future<Output = Result<Placed, HerdrError>> + Send;
 
-    fn worktree_open(&self, path: &str) -> impl Future<Output = Result<Placed, HerdrError>> + Send;
+    /// `cwd` is the repository checkout: Herdr refuses to open a worktree
+    /// without it (`not_git_worktree`).
+    fn worktree_open(
+        &self,
+        cwd: &str,
+        path: &str,
+    ) -> impl Future<Output = Result<Placed, HerdrError>> + Send;
 
     fn agent_start(
         &self,
@@ -164,8 +170,8 @@ impl Herdr for Client {
         Ok(answer.placed(cwd))
     }
 
-    async fn worktree_open(&self, path: &str) -> Result<Placed, HerdrError> {
-        let params = json!({"path": path, "focus": false});
+    async fn worktree_open(&self, cwd: &str, path: &str) -> Result<Placed, HerdrError> {
+        let params = json!({"cwd": cwd, "path": path, "focus": false});
         let answer: PlacedAnswer = self.call("worktree.open", params).await?;
         Ok(answer.placed(path))
     }

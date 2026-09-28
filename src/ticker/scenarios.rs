@@ -1441,3 +1441,25 @@ async fn a_coordinator_seen_again_in_its_pane_is_no_longer_lost_and_gets_its_rep
         Some(NUDGE_REPLY)
     );
 }
+
+#[tokio::test]
+async fn a_worker_idle_right_after_its_launch_prompt_is_not_reported_idle() {
+    let mut world = World::sample();
+    world.running_issue().await;
+    let w = world.start_worker("api").await;
+    world.settle().await;
+    assert_eq!(
+        to(&world, &w.agent.pane_id),
+        ["Read .herdr-linear-agent/DATA-1-w1/brief.md and do what it says."]
+    );
+    let idle = |world: &World| mentions(&world.inbox(KEY), "is idle without a report");
+    assert!(!idle(&world), "the prompt has not been picked up yet");
+
+    world.later(30);
+    world.settle().await;
+    assert!(!idle(&world), "still inside the minute after the prompt");
+
+    world.later(31);
+    world.settle().await;
+    assert!(idle(&world), "a minute without any change is idle");
+}

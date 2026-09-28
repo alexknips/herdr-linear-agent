@@ -315,7 +315,7 @@ async fn create_worktree<H: Herdr>(
     match herdr.worktree_create(repo_path, branch, base).await {
         Err(herdr::HerdrError::OutcomeUnknown(detail)) => {
             match find_worktree(runner, repo_path, branch).await {
-                Some(path) => herdr.worktree_open(&path).await,
+                Some(path) => herdr.worktree_open(repo_path, &path).await,
                 None => Err(herdr::HerdrError::OutcomeUnknown(detail)),
             }
         }
@@ -532,7 +532,7 @@ async fn reopen<H: Herdr>(
         }
         return session
             .herdr
-            .worktree_open(&w.worktree_path)
+            .worktree_open(&w.repo_path, &w.worktree_path)
             .await
             .with_context(|| format!("could not open the worktree of {id}"));
     }
@@ -542,7 +542,7 @@ async fn reopen<H: Herdr>(
         // A creation whose answer was lost left the checkout behind.
         Some(path) => session
             .herdr
-            .worktree_open(&path)
+            .worktree_open(&repo_path, &path)
             .await
             .with_context(|| format!("could not open the worktree of {id}")),
         // The worktree was never created: place it again from its base.

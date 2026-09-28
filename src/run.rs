@@ -99,6 +99,9 @@ pub struct AgentRecord {
     pub cwd: String,
     /// The launch prompt has not been delivered yet.
     pub prompt_pending: bool,
+    /// When the launch prompt went out, and Herdr's `state_change_seq` then.
+    pub prompted_at: String,
+    pub prompted_seq: u64,
     pub launch_attempts: u32,
     /// The agent's native session, for a resume.
     pub agent_session: String,

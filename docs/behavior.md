@@ -337,7 +337,7 @@ Git, the routing agent, `open`/`xdg-open` and `herdr session list --json` run as
 | `workspace.close` | `workspace_id` | run close, worker restart |
 | `workspace.focus` | `workspace_id` | focus-run action |
 | `worktree.create` | `cwd`, `branch`, `base`, `focus: false` | worker start; result has `root_pane` and `worktree.path` |
-| `worktree.open` | `path`, `focus: false` | worker restart in the kept checkout |
+| `worktree.open` | `cwd` (the repository checkout), `path`, `focus: false` | worker restart in the kept checkout. Without `cwd` Herdr 0.9.1 refuses the request (`not_git_worktree`, or `worktree_not_found`), measured in THLA-10. |
 | `agent.start` | `name`, `kind`, `pane_id`, `args` | launch |
 | `agent.prompt` | `target` (pane id), `text` | launch prompt, nudge, worker prompt |
 | `agent.send_keys` | `target`, `keys: ["esc"]` | stop, close, detach |
@@ -625,7 +625,7 @@ For an `open` record, given `Live`:
 - the status is `blocked` for at least 30 s, or
 - the launch prompt is pending and the status is `unknown` for at least 60 s (a launch stuck on a dialog).
 
-A blocked status for 29 s does not count: a quickly answered prompt never shows. `tests/worker:groups_follow_the_rows_in_order`
+A blocked status for 29 s does not count: a quickly answered prompt never shows. `tests/worker:groups_follow_the_rows_in_order`. Row 8 was lost in the first rewrite and came back after the second end-to-end run (THLA-10), where a worker idle before its prompt reached it was reported idle and restarted. `tests/scenarios:a_worker_idle_right_after_its_launch_prompt_is_not_reported_idle`
 
 `ask_for_person(run, who, record)` queues an elicitation without options and shows the notification `<KEY> needs you` with the same body:
 
@@ -662,7 +662,8 @@ After a `resume` reply the coordinator is started again with `--resume <session>
 | 5 | the self-report says `Waiting for you` | Waiting on you |
 | 6 | status is not idle (working, short blocked, unknown, no agent yet) | Working |
 | 7 | idle, report written | Reported |
-| 8 | idle, no report | Idle |
+| 8 | idle, no report, but the launch prompt has not gone out, or went out less than 60 s ago with no state change since (`prompted_at`, `prompted_seq`), or a self-report under 5 minutes old is not at 100 percent | Working |
+| 9 | idle, no report | Idle |
 
 "Report written" means `report_hash` is non-empty. A pending launch with no agent yet is Working. `tests/worker:groups_follow_the_rows_in_order`
 
