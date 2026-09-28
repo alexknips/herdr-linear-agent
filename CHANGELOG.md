@@ -5,6 +5,39 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-09-28
+
+
+### Bug Fixes
+
+- leave agent session comments out of the issue hash (#42)
+- keep a just-prompted worker working and open worktrees with their checkout (#40)
+- recognize a coordinator Herdr is still launching (#37)
+
+
+### Documentation
+
+- record the live check of issue edits (#43)
+- record the integration test of the async rewrite (#41)
+- record the behavior the async rewrite keeps (#31)
+
+
+### Features
+
+- pace Linear reads by the rate-limit budget (#38)
+- make the ticker event-driven on the Herdr socket (#35)
+- run on tokio and read Herdr over its socket (#32)
+
+
+### Maintenance
+
+- lock file maintenance (#34)
+
+
+### Refactor
+
+- rewrite the remaining helpers and drop the herdr-projects attribution (#39)
+
 ## [0.1.0] - 2026-09-27
 
 
