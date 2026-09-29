@@ -12,7 +12,7 @@ use std::path::Path;
 use anyhow::Result;
 use jiff::Timestamp;
 
-use crate::config::Config;
+use crate::config::{Config, Instructions};
 use crate::files::{self, shell_quote, write_atomic};
 use crate::herdr::Snapshot;
 use crate::run::{AgentRecord, AgentStatus, Run, RunRecord};
@@ -43,7 +43,7 @@ pub fn sheet(bin: &str, key: &str) -> String {
         .replace("{key}", key)
 }
 
-pub fn agents_md(bin: &str, record: &RunRecord, instructions: Option<&str>) -> String {
+pub fn agents_md(bin: &str, record: &RunRecord, instructions: &[Instructions]) -> String {
     format!(
         "# herdr-linear-agent run {key}\n\n\
          If your working directory is this folder, you are the coordinator of the herdr-linear-agent run for the Linear issue {issue} ({title}).\n\n\
@@ -54,18 +54,36 @@ pub fn agents_md(bin: &str, record: &RunRecord, instructions: Option<&str>) -> S
     ) + &profile_section(&record.coordinator.profile, "the sheet", instructions)
 }
 
-/// A profile's own `instructions`, after the built-in rules they may not
-/// override; nothing when the profile has none.
-pub fn profile_section(profile: &str, rules: &str, instructions: Option<&str>) -> String {
-    let Some(instructions) = instructions.filter(|t| !t.trim().is_empty()) else {
-        return String::new();
-    };
-    format!(
-        "\n## Profile instructions\n\n\
-         These come from the `{profile}` profile in the plugin's config and add to {rules}. \
-         Where they disagree with {rules}, follow {rules}.\n\n{}\n",
-        instructions.trim()
-    )
+/// A profile's `instructions`, after the built-in rules they may not
+/// override: one layer as it is, several under a heading each from the most
+/// general to the most specific; nothing when there are none.
+pub fn profile_section(profile: &str, rules: &str, layers: &[Instructions]) -> String {
+    match layers {
+        [] => String::new(),
+        [one] => format!(
+            "\n## Profile instructions\n\n\
+             These come from the `{profile}` profile in the plugin's config and add to {rules}. \
+             Where they disagree with {rules}, follow {rules}.\n\n{}\n",
+            one.text.trim()
+        ),
+        _ => {
+            let mut text = format!(
+                "\n## Profile instructions\n\n\
+                 These come from the `{profile}` profile and the profiles it is based on, \
+                 from the most general to the most specific, and add to {rules}. \
+                 Where they disagree with each other, follow the later one. \
+                 Where they disagree with {rules}, follow {rules}.\n"
+            );
+            for layer in layers {
+                text += &format!(
+                    "\n### From the `{}` profile\n\n{}\n",
+                    layer.profile,
+                    layer.text.trim()
+                );
+            }
+            text
+        }
+    }
 }
 
 pub fn settings_local(bin: &str) -> serde_json::Value {
@@ -82,7 +100,7 @@ pub fn write_priming(
     run: &Run,
     record: &RunRecord,
     bin: &str,
-    instructions: Option<&str>,
+    instructions: &[Instructions],
 ) -> Result<()> {
     write_atomic(
         &run.dir.join("AGENTS.md"),
@@ -346,10 +364,41 @@ mod tests {
     }
 
     #[test]
+    fn several_instruction_layers_get_a_heading_each_from_the_most_general() {
+        let layer = |profile: &str, text: &str| Instructions {
+            profile: profile.into(),
+            text: text.into(),
+        };
+        assert_eq!(
+            profile_section(
+                "leaf",
+                "the sheet",
+                &[
+                    layer("root", "Root rule.\n"),
+                    layer("leaf", " Leaf rule. \n")
+                ]
+            ),
+            "\n## Profile instructions\n\n\
+             These come from the `leaf` profile and the profiles it is based on, from the most general \
+             to the most specific, and add to the sheet. Where they disagree with each other, follow \
+             the later one. Where they disagree with the sheet, follow the sheet.\n\n\
+             ### From the `root` profile\n\nRoot rule.\n\n\
+             ### From the `leaf` profile\n\nLeaf rule.\n"
+        );
+        assert_eq!(profile_section("leaf", "the sheet", &[]), "");
+        assert_eq!(
+            profile_section("leaf", "the sheet", &[layer("root", "Root rule.\n")]),
+            "\n## Profile instructions\n\n\
+             These come from the `leaf` profile in the plugin's config and add to the sheet. \
+             Where they disagree with the sheet, follow the sheet.\n\nRoot rule.\n"
+        );
+    }
+
+    #[test]
     fn priming_points_the_coordinator_at_the_binary_and_allows_only_agent_commands() {
         let f = folder("Fix the\nlogin");
         std::os::unix::fs::symlink("elsewhere.md", f.run.dir.join("CLAUDE.md")).unwrap();
-        write_priming(&f.run, &f.record, BIN, None).unwrap();
+        write_priming(&f.run, &f.record, BIN, &[]).unwrap();
 
         let agents = std::fs::read_to_string(f.run.dir.join("AGENTS.md")).unwrap();
         let expected = [
@@ -405,7 +454,7 @@ mod tests {
         );
 
         // A second placement keeps the link and rewrites the text.
-        write_priming(&f.run, &f.record, "/usr/local/bin/hla", None).unwrap();
+        write_priming(&f.run, &f.record, "/usr/local/bin/hla", &[]).unwrap();
         assert!(
             std::fs::read_to_string(f.run.dir.join("CLAUDE.md"))
                 .unwrap()

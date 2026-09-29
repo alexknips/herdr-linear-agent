@@ -108,13 +108,16 @@ Profiles are not in `config.toml`: a `profiles` key there is refused with `profi
 
 | Key | Type | Default | Rule and message |
 | --- | --- | --- | --- |
-| `kind` | Herdr agent kind | required | ``profile `<name>`: kind `<kind>` is not a Herdr agent kind`` |
+| `base` | profile name | none | the profile this one starts from (see below); not a path |
+| `kind` | Herdr agent kind | required, here or in a base | ``profile `<name>`: kind `<kind>` is not a Herdr agent kind``; ``profile `<name>`: kind is set neither here nor in a base`` |
 | `model` | string | none | |
 | `effort` | string | none | only for kinds with an effort flag: ``profile `<name>`: the `<kind>` CLI has no effort flag; put the effort in the model ID instead`` |
 | `args` | list | `[]` | passed unchecked |
 | `description` | string | `""` | shown to the routing agent for coordinator candidates |
 | `env` | table of strings | `{}` | added to the routing agent's call before the recipe's variables; only the routing agent's profile may set it: ``profile `<name>`: env applies only to the routing agent, but `<name>` is also a coordinator or worker profile``; variable names may not be empty or contain `=`. `src/config.rs:only_the_routing_agents_profile_may_set_env`, `src/routing.rs:the_profiles_env_reaches_the_agent_and_the_recipe_wins` |
 | `instructions.md` (a file) | Markdown | none | added after the built-in rules: to `AGENTS.md` for a coordinator profile, to the brief for a worker profile |
+
+Inheritance (`resolve`, in `load_profiles` only; launch, routing and validation see resolved profiles): `base` names another profile, one per profile, and the chain is followed to its root. A name seen again in the chain, the profile itself included, is ``profile `<name>`: its base chain loops: a → b → a``; a base that is not a profile is ``profile `<name>`: base `<base>` is not a profile``. The layers are applied from the root: `kind` is inherited and may not change (``profile `<layer>`: kind `<kind>` differs from its base `<base>` (`<inherited>`)``); `model` and `effort` are replaced when set; `args` and `env` are replaced whole; `description` is the profile's own; `instructions` are the layers' `instructions.md` from the root, blank or missing ones left out. Validation, the env rule included, runs on the resolved profiles. `src/config.rs:a_profile_inherits_from_its_base_chain`, `src/config.rs:a_base_chain_must_end_at_a_profile_keep_its_kind_and_not_loop`, `src/config.rs:env_inherited_by_a_worker_profile_is_refused`, `src/config.rs:instructions_are_the_layers_that_have_them_from_the_root`
 
 Reading the folders (`load_profiles`): a missing `profiles` folder gives no profiles; entries starting with `.` are skipped; symbolic links are followed; any other file in `profiles/` is refused with `<path> is not a folder: each profile is a folder with a config.toml`; a folder without `config.toml` gives `could not read <path>`; other files inside a profile folder are left alone. `src/config.rs:profiles_come_from_their_folders`, `src/config.rs:profiles_live_only_in_their_folders`
 
@@ -558,7 +561,7 @@ Rules pinned:
 
 ### Profile instructions
 
-`profile_section(profile, rules, instructions)`: `## Profile instructions`, then ``These come from the `<profile>` profile in the plugin's config and add to <rules>. Where they disagree with <rules>, follow <rules>.`` and the trimmed instructions. The coordinator's `AGENTS.md` gets it after the line pointing at the sheet (`<rules>` = `the sheet`); the worker brief gets it after `WORKER.md` and before `## Progress` (`<rules>` = `the rules above`). Empty or absent instructions add nothing. `src/worker.rs:a_brief_puts_heading_restart_note_rules_report_command_and_task_in_order`
+`profile_section(profile, rules, layers)`: nothing without layers. With one layer: `## Profile instructions`, then ``These come from the `<profile>` profile in the plugin's config and add to <rules>. Where they disagree with <rules>, follow <rules>.`` and the trimmed text. With several: `## Profile instructions`, then ``These come from the `<profile>` profile and the profiles it is based on, from the most general to the most specific, and add to <rules>. Where they disagree with each other, follow the later one. Where they disagree with <rules>, follow <rules>.``, then per layer from the root ``### From the `<layer profile>` profile`` and its trimmed text. `src/coordinator.rs:several_instruction_layers_get_a_heading_each_from_the_most_general`, `src/worker.rs:several_instruction_layers_go_between_the_rules_and_the_progress_section` The coordinator's `AGENTS.md` gets it after the line pointing at the sheet (`<rules>` = `the sheet`); the worker brief gets it after `WORKER.md` and before `## Progress` (`<rules>` = `the rules above`). Empty or absent instructions add nothing. `src/worker.rs:a_brief_puts_heading_restart_note_rules_report_command_and_task_in_order`
 
 ## Reading runs: close, detach, issue edits
 

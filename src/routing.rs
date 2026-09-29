@@ -708,7 +708,7 @@ mod tests {
             effort: Some("low".into()),
             args: vec!["--dangerously-skip-permissions".into()],
             description: String::new(),
-            instructions: None,
+            instructions: Vec::new(),
             env: BTreeMap::new(),
         }
     }

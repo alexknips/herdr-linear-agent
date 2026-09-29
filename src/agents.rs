@@ -90,7 +90,7 @@ mod tests {
             effort: effort.map(Into::into),
             args: args.iter().map(|a| a.to_string()).collect(),
             description: String::new(),
-            instructions: None,
+            instructions: Vec::new(),
             env: Default::default(),
         }
     }

@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail, ensure};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 use crate::{agents, routing};
 
@@ -147,29 +147,46 @@ pub struct Repository {
     pub description: String,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
-#[serde(deny_unknown_fields)]
+/// A profile with its base chain resolved: what launch, routing and validation
+/// see.
+#[derive(Debug, Clone, PartialEq)]
 pub struct Profile {
     pub kind: String,
-    #[serde(default)]
     pub model: Option<String>,
-    #[serde(default)]
     pub effort: Option<String>,
     /// Extra agent CLI arguments (permission mode, sandbox), passed unchecked.
-    #[serde(default)]
     pub args: Vec<String>,
-    #[serde(default)]
     pub description: String,
-    /// The profile folder's `instructions.md`: Markdown the plugin adds to the
-    /// agent's instructions for work under this profile, after the built-in
-    /// sheet. Only people write it.
-    #[serde(skip)]
-    pub instructions: Option<String>,
+    /// The `instructions.md` of the profile and of the profiles it is based
+    /// on, from the root to the profile itself; layers without one are left
+    /// out. Markdown the plugin adds to the agent's instructions for work
+    /// under this profile, after the built-in sheet. Only people write it.
+    pub instructions: Vec<Instructions>,
     /// Environment variables for the routing agent's call. Herdr starts
     /// coordinators and workers and cannot pass them any, so only the
     /// routing agent's profile may set this.
-    #[serde(default)]
     pub env: BTreeMap<String, String>,
+}
+
+/// One layer of a profile's instructions: whose `instructions.md` it is.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Instructions {
+    pub profile: String,
+    pub text: String,
+}
+
+/// A profile's `config.toml` as written. `base` names the profile it
+/// inherits from; a field it leaves out comes from there.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProfileFile {
+    base: Option<String>,
+    kind: Option<String>,
+    model: Option<String>,
+    effort: Option<String>,
+    args: Option<Vec<String>>,
+    description: Option<String>,
+    env: Option<BTreeMap<String, String>>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -393,12 +410,12 @@ impl Config {
 /// Reads every profile folder under `dir`: the folder's name is the profile's
 /// name. Entries starting with `.` are skipped, symbolic links are followed,
 /// and files other than the two a profile has are left alone. A missing `dir`
-/// gives no profiles.
+/// gives no profiles. Each profile is then resolved against its base chain.
 fn load_profiles(dir: &Path) -> Result<BTreeMap<String, Profile>> {
-    let mut profiles = BTreeMap::new();
+    let mut files = BTreeMap::new();
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(profiles),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
         Err(error) => {
             return Err(error).with_context(|| format!("could not read {}", dir.display()));
         }
@@ -420,19 +437,24 @@ fn load_profiles(dir: &Path) -> Result<BTreeMap<String, Profile>> {
             "{} is not a folder: each profile is a folder with a {FILE_NAME}",
             path.display()
         );
-        profiles.insert(name, load_profile(&path)?);
+        files.insert(name, read_profile(&path)?);
     }
-    Ok(profiles)
+    files
+        .keys()
+        .map(|name| Ok((name.clone(), resolve(name, &files)?)))
+        .collect()
 }
 
-fn load_profile(folder: &Path) -> Result<Profile> {
+/// A profile folder's `config.toml` and its `instructions.md`, `None` when
+/// that is missing or blank.
+fn read_profile(folder: &Path) -> Result<(ProfileFile, Option<String>)> {
     let path = folder.join(FILE_NAME);
     let text = std::fs::read_to_string(&path)
         .with_context(|| format!("could not read {}", path.display()))?;
-    let mut profile: Profile =
+    let file: ProfileFile =
         toml::from_str(&text).with_context(|| format!("{} is not valid", path.display()))?;
     let path = folder.join(INSTRUCTIONS_FILE);
-    profile.instructions = match std::fs::read_to_string(&path) {
+    let instructions = match std::fs::read_to_string(&path) {
         Ok(text) if text.trim().is_empty() => None,
         Ok(text) => Some(text),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
@@ -440,7 +462,66 @@ fn load_profile(folder: &Path) -> Result<Profile> {
             return Err(error).with_context(|| format!("could not read {}", path.display()));
         }
     };
-    Ok(profile)
+    Ok((file, instructions))
+}
+
+/// Lays `name`'s base chain from its root to `name`: a later layer replaces
+/// `model`, `effort`, `args` and `env` whole, may not change `kind`, and
+/// adds its instructions; `description` is `name`'s own.
+fn resolve(name: &str, files: &BTreeMap<String, (ProfileFile, Option<String>)>) -> Result<Profile> {
+    let mut chain = vec![name];
+    while let Some(base) = files[*chain.last().unwrap()].0.base.as_deref() {
+        if chain.contains(&base) {
+            chain.push(base);
+            bail!(
+                "profile `{name}`: its base chain loops: {}",
+                chain.join(" \u{2192} ")
+            );
+        }
+        ensure!(
+            files.contains_key(base),
+            "profile `{}`: base `{base}` is not a profile",
+            chain.last().unwrap()
+        );
+        chain.push(base);
+    }
+    let mut kind: Option<(&str, &str)> = None;
+    let (mut model, mut effort, mut args, mut env) = (None, None, Vec::new(), BTreeMap::new());
+    let mut instructions = Vec::new();
+    for layer in chain.iter().rev() {
+        let (file, text) = &files[*layer];
+        if let Some(own) = file.kind.as_deref() {
+            match kind {
+                Some((inherited, from)) if inherited != own => bail!(
+                    "profile `{layer}`: kind `{own}` differs from its base `{from}` (`{inherited}`)"
+                ),
+                Some(_) => {}
+                None => kind = Some((own, layer)),
+            }
+        }
+        model = file.model.clone().or(model);
+        effort = file.effort.clone().or(effort);
+        args = file.args.clone().unwrap_or(args);
+        env = file.env.clone().unwrap_or(env);
+        if let Some(text) = text {
+            instructions.push(Instructions {
+                profile: layer.to_string(),
+                text: text.clone(),
+            });
+        }
+    }
+    let Some((kind, _)) = kind else {
+        bail!("profile `{name}`: kind is set neither here nor in a base");
+    };
+    Ok(Profile {
+        kind: kind.to_string(),
+        model,
+        effort,
+        args,
+        description: files[name].0.description.clone().unwrap_or_default(),
+        instructions,
+        env,
+    })
 }
 
 fn valid_name(name: &str) -> bool {
@@ -577,14 +658,13 @@ workers = ["standard", "deep"]
             ]
         );
         assert_eq!(
-            config
-                .profile("coordinator-light")
-                .unwrap()
-                .instructions
-                .as_deref(),
-            Some("Prefer one worker. Ask before you split the work.\n")
+            config.profile("coordinator-light").unwrap().instructions,
+            [Instructions {
+                profile: "coordinator-light".into(),
+                text: "Prefer one worker. Ask before you split the work.\n".into(),
+            }]
         );
-        assert_eq!(config.profile("coordinator").unwrap().instructions, None);
+        assert_eq!(config.profile("coordinator").unwrap().instructions, []);
         assert_eq!(config.worker_profile("deep").unwrap().kind, "codex");
         assert!(config.worker_profile("coordinator").is_err());
         assert!(
@@ -676,11 +756,129 @@ workers = ["standard", "deep"]
                 "standard"
             ]
         );
-        assert_eq!(config.profile("standard").unwrap().instructions, None);
+        assert_eq!(config.profile("standard").unwrap().instructions, []);
         let shared = config.profile("shared").unwrap();
+        assert_eq!(shared.kind, "codex");
+        assert_eq!(shared.instructions[0].text, "Run `make check`.\n");
+    }
+
+    #[test]
+    fn a_profile_inherits_from_its_base_chain() {
+        let config = load_with(
+            SAMPLE,
+            &[
+                (
+                    "root",
+                    "kind = \"claude\"\nmodel = \"opus\"\neffort = \"high\"\nargs = [\"--permission-mode\", \"auto\"]\ndescription = \"the root\"\nenv = { A = \"1\" }\n",
+                ),
+                ("mid", "base = \"root\"\nmodel = \"sonnet\"\nargs = [\"--x\"]\n"),
+                ("leaf", "base = \"mid\"\neffort = \"low\"\ndescription = \"the leaf\"\n"),
+            ],
+        )
+        .unwrap();
+        let leaf = config.profile("leaf").unwrap();
         assert_eq!(
-            (shared.kind.as_str(), shared.instructions.as_deref()),
-            ("codex", Some("Run `make check`.\n"))
+            (
+                leaf.kind.as_str(),
+                leaf.model.as_deref(),
+                leaf.effort.as_deref(),
+                leaf.args.as_slice(),
+                leaf.description.as_str(),
+            ),
+            (
+                "claude",
+                Some("sonnet"),
+                Some("low"),
+                &["--x".to_string()][..],
+                "the leaf"
+            )
+        );
+        assert_eq!(
+            leaf.env,
+            BTreeMap::from([("A".to_string(), "1".to_string())])
+        );
+        let mid = config.profile("mid").unwrap();
+        assert_eq!(
+            (mid.effort.as_deref(), mid.description.as_str()),
+            (Some("high"), ""),
+            "the description is not inherited"
+        );
+    }
+
+    #[test]
+    fn a_base_chain_must_end_at_a_profile_keep_its_kind_and_not_loop() {
+        let error = |profiles: &[(&str, &str)]| load_with(SAMPLE, profiles).unwrap_err();
+        assert!(
+            error(&[
+                ("b", "kind = \"claude\"\n"),
+                ("a", "base = \"b\"\nkind = \"codex\"\n")
+            ])
+            .ends_with("profile `a`: kind `codex` differs from its base `b` (`claude`)")
+        );
+        assert!(
+            error(&[("a", "base = \"a\"\nkind = \"claude\"\n")])
+                .ends_with("profile `a`: its base chain loops: a \u{2192} a")
+        );
+        assert!(
+            error(&[
+                ("a", "base = \"b\"\nkind = \"claude\"\n"),
+                ("b", "base = \"a\"\n")
+            ])
+            .ends_with("profile `a`: its base chain loops: a \u{2192} b \u{2192} a")
+        );
+        assert!(
+            error(&[("a", "base = \"x\"\nkind = \"claude\"\n")])
+                .ends_with("profile `a`: base `x` is not a profile")
+        );
+        assert!(
+            error(&[("a", "base = \"b\"\n"), ("b", "model = \"opus\"\n")])
+                .ends_with("profile `a`: kind is set neither here nor in a base")
+        );
+    }
+
+    #[test]
+    fn env_inherited_by_a_worker_profile_is_refused() {
+        let error = load_with(
+            SAMPLE,
+            &[
+                ("with-env", "kind = \"claude\"\nenv = { X = \"1\" }\n"),
+                ("standard", "base = \"with-env\"\n"),
+            ],
+        )
+        .unwrap_err();
+        assert!(error.ends_with(
+            "profile `standard`: env applies only to the routing agent, but `standard` is also a coordinator or worker profile"
+        ), "{error}");
+    }
+
+    #[test]
+    fn instructions_are_the_layers_that_have_them_from_the_root() {
+        let dir = tempfile::tempdir().unwrap();
+        write_sample(dir.path(), SAMPLE);
+        let profiles = dir.path().join(PROFILES_DIR);
+        for (name, config, instructions) in [
+            ("root", "kind = \"claude\"\n", Some("Root rule.\n")),
+            ("mid", "base = \"root\"\n", None),
+            ("leaf", "base = \"mid\"\n", Some("Leaf rule.\n")),
+        ] {
+            std::fs::create_dir_all(profiles.join(name)).unwrap();
+            std::fs::write(profiles.join(name).join(FILE_NAME), config).unwrap();
+            if let Some(text) = instructions {
+                std::fs::write(profiles.join(name).join(INSTRUCTIONS_FILE), text).unwrap();
+            }
+        }
+        let config = Config::load(dir.path()).unwrap();
+        let layer = |profile: &str, text: &str| Instructions {
+            profile: profile.into(),
+            text: text.into(),
+        };
+        assert_eq!(
+            config.profile("leaf").unwrap().instructions,
+            [layer("root", "Root rule.\n"), layer("leaf", "Leaf rule.\n")]
+        );
+        assert_eq!(
+            config.profile("mid").unwrap().instructions,
+            [layer("root", "Root rule.\n")]
         );
     }
 

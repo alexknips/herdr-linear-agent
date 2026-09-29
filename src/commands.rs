@@ -415,7 +415,7 @@ pub async fn worker_start<H: Herdr>(
             bail!("could not create the worktree for {}: {error}", worker.id);
         }
     };
-    let instructions = profile.instructions.as_deref();
+    let instructions = profile.instructions.as_slice();
     let worker = place(
         ctx,
         &run,
@@ -446,7 +446,7 @@ async fn place(
     placed: &Placed,
     task: &str,
     restart: bool,
-    instructions: Option<&str>,
+    instructions: &[crate::config::Instructions],
 ) -> Result<Worker> {
     let worktree = placed
         .worktree_path
@@ -637,7 +637,7 @@ pub async fn worker_restart<H: Herdr>(
         w.agent.resume = false;
     })?;
     let task = std::fs::read_to_string(worker::task_path(&run, id)).unwrap_or_default();
-    let instructions = profile.instructions.as_deref();
+    let instructions = profile.instructions.as_slice();
     let worker = place(
         ctx,
         &run,

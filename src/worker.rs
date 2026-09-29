@@ -288,8 +288,8 @@ pub struct BriefInput<'a> {
     pub task: &'a str,
     pub restart: bool,
     pub binary: &'a str,
-    /// The worker profile's `instructions`, added after the built-in rules.
-    pub instructions: Option<&'a str>,
+    /// The worker profile's instruction layers, added after the built-in rules.
+    pub instructions: &'a [crate::config::Instructions],
 }
 
 pub fn compose_brief(input: &BriefInput) -> String {
@@ -781,7 +781,7 @@ mod tests {
                 task: "\n  Change the session handler.  \n",
                 restart,
                 binary: "/bin/hla",
-                instructions: None,
+                instructions: &[],
             })
         };
         let rules = include_str!("../assets/WORKER.md").lines().next().unwrap();
@@ -819,7 +819,10 @@ mod tests {
             task: "Change the session handler.",
             restart: false,
             binary: "/bin/hla",
-            instructions: Some("Run `make check` before you commit.\n"),
+            instructions: &[crate::config::Instructions {
+                profile: "standard".into(),
+                text: "Run `make check` before you commit.\n".into(),
+            }],
         });
         let last_rule = include_str!("../assets/WORKER.md")
             .trim_end()
@@ -834,6 +837,46 @@ mod tests {
             "These come from the `standard` profile in the plugin's config and add to the rules above. \
              Where they disagree with the rules above, follow the rules above.\n\nRun `make check` before you commit.\n"
         ));
+    }
+
+    #[test]
+    fn several_instruction_layers_go_between_the_rules_and_the_progress_section() {
+        let worker = Worker {
+            brief_dir: brief_dir(WORKTREE, "acme/DATA-1", "w1"),
+            ..api_worker(AgentStatus::Open, "", true)
+        };
+        let layers = [
+            crate::config::Instructions {
+                profile: "base".into(),
+                text: "Run `make check`.\n".into(),
+            },
+            crate::config::Instructions {
+                profile: "standard".into(),
+                text: "Keep the change small.\n".into(),
+            },
+        ];
+        let brief = compose_brief(&BriefInput {
+            issue_key: "DATA-1",
+            issue_title: "Fix login",
+            issue_url: "https://linear.app/acme/issue/DATA-1",
+            worker: &worker,
+            task: "Change the session handler.",
+            restart: false,
+            binary: "/bin/hla",
+            instructions: &layers,
+        });
+        let last_rule = include_str!("../assets/WORKER.md")
+            .trim_end()
+            .lines()
+            .last()
+            .unwrap();
+        let rules_end = brief.find(last_rule).unwrap() + last_rule.len();
+        let (root, own) = (
+            brief.find("### From the `base` profile").unwrap(),
+            brief.find("### From the `standard` profile").unwrap(),
+        );
+        let progress = brief.find("## Progress").unwrap();
+        assert!(rules_end < root && root < own && own < progress, "{brief}");
     }
 
     #[test]

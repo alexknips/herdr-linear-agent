@@ -353,7 +353,7 @@ impl Reconciler {
             .config
             .profiles
             .get(&record.coordinator.profile)
-            .and_then(|p| p.instructions.as_deref());
+            .map_or(&[][..], |p| p.instructions.as_slice());
         coordinator::write_priming(run, record, &self.bin, instructions)?;
         let cwd = run.canonical_dir().to_string_lossy().into_owned();
         let label = coordinator::workspace_label(record);

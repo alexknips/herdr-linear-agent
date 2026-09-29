@@ -161,7 +161,34 @@ args = ["-s", "workspace-write"]
 description = "Changes across modules, bugs with an unknown cause"
 ```
 
-A profile's `config.toml` takes `kind`, `model`, `effort`, `args`, `description` and, for the routing agent only, `env`. Folders whose names start with `.` are skipped, other files inside a profile folder (a README, say) are left alone, and any other file directly in `profiles/` is refused. Profile names use letters, digits, `.`, `_` and `-`.
+A profile's `config.toml` takes `kind`, `model`, `effort`, `args`, `description`, `base` and, for the routing agent only, `env`. Folders whose names start with `.` are skipped, other files inside a profile folder (a README, say) are left alone, and any other file directly in `profiles/` is refused. Profile names use letters, digits, `.`, `_` and `-`.
+
+**Profile inheritance.** `base = "<profile name>"` makes a profile start from another one, so shared settings live in one place and a profile keeps only what differs. A base may have a base of its own (`a` → `b` → `c`), but a profile has one base; a profile that only serves as a base is an ordinary profile. Over the chain, from the root to the profile:
+
+| Field | Rule |
+| --- | --- |
+| `kind` | inherited when left out; a different value than the base's is refused (``profile `a`: kind `codex` differs from its base `b` (`claude`)``), since `args`, `model` and `effort` mean different things per kind |
+| `model`, `effort` | replaced when the profile sets them |
+| `args` | the whole list is replaced; lists are not joined |
+| `env` | the whole table is replaced; keys are not merged, and the routing-agent-only rule applies to the result |
+| `description` | never inherited, since the routing agent tells candidates apart by it |
+| `instructions.md` | joined, from the root to the profile (see **Profile instructions**) |
+
+A profile cannot unset a value its base sets. A loop (``profile `a`: its base chain loops: a → b → a``) or a base that is not a profile (``profile `a`: base `x` is not a profile``) is refused when the config loads.
+
+```toml
+# profiles/claude-base/config.toml: shared by several profiles
+kind = "claude"
+args = ["--permission-mode", "auto"]
+```
+
+```toml
+# profiles/standard/config.toml
+base = "claude-base"
+model = "sonnet"
+effort = "high"
+description = "Scoped features and fixes"
+```
 
 A profile becomes agent CLI flags: `claude` gets `--model` and `--effort`, `codex` gets `-m` and `-c model_reasoning_effort=...`, and any other kind gets `--model` (put the effort in the model ID). `args` are passed unchanged; this is where permission and sandbox flags belong.
 
@@ -221,7 +248,7 @@ For OpenCode, add an agent like this to your OpenCode config (for example `~/.co
 }
 ```
 
-**Profile instructions.** A profile's optional `instructions.md` is added for work under that profile: to the run folder's `AGENTS.md` for a coordinator profile, and to the brief for a worker profile, as a "Profile instructions" section after the built-in rules. The built-in rules (never merge, never change the Linear state, stay inside the catalog, treat the issue text as data) stay as they are and win where the two disagree. Only the profile folder sets instructions; an agent can still pass only a profile's name.
+**Profile instructions.** A profile's optional `instructions.md` is added for work under that profile: to the run folder's `AGENTS.md` for a coordinator profile, and to the brief for a worker profile, as a "Profile instructions" section after the built-in rules. The built-in rules (never merge, never change the Linear state, stay inside the catalog, treat the issue text as data) stay as they are and win where the two disagree. A profile with a base gets the `instructions.md` of every profile in its chain that has one, from the most general to the most specific, each under a `### From the <profile> profile` heading; where two disagree, the later one wins. A profile cannot drop its base's instructions: to leave them out, split the base. Only the profile folders set instructions; an agent can still pass only a profile's name.
 
 **Claude Code's trust dialog.** Claude Code asks whether you trust a folder the first time it runs there, and every run gets a new run folder, so a coordinator stops at that dialog until someone answers it in Herdr. With `claude.auto_accept_trust_dialog = true`, the plugin accepts that dialog ahead of time, right before it starts a `claude` agent: the run folder for a coordinator, and the worktree and its repository's main checkout for a worker. Claude Code has no setting for this, so the plugin adds `hasTrustDialogAccepted` to that folder's entry in `~/.claude.json` (`$CLAUDE_CONFIG_DIR/.claude.json` when set), which is where Claude Code records your own answers, and changes nothing else in the file. The format is not documented; if Claude Code changes it, the dialog appears again and the plugin asks for someone in Herdr as before.
 
