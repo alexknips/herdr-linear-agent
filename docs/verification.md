@@ -108,7 +108,8 @@ What Linear returns for the workers' pull requests (THLA-2 to THLA-11 of the scr
 
 - The issue's attachments list each pull request with `id`, `title`, `subtitle` and `url` only. THLA-12 and THLA-14 were canceled before a worker opened one.
 - The Diffs view (`get_diff`, `list_diffs`) finds every pull request by its branch `herdr-linear-agent/<key>/<id>-<title>` and gives `status`, `mergeStatus`, `reviewers` and `viewerReviewState`, but no checks. Linear's documentation says the Diffs view shows the overall check status; the MCP does not return it.
-- `sourceType` and `metadata` of the attachments were not read: the MCP does not return them, and reading them with the plugin's own token was left to a person.
+- With the plugin's own token (GraphQL, read only), each attachment has `sourceType` `github`, `source` `{"type":"github","pullRequestId":...}`, and `metadata` with `status` (`open`, `merged`), `draft`, `hasConflicts`, `reviews`, `reviewers` and `reviewerDetails`, but no checks.
+- The schema has checks elsewhere: `PullRequest.checks` is a list of `PullRequestCheck` (`name`, `workflowName`, `status`, `url`, `isRequired`, `startedAt`, `completedAt`), next to `PullRequest.status`, `mergeStatus` and `hasConflicts`. No root query returns a `PullRequest`; it is reached through `AgentSession.pullRequest` and `AgentSession.pullRequests`, and perhaps `Query.diff`. Whether a worker's pull request shows up there, and with which check values, was not read, since the scratch repository has no CI.
 - The scratch repository has no workflows, so no pull request had checks.
 
 The workers' Claude Code sessions (`~/.claude/projects/` for each worktree, Sonnet), from `gh pr create` to the end:
