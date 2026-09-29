@@ -148,4 +148,15 @@ With the config moved to `[workspaces.civitaspo]` and `[workspaces.civitaspo.tea
 | focus-run | the issue's URL focused the run; the same key under another organization gave `there is no run for THLA-15` |
 | Close | Canceled closed the run and its workspaces 5 s later |
 
-Two workspaces at once were not run against Linear yet.
+Then with a second workspace (its own OAuth application and app user, and a team with the same key `THLA`), named `second` in the config, and `max_runs = 2`:
+
+| Step | Result |
+| --- | --- |
+| Login | `action login --workspace second` stored the second workspace's token under the account `second`; `doctor` listed both workspaces' credentials and budgets |
+| Two issues at once | THLA-1 of `second` and THLA-16 of `civitaspo`, created 3 s apart, were picked up as `second/THLA-1` and `civitaspo/THLA-16` within 3 s and 6 s; each workspace's task logged its own run read cost |
+| Names | the coordinators were `second-thla-1-coordinator` and `civitaspo-thla-16-coordinator`, the workers worked on `herdr-linear-agent/second/thla-1/w1-...` and `herdr-linear-agent/civitaspo/thla-16/w1-...` of the same repository, and the Herdr workspace labels started with the run keys |
+| Reply | a reply from the second workspace's allowed user reached `second/THLA-1`'s `conversation.md` 5 s later; the coordinator handled it and sent the worker a follow-up, which ended up in its pull request |
+| Finish | both workers waited for CI with one `--watch` and opened PRs #11 and #12; both issues moved to In Review. Only the first workspace attached its PR to the issue, since only it has a GitHub integration for the sandbox repository; both sessions carry the PR URL |
+| Close | canceling both issues closed both runs and their workspaces within 4 s |
+
+The same issue key in both workspaces at once (for example THLA-1 in each) was not run against Linear; `tests/scenarios:two_workspaces_with_the_same_issue_key_run_apart_under_their_own_team_rules` covers it.
