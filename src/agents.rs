@@ -40,9 +40,14 @@ pub fn has_effort_flag(kind: &str) -> bool {
 }
 
 /// The model flag, the effort flag, then the profile's own `args`.
+/// OpenCode starts as `opencode mini`: its full interface takes no model
+/// flag, and `mini` takes both `--model` and the `--session` a resume adds.
 pub fn profile_args(profile: &Profile) -> Vec<String> {
     let codex = profile.kind == "codex";
     let mut out = Vec::new();
+    if profile.kind == "opencode" {
+        out.push("mini".to_string());
+    }
     if let Some(model) = &profile.model {
         out.push(if codex { "-m" } else { "--model" }.to_string());
         out.push(model.clone());
@@ -149,6 +154,24 @@ mod tests {
         );
         let gemini = profile("gemini", Some("gemini-3-pro"), Some("high"), &["--yolo"]);
         assert_eq!(profile_args(&gemini), ["--model", "gemini-3-pro", "--yolo"]);
+        assert_eq!(
+            profile_args(&profile(
+                "opencode",
+                Some("openai/gpt-6-luna"),
+                None,
+                &["--agent", "build"]
+            )),
+            ["mini", "--model", "openai/gpt-6-luna", "--agent", "build"]
+        );
+        assert_eq!(
+            profile_args(&profile(
+                "cursor",
+                Some("grok-4.7-medium"),
+                None,
+                &["--trust"]
+            )),
+            ["--model", "grok-4.7-medium", "--trust"]
+        );
         assert!(profile_args(&profile("claude", None, None, &[])).is_empty());
         assert_eq!(
             profile_args(&profile("codex", None, Some("low"), &[])),

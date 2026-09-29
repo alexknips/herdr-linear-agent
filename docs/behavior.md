@@ -157,7 +157,8 @@ runs/<KEY>/
   .state/outbox/failed/         requests Linear refused or that do not parse
   .state/outbox-counter.json    the last outbox counter
   .state/ignored-prompts.md     replies from users who are not allowed
-  .claude/settings.local.json   the coordinator's allow-list
+  .claude/settings.local.json   the coordinator's allow-list for Claude Code
+  .cursor/cli.json              the coordinator's allow-list for Cursor Agent
 ```
 
 Rules:
@@ -256,7 +257,7 @@ Kinds (`agents`):
 - `has_effort_flag`: true for `claude` and `codex`, false for every other kind.
 - The executable Herdr starts for kind `cursor` is `cursor-agent`; for every other kind it is the kind name.
 
-`profile_args(profile)`, in this order: model flag, effort flag, then `args` unchanged.
+`profile_args(profile)`, in this order: model flag, effort flag, then `args` unchanged. An `opencode` profile starts with `mini`: OpenCode's full interface takes no `--model`, and `mini` takes `--model` and `--session` (measured with OpenCode 2.0.15, which exits with `Unrecognized flag: --model` otherwise). `src/agents.rs:a_profile_becomes_model_effort_and_extra_flags_per_kind`
 
 | Kind | Model | Effort |
 | --- | --- | --- |
@@ -538,7 +539,7 @@ Rules pinned:
 - Standard input: `Title: <title>`, then `Team: <key> (<name>)`, `Estimate: <n> (scale: <type>)` and `Labels: <a>, <group>/<b>` when known, a blank line, and the description. The estimate, labels and team only inform the choice; they never narrow the candidates. `src/routing.rs:the_issue_with_its_estimate_labels_and_team_goes_to_standard_input`
 - Schema: an object with one required string property `coordinator`, enum of the candidate names, no other properties. Kinds that take a schema get it; the binary checks the answer with the same rules either way (`pick`): not an object, another key, or a name outside the candidates gives `Default(Invalid(<why>))`. No JSON gives `Invalid("no JSON answer")`, a run past `routing.timeout_seconds` is killed and gives `Default(TimedOut)`, a failed start or a non-zero exit gives `Default(Failed(<why>))`. `src/routing.rs:invalid_answers_and_timeouts_fall_back_to_the_default`
 - The profile's `args` never reach the routing agent; `model` and `effort` map to the kind's flags. `src/routing.rs:the_recipe_reaches_the_agent_but_not_the_profile_args`
-- Recipes (what each cuts and what remains is in README.md, "Routing agent kinds"): `claude` reads `structured_output` (or JSON text in `result`) from its JSON on standard output; `codex` writes the answer to `-o answer.json` in the folder. `src/routing.rs:the_codex_recipe_ignores_the_user_config_and_switches_the_rest_off`
+- Recipes (what each cuts and what remains is in README.md, "Routing agent kinds"): `claude` reads `structured_output` (or JSON text in `result`) from its JSON on standard output; `codex` writes the answer to `-o answer.json` in the folder; `cursor` gets the instructions as the folder's `AGENTS.md` and a deny-all `.cursor/cli.json`, and prints JSON whose `result` holds the answer; `opencode` prints JSON lines whose last `text` event holds the answer, and its session is deleted afterwards with `opencode session delete --standalone <id>` (best effort, 10 s). `src/routing.rs:the_cursor_recipe_puts_the_instruction_in_agents_md_and_denies_tools`, `src/routing.rs:the_opencode_recipe_denies_tools_and_deletes_its_session` `src/routing.rs:the_codex_recipe_ignores_the_user_config_and_switches_the_rest_off`
 - `decide(choice)`: the profile is the agent's pick or `routing.default`; set `routing_source` and a pending coordinator record (`status pending`, `profile`, `kind`, `agent_name`), then queue the thought ``The coordinator uses the `<profile>` profile (<source>).`` where `<source>` is `chosen by the routing agent`, `the default: the routing agent timed out`, ``the default: the routing agent's answer was not valid (<why>)`` or `the default: the routing agent failed (<why>)`. A failure is also logged: `<KEY>: the routing agent failed: <why>`. `tests/scenarios:the_routing_agent_picks_a_candidate_and_its_instructions_reach_agents_md`, `tests/scenarios:a_name_outside_the_candidates_falls_back_to_the_default`, `tests/scenarios:a_routing_agent_that_never_reads_its_input_times_out`
 
 ### Profile instructions
@@ -697,6 +698,7 @@ For an active run whose coordinator is `pending`:
      ```
    - `CLAUDE.md`: a symlink to `AGENTS.md`, replaced when it points elsewhere.
    - `.claude/settings.local.json`: `{"permissions":{"allow":["Bash(<bin> skill:*)", "Bash(<bin> context:*)", "Bash(<bin> inbox done:*)", "Bash(<bin> plan:*)", "Bash(<bin> say:*)", "Bash(<bin> ask:*)", "Bash(<bin> worker:*)", "Bash(<bin> finish:*)"]}}`. `startup`, `action` and `ticker` are never allowed.
+   - `.cursor/cli.json`: `{"permissions":{"allow":["Shell(<bin>)"],"deny":[]}}`. Cursor Agent matches the command as typed, so the entry is the path the sheet gives; without it every `herdr-linear-agent` command waits for approval (measured with Cursor Agent 2026.09.26). `src/coordinator.rs:priming_points_the_coordinator_at_the_binary_and_allows_only_agent_commands`
    - `tests/coordinator:priming_names_the_binary_and_the_allow_list_leaves_out_plugin_commands`
 2. `workspace.create` with `cwd` = `canonical_dir`, `label` = the workspace label, not focused.
 3. Record `workspace_id`, `tab_id`, `pane_id`, `cwd` from the root pane; set `status open`, `prompt_pending true`, `launch_attempts 0`.

@@ -20,6 +20,8 @@ use tokio::process::Command;
 use crate::config::{Config, Profile};
 use crate::linear::api::IssueDetail;
 
+const CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// A coordinator profile the routing agent may pick.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Candidate {
@@ -203,6 +205,9 @@ struct Recipe {
     invocation: fn(&Call) -> Invocation,
     /// The answer object inside what the kind printed or wrote.
     answer: fn(&str) -> Option<Value>,
+    /// Arguments of a second call that removes what the first one stored,
+    /// from what it printed; `None` when there is nothing to remove.
+    cleanup: fn(&str) -> Option<Vec<String>>,
 }
 
 const RECIPES: &[Recipe] = &[
@@ -210,11 +215,25 @@ const RECIPES: &[Recipe] = &[
         kind: "claude",
         invocation: claude_invocation,
         answer: claude_answer,
+        cleanup: nothing_stored,
     },
     Recipe {
         kind: "codex",
         invocation: codex_invocation,
         answer: plain_answer,
+        cleanup: nothing_stored,
+    },
+    Recipe {
+        kind: "cursor",
+        invocation: cursor_invocation,
+        answer: claude_answer,
+        cleanup: nothing_stored,
+    },
+    Recipe {
+        kind: "opencode",
+        invocation: opencode_invocation,
+        answer: opencode_answer,
+        cleanup: opencode_cleanup,
     },
 ];
 
@@ -384,6 +403,119 @@ fn toml_string(text: &str) -> String {
     serde_json::to_string(text).unwrap_or_default()
 }
 
+/// Cursor Agent keeps its login in the Keychain under the real HOME, which
+/// stays. It has no system prompt option, so the fixed instruction is the
+/// call folder's `AGENTS.md`, which it applies as a workspace rule; the
+/// issue alone goes to standard input. `--allowed-tools ""` (an internal
+/// flag of the tested version) removes every tool, and the folder's
+/// permissions deny them as well. The account's user rules, the skills and
+/// plugin MCP servers under the real HOME, and the session it stores in
+/// `~/.cursor` remain (docs/verification.md).
+fn cursor_invocation(call: &Call) -> Invocation {
+    let mut args: Vec<String> = ["-p", "--trust", "--output-format", "json"]
+        .map(String::from)
+        .to_vec();
+    if let Some(model) = &call.profile.model {
+        args.extend(["--model".into(), model.clone()]);
+    }
+    args.extend(["--allowed-tools".into(), String::new()]);
+    let deny = json!({
+        "permissions": {
+            "allow": [],
+            "deny": ["Shell(*)", "Read(**)", "Write(**)", "WebFetch(*)", "Mcp(*:*)"]
+        }
+    });
+    Invocation {
+        program: "cursor-agent".into(),
+        args,
+        env: Vec::new(),
+        files: vec![
+            (
+                call.dir.join("AGENTS.md"),
+                format!("{}\n", call.instructions),
+            ),
+            (call.dir.join(".cursor/cli.json"), format!("{deny}\n")),
+        ],
+        answer_file: None,
+    }
+}
+
+/// OpenCode reads its login from its database, which stays; the call runs
+/// a private server (`--standalone`: the shared background service ignores
+/// the call's environment), skips the project layer, and uses an agent of
+/// its own whose prompt is the fixed instruction and whose permissions deny
+/// every tool. The global config (its MCP servers, plugins and AGENTS.md)
+/// still loads (docs/verification.md).
+fn opencode_invocation(call: &Call) -> Invocation {
+    let mut args: Vec<String> = [
+        "run",
+        "--standalone",
+        "--agent",
+        "route",
+        "--format",
+        "json",
+    ]
+    .map(String::from)
+    .to_vec();
+    if let Some(model) = &call.profile.model {
+        // `provider/model`, with the effort as a `#variant` suffix if any.
+        args.extend(["--model".into(), model.clone()]);
+    }
+    let config = json!({
+        "share": "disabled",
+        "snapshot": false,
+        "agent": {
+            "title": { "disable": true },
+            "summary": { "disable": true },
+            "route": {
+                "mode": "primary",
+                "prompt": call.instructions,
+                "permission": { "*": "deny" }
+            }
+        }
+    });
+    Invocation {
+        program: "opencode".into(),
+        args,
+        env: [
+            ("OPENCODE_DISABLE_PROJECT_CONFIG", "1".to_string()),
+            ("OPENCODE_DISABLE_AUTOUPDATE", "1".to_string()),
+            ("OPENCODE_CONFIG_CONTENT", config.to_string()),
+        ]
+        .map(|(k, v)| (k.to_string(), v))
+        .to_vec(),
+        files: Vec::new(),
+        answer_file: None,
+    }
+}
+
+/// The answer is the text of the last `text` event of the JSON lines.
+fn opencode_answer(text: &str) -> Option<Value> {
+    let last = text
+        .lines()
+        .rev()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .find(|e| e["type"] == "text")?;
+    serde_json::from_str(last["part"]["text"].as_str()?.trim()).ok()
+}
+
+/// OpenCode stores every session in its database; the call deletes its own.
+fn opencode_cleanup(text: &str) -> Option<Vec<String>> {
+    let session = text
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .find_map(|e| e["sessionID"].as_str().map(str::to_string))?;
+    Some(
+        ["session", "delete", "--standalone", &session]
+            .map(String::from)
+            .to_vec(),
+    )
+}
+
+fn nothing_stored(_: &str) -> Option<Vec<String>> {
+    None
+}
+
 fn plain_answer(text: &str) -> Option<Value> {
     serde_json::from_str(text.trim()).ok()
 }
@@ -431,6 +563,9 @@ async fn run(
         instructions: &instructions,
     });
     for (path, text) in &invocation.files {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
         std::fs::write(path, text)?;
     }
     let mut cmd = Command::new(&invocation.program);
@@ -473,6 +608,22 @@ async fn run(
         Some(path) => std::fs::read_to_string(path).unwrap_or_default(),
         None => String::from_utf8_lossy(&output.stdout).into_owned(),
     };
+    if let Some(args) = (recipe.cleanup)(&text) {
+        let mut cleanup = Command::new(&invocation.program);
+        cleanup
+            .args(args)
+            .current_dir(sandbox.path())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        if let Some(path) = path_var {
+            cleanup.env("PATH", path);
+        }
+        cleanup.envs(invocation.env.iter().map(|(k, v)| (k, v)));
+        // Best effort: a session left behind only shows in the user's list.
+        let _ = tokio::time::timeout(CLEANUP_TIMEOUT, cleanup.status()).await;
+    }
     let Some(answer) = (recipe.answer)(&text) else {
         return Ok(Err(Fallback::Invalid("no JSON answer".into())));
     };
@@ -578,7 +729,12 @@ mod tests {
                  {deliver}",
                 seen = seen.display()
             );
-            let path = bin.join(kind);
+            let program = if kind == "cursor" {
+                "cursor-agent"
+            } else {
+                kind
+            };
+            let path = bin.join(program);
             std::fs::write(&path, script).unwrap();
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
             Fake { dir }
@@ -783,16 +939,21 @@ mod tests {
         );
     }
 
-    /// Runs the real `claude` and `codex` CLIs once each; `cargo test --
-    /// --ignored routing_live` with both logged in.
+    /// Runs the real `claude`, `codex`, `opencode` and `cursor-agent` CLIs once each;
+    /// `cargo test -- --ignored routing_live` with all logged in.
     #[tokio::test]
     #[ignore]
     async fn routing_live() {
         let parent = tempfile::tempdir().unwrap();
-        for (kind, model) in [("claude", "haiku"), ("codex", "gpt-5.6-luna")] {
+        for (kind, model, effort) in [
+            ("claude", "haiku", Some("low")),
+            ("codex", "gpt-5.6-luna", Some("low")),
+            ("opencode", "openai/gpt-6-luna#low", None),
+            ("cursor", "grok-4.7-low", None),
+        ] {
             let p = Profile {
                 model: Some(model.into()),
-                effort: Some("low".into()),
+                effort: effort.map(Into::into),
                 ..profile(kind)
             };
             let started = std::time::Instant::now();
@@ -809,6 +970,63 @@ mod tests {
             assert!(matches!(choice, Choice::Agent(_)), "{kind}: {choice:?}");
         }
         assert_eq!(std::fs::read_dir(parent.path()).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn the_opencode_recipe_denies_tools_and_deletes_its_session() {
+        let answer =
+            r#"{"type":"text","sessionID":"ses_42","part":{"text":"{\"coordinator\":\"docs\"}"}}"#;
+        let fake = Fake::new("opencode", answer);
+        let choice = fake.choose("opencode", Duration::from_secs(10)).await;
+        assert_eq!(choice, Choice::Agent("docs".into()));
+        // The fake keeps the arguments of its last call: the cleanup.
+        assert_eq!(fake.seen("args"), "session\ndelete\n--standalone\nses_42\n");
+        let env = fake.seen("env");
+        assert!(
+            env.lines()
+                .any(|l| l == "OPENCODE_DISABLE_PROJECT_CONFIG=1")
+        );
+        let config = env
+            .lines()
+            .find_map(|l| l.strip_prefix("OPENCODE_CONFIG_CONTENT="))
+            .unwrap();
+        let config: Value = serde_json::from_str(config).unwrap();
+        assert_eq!(config["agent"]["route"]["permission"], json!({"*": "deny"}));
+        assert!(
+            config["agent"]["route"]["prompt"]
+                .as_str()
+                .unwrap()
+                .contains("- docs: documentation changes")
+        );
+    }
+
+    #[tokio::test]
+    async fn the_cursor_recipe_puts_the_instruction_in_agents_md_and_denies_tools() {
+        let fake = Fake::new(
+            "cursor",
+            r#"{"type":"result","result":"{\"coordinator\":\"docs\"}"}"#,
+        );
+        let choice = fake.choose("cursor", Duration::from_secs(10)).await;
+        assert_eq!(choice, Choice::Agent("docs".into()));
+        assert_eq!(
+            fake.seen("cwd-contents"),
+            ".cursor\nAGENTS.md\nschema.json\n"
+        );
+        let args: Vec<String> = fake.seen("args").lines().map(String::from).collect();
+        assert_eq!(
+            args,
+            [
+                "-p",
+                "--trust",
+                "--output-format",
+                "json",
+                "--model",
+                "small",
+                "--allowed-tools",
+                ""
+            ]
+        );
+        assert!(fake.seen("stdin").starts_with("Title: Fix the login\n"));
     }
 
     #[test]
@@ -830,6 +1048,24 @@ mod tests {
             pick(&json!(["docs"]), &two()),
             Err("not a JSON object".into())
         );
-        assert!(registered("claude") && registered("codex") && !registered("cursor"));
+        assert!(
+            ["claude", "codex", "cursor", "opencode"]
+                .iter()
+                .all(|k| registered(k))
+                && !registered("gemini")
+        );
+        let events = concat!(
+            r#"{"type":"step_start","sessionID":"ses_1"}"#,
+            "\n",
+            r#"{"type":"text","sessionID":"ses_1","part":{"text":"thinking"}}"#,
+            "\n",
+            r#"{"type":"text","sessionID":"ses_1","part":{"text":"{\"coordinator\":\"docs\"}"}}"#,
+            "\n"
+        );
+        assert_eq!(
+            opencode_answer(events),
+            Some(json!({"coordinator": "docs"}))
+        );
+        assert_eq!(opencode_answer(r#"{"type":"error","error":{}}"#), None);
     }
 }

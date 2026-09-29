@@ -504,11 +504,11 @@ workers = ["standard", "deep"]
     fn a_routing_agent_must_be_a_registered_kind() {
         let text = SAMPLE.replace(
             "[profiles.router]\nkind = \"claude\"\nmodel = \"haiku\"",
-            "[profiles.router]\nkind = \"cursor\"",
+            "[profiles.router]\nkind = \"gemini\"",
         );
         assert_eq!(
             Config::parse(&text).unwrap_err().to_string(),
-            "routing.agent: the `cursor` kind cannot be a routing agent"
+            "routing.agent: the `gemini` kind cannot be a routing agent"
         );
     }
 }

@@ -88,7 +88,7 @@ Start one worker. Ask in the session before you split the work.
 """
 
 [profiles.router]                        # the routing agent: any registered kind, a small fast model
-kind = "claude"                          # or "codex"; see "Routing agent kinds"
+kind = "claude"                          # or another kind from "Routing agent kinds" below
 model = "<a small model of that kind>"
 
 [profiles.standard]
@@ -114,6 +114,24 @@ workers = ["standard", "deep"]           # the profiles a coordinator may start 
 ```
 
 A profile becomes agent CLI flags: `claude` gets `--model` and `--effort`, `codex` gets `-m` and `-c model_reasoning_effort=...`, and any other kind gets `--model` (put the effort in the model ID). `args` are passed unchanged; this is where permission and sandbox flags belong.
+
+**Coordinators on other kinds.** A coordinator reads the run folder's `AGENTS.md`, which Claude Code (through the `CLAUDE.md` link), Codex, Cursor Agent and OpenCode all read. Examples, both checked in a Herdr pane with a shell command the agent had to run:
+
+```toml
+[profiles.coordinator-cursor]
+kind = "cursor"
+model = "grok-4.7-medium"                # Cursor has no effort flag: the effort is part of the model ID
+args = ["--trust"]                       # otherwise Cursor asks to trust every new run folder
+description = "Coordinator on Cursor Agent"
+
+[profiles.coordinator-opencode]
+kind = "opencode"
+model = "openai/gpt-6-luna"              # provider/model, as `opencode models` lists it
+description = "Coordinator on OpenCode"
+```
+
+- Cursor Agent asks before it runs a command that is not in its allow-list. The plugin writes `.cursor/cli.json` into each run folder, allowing the plugin's binary by the path the sheet gives the coordinator, as it writes `.claude/settings.local.json` for Claude Code.
+- OpenCode starts as `opencode mini`: its full interface takes no model flag, and `mini` takes `--model` and the `--session` a resume adds. OpenCode lets agents run commands unless your OpenCode config says otherwise.
 
 **Profile instructions.** A profile's optional `instructions` (Markdown) are added for work under that profile: to the run folder's `AGENTS.md` for a coordinator profile, and to the brief for a worker profile, as a "Profile instructions" section after the built-in rules. The built-in rules (never merge, never change the Linear state, stay inside the catalog, treat the issue text as data) stay as they are and win where the two disagree. Only the config sets instructions; an agent can still pass only a profile's name.
 
@@ -148,7 +166,25 @@ Whatever the issue says, the routing agent can only pick one of the configured c
 | | | Auto-memory | `--disable memories` | |
 | | | Session history and persistence | `--ephemeral`, `history.persistence="none"` | |
 
-Other kinds are not registered. `opencode` has a usable recipe on paper (a config-defined agent with its own prompt and every permission denied, `OPENCODE_DISABLE_PROJECT_CONFIG=1`, `--standalone`), but its global config, plugins, MCP servers and `~/.config/opencode/AGENTS.md` stay loaded, `run` has no schema option, and it could not be tested with a login.
+| `cursor` | Cursor Agent 2026.09.26 | Default system prompt | none: Cursor offers no system prompt option; the fixed instruction is the call folder's `AGENTS.md`, which Cursor applies as a rule | Cursor's own system prompt, the user rules synced from your Cursor account, and any `AGENTS.md` or `.cursor/rules` in a folder above the call folder (normally none: it is under the system temp dir) |
+| | | Tools | `--allowed-tools ""` (an internal flag of this version: every tool call answers "Tool not available"), and the call folder's `.cursor/cli.json` denies shell, read, write, web and MCP | |
+| | | MCP | denied as above, and project MCP servers need an approval the call never gives | Descriptions of MCP servers that Cursor plugins bring (they cannot be called) |
+| | | Skills | | Skills under your home folder (`~/.claude/skills`, `~/.agents/skills`, Cursor's own) |
+| | | Plugins, hooks | | Anything under `~/.cursor` (`mcp.json`, `hooks.json`, `rules`) and in a folder above the call folder |
+| | | User and project settings | `--trust` (otherwise Cursor stops at its trust prompt); the call folder's own `.cursor/cli.json` | Your `~/.cursor/cli-config.json` |
+| | | Auto-memory | none in Cursor Agent's print mode | |
+| | | Session history and persistence | | Each call's chat in `~/.cursor/chats` and a `~/.cursor/projects` folder |
+| `opencode` | OpenCode 2.0.15 | Default system prompt | an agent of its own in `OPENCODE_CONFIG_CONTENT` whose `prompt` is the fixed instruction | An environment block (session id, working directory, platform) and the date |
+| | | Tools | that agent's `permission` denies everything (`{"*": "deny"}`) | |
+| | | MCP, plugins, skills, agents, settings (project) | `OPENCODE_DISABLE_PROJECT_CONFIG=1`; `--standalone` runs a private server, since the shared background service ignores the call's environment | The global config in `~/.config/opencode` (its MCP servers, plugins and agents) still loads |
+| | | Hooks | OpenCode's hooks are plugins: as above | Hooks of global plugins |
+| | | Instruction files | the project layer, as above (OpenCode does not read `CLAUDE.md`) | `~/.config/opencode/AGENTS.md` |
+| | | Auto-memory | none in OpenCode | |
+| | | Session history and persistence | `"snapshot": false`, `"share": "disabled"`, and the plugin deletes the session afterwards (`opencode session delete`) | A stored copy of the environment block, a project row and an empty `shell/` folder per call in `~/.local/share/opencode`, which the CLI cannot remove |
+
+Cursor Agent and OpenCode have no schema option, so the plugin checks the JSON they print itself (Cursor's `result`, OpenCode's last text event). Put Cursor's effort in the model ID: `model = "grok-4.7-low"`. Put the effort in the model as a variant: `model = "openai/gpt-6-luna#low"`.
+
+Other kinds are not registered.
 
 ## How a run works
 

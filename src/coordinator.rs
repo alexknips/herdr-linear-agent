@@ -95,7 +95,16 @@ pub fn write_priming(
     files::write_json(
         &run.dir.join(".claude/settings.local.json"),
         &settings_local(bin),
-    )
+    )?;
+    std::fs::create_dir_all(run.dir.join(".cursor"))?;
+    files::write_json(&run.dir.join(".cursor/cli.json"), &cursor_cli(bin))
+}
+
+/// Cursor Agent's project permissions: the coordinator may run the plugin's
+/// binary without asking. Cursor matches the command as typed, so the entry
+/// is the path the sheet tells the coordinator to run.
+pub fn cursor_cli(bin: &str) -> serde_json::Value {
+    serde_json::json!({ "permissions": { "allow": [format!("Shell({bin})")], "deny": [] } })
 }
 
 /// The coordinator record before its workspace exists.
@@ -374,6 +383,17 @@ mod tests {
         for plugin_only in ["startup", "action", "ticker"] {
             assert!(!settings.to_string().contains(plugin_only), "{plugin_only}");
         }
+        let cursor: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(f.run.dir.join(".cursor/cli.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            cursor,
+            serde_json::json!({"permissions": {
+                "allow": ["Shell(/opt/hla/bin/herdr-linear-agent)"],
+                "deny": []
+            }})
+        );
 
         // A second placement keeps the link and rewrites the text.
         write_priming(&f.run, &f.record, "/usr/local/bin/hla", None).unwrap();
