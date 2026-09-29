@@ -218,6 +218,13 @@ impl World {
         self.seen_level = LinearLevel::default();
     }
 
+    /// What a reload of a changed config does: the ticker's tasks start again
+    /// with the config the files now hold.
+    pub fn reload_config(&mut self) {
+        self.config = Config::load(&self.env.config_dir()).unwrap();
+        self.restart_ticker();
+    }
+
     pub fn ctx(&self) -> Ctx<'_> {
         Ctx {
             env: &self.env,

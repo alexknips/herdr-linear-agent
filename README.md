@@ -91,6 +91,12 @@ timeout_seconds = 120
 workers = ["standard", "deep"]           # the profiles a coordinator may start workers with
 ```
 
+**Config changes apply within seconds.** The ticker compares `config.toml` and the profile folders with the ones it runs on every 5 seconds, by content. When they changed and the new config loads, it starts its tasks again with it, as a ticker restart would; a config that does not load is logged (`config reload failed: <error>`, once per version of the files) and the old one stays in use until the files are fixed. A change takes effect for what is decided and started afterwards: routing of new issues, coordinator and worker launches and restarts, limits and notifications.
+
+- An agent that is running keeps its arguments and instructions; the change reaches it at its next launch or restart. `AGENTS.md` and briefs already written are not rewritten.
+- Removing a profile that a running run uses is not refused; restarting or resuming with it fails then with the usual unknown-profile error.
+- Lowering a limit below the current count leaves running runs alone; new ones wait until there is room.
+
 **Workspaces and teams.** Each workspace polls Linear with its own OAuth application, token and app user. Runs are named `<workspace>/<ISSUE-KEY>`, for example `acme/DATA-1`, so the same issue key in two workspaces makes two runs; the name is what agents pass to `herdr-linear-agent` commands, and the workspace is part of agent names (`acme-data-1-coordinator`), branches (`herdr-linear-agent/acme/data-1/w1-...`) and brief folders. A team's `allowed_user_ids` and `review_state` apply to that team's issues only. A run whose team was removed from the config keeps running, relays nobody's replies and moves to `In Review` on `finish`.
 
 ### Profiles

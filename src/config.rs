@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
+use sha2::Digest;
 
 use crate::{agents, routing};
 
@@ -219,6 +220,43 @@ impl Config {
             .with_context(|| format!("could not read {}", path.display()))?;
         let profiles = load_profiles(&config_dir.join(PROFILES_DIR))?;
         Self::parse(&text, profiles).with_context(|| format!("{} is not valid", path.display()))
+    }
+
+    /// A SHA-256 over the files `load` reads, by sorted path and content:
+    /// `config.toml` and each profile folder's `config.toml` and
+    /// `instructions.md`. Rewriting a file with the same content keeps it.
+    pub fn fingerprint(config_dir: &Path) -> Result<[u8; 32]> {
+        let path = Self::path(config_dir);
+        let mut files = vec![path];
+        if let Ok(entries) = std::fs::read_dir(config_dir.join(PROFILES_DIR)) {
+            for entry in entries.flatten() {
+                if entry.file_name().to_string_lossy().starts_with('.') {
+                    continue;
+                }
+                files.push(entry.path().join(FILE_NAME));
+                files.push(entry.path().join(INSTRUCTIONS_FILE));
+            }
+        }
+        files.sort();
+        let mut hash = sha2::Sha256::new();
+        for file in files {
+            match std::fs::read(&file) {
+                Ok(bytes) => {
+                    hash.update(file.as_os_str().as_encoded_bytes());
+                    hash.update([0]);
+                    hash.update((bytes.len() as u64).to_le_bytes());
+                    hash.update(&bytes);
+                }
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::NotFound
+                        && file != Self::path(config_dir) => {}
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("could not read {}", file.display()));
+                }
+            }
+        }
+        Ok(hash.finalize().into())
     }
 
     fn parse(text: &str, profiles: BTreeMap<String, Profile>) -> Result<Config> {
@@ -879,6 +917,41 @@ workers = ["standard", "deep"]
         assert_eq!(
             config.profile("mid").unwrap().instructions,
             [layer("root", "Root rule.\n")]
+        );
+    }
+
+    #[test]
+    fn the_fingerprint_follows_the_content_of_the_files_load_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        write_sample(dir.path(), SAMPLE);
+        let first = Config::fingerprint(dir.path()).unwrap();
+        write_sample(dir.path(), SAMPLE);
+        assert_eq!(
+            Config::fingerprint(dir.path()).unwrap(),
+            first,
+            "rewritten with the same content"
+        );
+        let instructions = dir
+            .path()
+            .join(PROFILES_DIR)
+            .join("deep")
+            .join(INSTRUCTIONS_FILE);
+        std::fs::write(&instructions, "Run the slow tests too.\n").unwrap();
+        let with_instructions = Config::fingerprint(dir.path()).unwrap();
+        assert_ne!(with_instructions, first, "a new instructions.md");
+        std::fs::write(&instructions, "Run the fast tests only.\n").unwrap();
+        assert_ne!(Config::fingerprint(dir.path()).unwrap(), with_instructions);
+        std::fs::write(dir.path().join(PROFILES_DIR).join(".notes"), "x").unwrap();
+        std::fs::write(
+            dir.path().join(PROFILES_DIR).join("deep").join("README.md"),
+            "x",
+        )
+        .unwrap();
+        std::fs::remove_file(&instructions).unwrap();
+        assert_eq!(
+            Config::fingerprint(dir.path()).unwrap(),
+            first,
+            "files load does not read leave it alone"
         );
     }
 

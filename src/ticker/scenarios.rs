@@ -192,6 +192,30 @@ async fn two_workspaces_with_the_same_issue_key_run_apart_under_their_own_team_r
 }
 
 #[tokio::test]
+async fn after_a_config_reload_the_next_worker_starts_with_the_new_profile() {
+    let mut world = World::sample();
+    world.running_issue().await;
+    std::fs::write(
+        world.env.config_dir().join("profiles/standard/config.toml"),
+        "kind = \"claude\"\nmodel = \"sonnet\"\nargs = [\"--permission-mode\", \"plan\"]\n",
+    )
+    .unwrap();
+    world.reload_config();
+    world.start_worker("api").await;
+    world.settle().await;
+    let start = world.herdr.starts().pop().unwrap();
+    assert_eq!(start.name, "acme-data-1-w1");
+    assert!(
+        ends_with(
+            &start.args,
+            &["--model", "sonnet", "--permission-mode", "plan"]
+        ),
+        "{:?}",
+        start.args
+    );
+}
+
+#[tokio::test]
 async fn intake_stops_at_max_runs_and_while_paused() {
     let mut full = World::with(limit("max_runs", 1));
     full.delegate(KEY, "One", None);

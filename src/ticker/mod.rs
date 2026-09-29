@@ -37,6 +37,20 @@ const STOP_WAIT: Duration = Duration::from_secs(30);
 const SUPERVISE_EVERY: Duration = Duration::from_secs(1);
 const SOCKET_RETRY: Duration = Duration::from_secs(5);
 const EVENT_QUEUE: usize = 256;
+/// How often the config files are compared with the ones in use.
+const CONFIG_POLL: Duration = Duration::from_secs(5);
+
+/// A config whose files changed and that loads, with their fingerprint.
+type Reloaded = (Box<Config>, [u8; 32]);
+
+/// Resolves when `serve` should start again with a new config.
+type Reload<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = Reloaded> + 'a>>;
+
+/// Why `serve` returned.
+enum Served {
+    Stopped(String),
+    Reload(Reloaded),
+}
 
 pub fn lock_path(state_dir: &Path) -> PathBuf {
     state_dir.join("ticker.lock")
@@ -297,9 +311,12 @@ pub fn unreachable(link: &Link, now: Timestamp) -> bool {
 }
 
 /// `ticker run`: holds the lock until asked to stop or until the configured
-/// session has been unreachable for five minutes.
+/// session has been unreachable for five minutes. A changed config that
+/// loads starts the tasks again with it, the lock still held.
 pub async fn run(ctx: &Ctx<'_>) -> Result<()> {
-    let config = Config::load(&ctx.config_dir())?;
+    let config_dir = ctx.config_dir();
+    let config = Config::load(&config_dir)?;
+    let fingerprint = Config::fingerprint(&config_dir)?;
     let state_dir = ctx.ensure_state_dir()?;
     let _lock = acquire(&state_dir).await?;
     let _ = std::fs::remove_file(stop_path(&state_dir));
@@ -308,7 +325,15 @@ pub async fn run(ctx: &Ctx<'_>) -> Result<()> {
         "ticker {VERSION} started (pid {})",
         std::process::id()
     ));
-    match serve(ctx, &config, &state_dir, &log).await {
+    let served = keep_serving(
+        &config_dir,
+        (Box::new(config), fingerprint),
+        &log,
+        CONFIG_POLL,
+        async |config, reload| serve(ctx, config, &state_dir, &log, reload).await,
+    )
+    .await;
+    match served {
         Ok(reason) => {
             log.line(&format!("ticker stopped: {reason}"));
             Ok(())
@@ -320,11 +345,68 @@ pub async fn run(ctx: &Ctx<'_>) -> Result<()> {
     }
 }
 
+/// Calls `serve` with the config in use and a watch on its files, again with
+/// each new config the watch brings, until `serve` stops for another reason.
+async fn keep_serving(
+    config_dir: &Path,
+    (mut config, mut fingerprint): Reloaded,
+    log: &Log,
+    poll: Duration,
+    mut serve: impl AsyncFnMut(&Config, Reload<'_>) -> Result<Served>,
+) -> Result<String> {
+    loop {
+        let reload = Box::pin(watch_config(config_dir, fingerprint, log, poll));
+        match serve(&config, reload).await? {
+            Served::Stopped(reason) => return Ok(reason),
+            Served::Reload((new, new_fingerprint)) => {
+                log.line("config changed; restarting the ticker's tasks");
+                (config, fingerprint) = (new, new_fingerprint);
+            }
+        }
+    }
+}
+
+/// Resolves with the config once its files differ from `fingerprint` and it
+/// loads. A config that does not load is logged once per fingerprint, and
+/// the one in use stays.
+async fn watch_config(
+    config_dir: &Path,
+    fingerprint: [u8; 32],
+    log: &Log,
+    poll: Duration,
+) -> Reloaded {
+    let mut refused = None;
+    loop {
+        tokio::time::sleep(poll).await;
+        let Ok(now) = Config::fingerprint(config_dir) else {
+            continue;
+        };
+        if now == fingerprint {
+            continue;
+        }
+        match Config::load(config_dir) {
+            Ok(config) => return (Box::new(config), now),
+            Err(error) if refused != Some(now) => {
+                log.line(&format!("config reload failed: {error:#}"));
+                refused = Some(now);
+            }
+            Err(_) => {}
+        }
+    }
+}
+
 /// Runs the Linear task and the reconciler at once. Until the configured
 /// session's socket is found the Herdr requests are `NotSent`, so the
 /// reconciler runs Linear-only passes; the link counts as down since the
-/// start, so the 5-minute unreachable exit still applies.
-async fn serve(ctx: &Ctx<'_>, config: &Config, state_dir: &Path, log: &Arc<Log>) -> Result<String> {
+/// start, so the 5-minute unreachable exit still applies. `reload` ends it
+/// like a stop, so the caller can start it again.
+async fn serve(
+    ctx: &Ctx<'_>,
+    config: &Config,
+    state_dir: &Path,
+    log: &Arc<Log>,
+    reload: Reload<'_>,
+) -> Result<Served> {
     let herdr = herdr::Client::default();
     let (link_tx, link) = watch::channel(Link {
         connected: false,
@@ -392,21 +474,22 @@ async fn serve(ctx: &Ctx<'_>, config: &Config, state_dir: &Path, log: &Arc<Log>)
         clock: Timestamp::now,
     });
     tokio::pin!(linear, reconciler);
-    let reason = tokio::select! {
+    let served = tokio::select! {
         result = &mut reconciler => {
             finder.abort();
             tasks.iter().for_each(tokio::task::JoinHandle::abort);
-            return result.map(|()| "the reconciler ended".into());
+            return result.map(|()| Served::Stopped("the reconciler ended".into()));
         }
-        reason = supervise(state_dir, link) => reason,
-        () = &mut linear => "a Linear task ended".into(),
+        reason = supervise(state_dir, link) => Served::Stopped(reason),
+        () = &mut linear => Served::Stopped("a Linear task ended".into()),
+        reloaded = reload => Served::Reload(reloaded),
     };
     finder.abort();
     tasks.iter().for_each(tokio::task::JoinHandle::abort);
     let _ = shutdown_tx.send(true);
     reconciler.await?;
     let _ = std::fs::remove_file(poke_path(state_dir));
-    Ok(reason)
+    Ok(served)
 }
 
 /// Finds the configured session's socket (`herdr session list` fails while
@@ -499,6 +582,89 @@ mod tests {
 
     const MINE: &str = "0.2.0+b1d";
     const RELEASE_WAIT: Duration = Duration::from_secs(5);
+
+    const POLL: Duration = Duration::from_millis(20);
+
+    fn sample_dir() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        crate::config::tests::write_sample(dir.path(), crate::config::tests::SAMPLE);
+        dir
+    }
+
+    #[tokio::test]
+    async fn a_changed_config_serves_again_with_it_while_the_lock_is_held() {
+        let config_dir = sample_dir();
+        let state = tempfile::tempdir().unwrap();
+        let _lock = acquire(state.path()).await.unwrap();
+        let log = Log::new(state.path().join("ticker.log"));
+        let config = Config::load(config_dir.path()).unwrap();
+        let fingerprint = Config::fingerprint(config_dir.path()).unwrap();
+        let standard = config_dir.path().join("profiles/standard/config.toml");
+        let mut args = Vec::new();
+        let stopped = keep_serving(
+            config_dir.path(),
+            (Box::new(config), fingerprint),
+            &log,
+            POLL,
+            async |config, reload| {
+                args.push(config.profile("standard").unwrap().args.clone());
+                if args.len() == 2 {
+                    assert_eq!(
+                        decide_start(&lock_state(state.path()), VERSION, false),
+                        StartAction::Nothing,
+                        "the lock is held while the tasks start again"
+                    );
+                    return Ok(Served::Stopped("asked to stop".into()));
+                }
+                std::fs::write(&standard, "kind = \"claude\"\nargs = [\"--new\"]\n").unwrap();
+                Ok(Served::Reload(reload.await))
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(stopped, "asked to stop");
+        assert_eq!(
+            args,
+            [
+                vec!["--permission-mode".to_string(), "auto".to_string()],
+                vec!["--new".to_string()],
+            ]
+        );
+        let text = std::fs::read_to_string(state.path().join("ticker.log")).unwrap();
+        assert_eq!(
+            text.matches("config changed; restarting the ticker's tasks")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn a_config_that_does_not_load_is_logged_once_and_the_old_one_stays() {
+        let config_dir = sample_dir();
+        let state = tempfile::tempdir().unwrap();
+        let log = Log::new(state.path().join("ticker.log"));
+        let fingerprint = Config::fingerprint(config_dir.path()).unwrap();
+        let path = config_dir.path().join("config.toml");
+        std::fs::write(&path, "not toml [").unwrap();
+        let watch = watch_config(config_dir.path(), fingerprint, &log, POLL);
+        tokio::pin!(watch);
+        let waited = tokio::time::timeout(POLL * 10, &mut watch).await;
+        assert!(waited.is_err(), "a config that does not load is not taken");
+        let logged = || {
+            std::fs::read_to_string(state.path().join("ticker.log"))
+                .unwrap()
+                .matches("config reload failed: ")
+                .count()
+        };
+        assert_eq!(logged(), 1, "logged once for the same files");
+        let fixed =
+            crate::config::tests::SAMPLE.replace("timeout_seconds = 60", "timeout_seconds = 90");
+        std::fs::write(&path, fixed).unwrap();
+        let (config, _) = tokio::time::timeout(POLL * 50, watch).await.unwrap();
+        assert_eq!(config.routing.timeout_seconds, 90);
+        assert!(config.workspaces.contains_key("acme"));
+        assert_eq!(logged(), 1);
+    }
 
     fn held_by(version: &str, pid: u32, started: &str) -> LockState {
         LockState::Held(Info {
