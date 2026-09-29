@@ -173,14 +173,27 @@ Whatever the issue says, the routing agent can only pick one of the configured c
 | | | Plugins, hooks | | Anything under `~/.cursor` (`mcp.json`, `hooks.json`, `rules`) and in a folder above the call folder |
 | | | User and project settings | `--trust` (otherwise Cursor stops at its trust prompt); the call folder's own `.cursor/cli.json` | Your `~/.cursor/cli-config.json` |
 | | | Auto-memory | none in Cursor Agent's print mode | |
-| | | Session history and persistence | | Each call's chat in `~/.cursor/chats` and a `~/.cursor/projects` folder |
+| | | Session history and persistence | | Each call's chat in `~/.cursor/chats` and a `~/.cursor/projects` folder, unless the profile's `env` sets `CURSOR_CONFIG_DIR` and `CURSOR_DATA_DIR` (below) |
 | `opencode` | OpenCode 2.0.15 | Default system prompt | an agent of its own in `OPENCODE_CONFIG_CONTENT` whose `prompt` is the fixed instruction | An environment block (session id, working directory, platform) and the date |
 | | | Tools | that agent's `permission` denies everything (`{"*": "deny"}`) | |
-| | | MCP, plugins, skills, agents, settings (project) | `OPENCODE_DISABLE_PROJECT_CONFIG=1`; `--standalone` runs a private server, since the shared background service ignores the call's environment | The global config in `~/.config/opencode` (its MCP servers, plugins and agents) still loads |
+| | | MCP, plugins, skills, agents, settings (project) | `OPENCODE_DISABLE_PROJECT_CONFIG=1`; `--standalone` runs a private server, since the shared background service ignores the call's environment | The global config in `~/.config/opencode` (its MCP servers, plugins and agents) still loads, unless the profile's `env` sets `OPENCODE_CONFIG_DIR` (below) |
 | | | Hooks | OpenCode's hooks are plugins: as above | Hooks of global plugins |
-| | | Instruction files | the project layer, as above (OpenCode does not read `CLAUDE.md`) | `~/.config/opencode/AGENTS.md` |
+| | | Instruction files | the project layer, as above (OpenCode does not read `CLAUDE.md`) | `~/.config/opencode/AGENTS.md`, unless `OPENCODE_CONFIG_DIR` is set |
 | | | Auto-memory | none in OpenCode | |
 | | | Session history and persistence | `"snapshot": false`, `"share": "disabled"`, and the plugin deletes the session afterwards (`opencode session delete`) | A stored copy of the environment block, a project row and an empty `shell/` folder per call in `~/.local/share/opencode`, which the CLI cannot remove |
+
+**Routing agent environment.** The routing agent's profile may set `env`, variables added to its call (the recipe's own variables win over them). Only that profile may set it: Herdr starts coordinators and workers and cannot pass them variables, so a profile with `env` that is also a coordinator or worker candidate is refused. Its main use is to give a kind an empty config folder of its own where its login does not live there, which cuts what the table above leaves:
+
+```toml
+[profiles.router-opencode]
+kind = "opencode"
+model = "openai/gpt-6-luna#low"
+env = { OPENCODE_CONFIG_DIR = "/Users/me/.local/state/herdr-linear-agent/router/opencode" }  # an empty folder you create
+```
+
+- `OPENCODE_CONFIG_DIR` replaces the global config folder, so the global `opencode.json`, its MCP servers, plugins and agents, and `~/.config/opencode/AGENTS.md` no longer load. The login lives in OpenCode's database and keeps working.
+- `CURSOR_CONFIG_DIR` and `CURSOR_DATA_DIR` (the second is undocumented) keep Cursor Agent's chats, projects and settings out of `~/.cursor`; they do not cut prompt tokens, and your default model is not read, so set `model`. The login lives in the Keychain and keeps working. Cursor writes each call's chat into that folder, so empty it now and then.
+- Do not point Claude Code's `CLAUDE_CONFIG_DIR` or Codex's `CODEX_HOME` there: their login lives in those folders.
 
 Cursor Agent and OpenCode have no schema option, so the plugin checks the JSON they print itself (Cursor's `result`, OpenCode's last text event). Put Cursor's effort in the model ID: `model = "grok-4.7-low"`. Put the effort in the model as a variant: `model = "openai/gpt-6-luna#low"`.
 

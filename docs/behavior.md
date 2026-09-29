@@ -103,6 +103,7 @@ File: `<config_dir>/config.toml`. Unknown keys are refused in every table. The k
 | `profiles.<name>.args` | list | `[]` | passed unchecked |
 | `profiles.<name>.description` | string | `""` | shown to the routing agent for coordinator candidates |
 | `profiles.<name>.instructions` | Markdown | none | added after the built-in rules: to `AGENTS.md` for a coordinator profile, to the brief for a worker profile |
+| `profiles.<name>.env` | table of strings | `{}` | added to the routing agent's call before the recipe's variables; only the routing agent's profile may set it: ``profiles.<name>.env applies only to the routing agent, but `<name>` is also a coordinator or worker profile``; variable names may not be empty or contain `=`. `src/config.rs:only_the_routing_agents_profile_may_set_env`, `src/routing.rs:the_profiles_env_reaches_the_agent_and_the_recipe_wins` |
 | `routing.agent` | profile name | required | must exist (context `routing.agent`); its kind must be registered (`src/routing.rs` `RECIPES`): ``routing.agent: the `<kind>` kind cannot be a routing agent`` |
 | `routing.coordinators` | profile names | required | non-empty (`routing.coordinators lists no profile`), each must exist |
 | `routing.default` | profile name | required | must exist (context `routing.default`) |

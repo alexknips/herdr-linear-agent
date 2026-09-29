@@ -22,6 +22,18 @@ use crate::linear::api::IssueDetail;
 
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// The variables a call adds to the ticker's environment, in the order they
+/// are set: the profile's `env`, then the recipe's.
+fn call_env<'a>(
+    profile: &'a Profile,
+    invocation: &'a Invocation,
+) -> impl Iterator<Item = (&'a String, &'a String)> {
+    profile
+        .env
+        .iter()
+        .chain(invocation.env.iter().map(|(k, v)| (k, v)))
+}
+
 /// A coordinator profile the routing agent may pick.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Candidate {
@@ -578,7 +590,8 @@ async fn run(
     if let Some(path) = path_var {
         cmd.env("PATH", path);
     }
-    for (key, value) in &invocation.env {
+    // The profile's own variables first: the recipe's cut wins over them.
+    for (key, value) in call_env(profile, &invocation) {
         cmd.env(key, value);
     }
     let mut child = cmd
@@ -620,7 +633,7 @@ async fn run(
         if let Some(path) = path_var {
             cleanup.env("PATH", path);
         }
-        cleanup.envs(invocation.env.iter().map(|(k, v)| (k, v)));
+        cleanup.envs(call_env(profile, &invocation));
         // Best effort: a session left behind only shows in the user's list.
         let _ = tokio::time::timeout(CLEANUP_TIMEOUT, cleanup.status()).await;
     }
@@ -632,6 +645,7 @@ async fn run(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::os::unix::fs::PermissionsExt;
 
     use super::*;
@@ -695,6 +709,7 @@ mod tests {
             args: vec!["--dangerously-skip-permissions".into()],
             description: String::new(),
             instructions: None,
+            env: BTreeMap::new(),
         }
     }
 
@@ -945,15 +960,35 @@ mod tests {
     #[ignore]
     async fn routing_live() {
         let parent = tempfile::tempdir().unwrap();
-        for (kind, model, effort) in [
-            ("claude", "haiku", Some("low")),
-            ("codex", "gpt-5.6-luna", Some("low")),
-            ("opencode", "openai/gpt-6-luna#low", None),
-            ("cursor", "grok-4.7-low", None),
+        // The README's optional isolation of each kind's own config dir.
+        let own = tempfile::tempdir().unwrap();
+        let dir = own.path().to_string_lossy().into_owned();
+        let isolated = |keys: &[&str]| -> BTreeMap<String, String> {
+            keys.iter().map(|k| (k.to_string(), dir.clone())).collect()
+        };
+        for (kind, model, effort, env) in [
+            ("claude", "haiku", Some("low"), BTreeMap::new()),
+            ("codex", "gpt-5.6-luna", Some("low"), BTreeMap::new()),
+            ("opencode", "openai/gpt-6-luna#low", None, BTreeMap::new()),
+            (
+                "opencode",
+                "openai/gpt-6-luna#low",
+                None,
+                isolated(&["OPENCODE_CONFIG_DIR"]),
+            ),
+            ("cursor", "grok-4.7-low", None, BTreeMap::new()),
+            (
+                "cursor",
+                "grok-4.7-low",
+                None,
+                isolated(&["CURSOR_CONFIG_DIR", "CURSOR_DATA_DIR"]),
+            ),
         ] {
+            let isolated = !env.is_empty();
             let p = Profile {
                 model: Some(model.into()),
                 effort: effort.map(Into::into),
+                env,
                 ..profile(kind)
             };
             let started = std::time::Instant::now();
@@ -966,7 +1001,10 @@ mod tests {
                 parent.path(),
             )
             .await;
-            println!("{kind}: {choice:?} in {:?}", started.elapsed());
+            println!(
+                "{kind} (own config dir: {isolated}): {choice:?} in {:?}",
+                started.elapsed()
+            );
             assert!(matches!(choice, Choice::Agent(_)), "{kind}: {choice:?}");
         }
         assert_eq!(std::fs::read_dir(parent.path()).unwrap().count(), 0);
@@ -1027,6 +1065,37 @@ mod tests {
             ]
         );
         assert!(fake.seen("stdin").starts_with("Title: Fix the login\n"));
+    }
+
+    #[tokio::test]
+    async fn the_profiles_env_reaches_the_agent_and_the_recipe_wins() {
+        let fake = Fake::new("claude", PICKS_DOCS);
+        let path = fake.path();
+        let p = Profile {
+            env: BTreeMap::from([
+                ("ROUTER_MARK".to_string(), "on".to_string()),
+                (
+                    "CLAUDE_CODE_DISABLE_CLAUDE_MDS".to_string(),
+                    "0".to_string(),
+                ),
+            ]),
+            ..profile("claude")
+        };
+        choose(
+            &p,
+            &two(),
+            &issue(),
+            Duration::from_secs(10),
+            Some(&path),
+            &fake.parent(),
+        )
+        .await;
+        let env = fake.seen("env");
+        assert!(env.lines().any(|l| l == "ROUTER_MARK=on"), "{env}");
+        assert!(
+            env.lines().any(|l| l == "CLAUDE_CODE_DISABLE_CLAUDE_MDS=1"),
+            "{env}"
+        );
     }
 
     #[test]

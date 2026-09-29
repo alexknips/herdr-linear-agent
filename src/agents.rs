@@ -91,6 +91,7 @@ mod tests {
             args: args.iter().map(|a| a.to_string()).collect(),
             description: String::new(),
             instructions: None,
+            env: Default::default(),
         }
     }
 

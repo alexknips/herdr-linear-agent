@@ -151,6 +151,11 @@ pub struct Profile {
     /// this profile, after the built-in sheet. Only people write it here.
     #[serde(default)]
     pub instructions: Option<String>,
+    /// Environment variables for the routing agent's call. Herdr starts
+    /// coordinators and workers and cannot pass them any, so only the
+    /// routing agent's profile may set this.
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -260,6 +265,19 @@ impl Config {
         }
 
         let routing = &self.routing;
+        for (name, profile) in &self.profiles {
+            for key in profile.env.keys() {
+                ensure!(
+                    !key.is_empty() && !key.contains('='),
+                    "profiles.{name}.env has an invalid variable name `{key}`"
+                );
+            }
+            let used = routing.coordinators.contains(name) || routing.workers.contains(name);
+            ensure!(
+                profile.env.is_empty() || !used,
+                "profiles.{name}.env applies only to the routing agent, but `{name}` is also a coordinator or worker profile"
+            );
+        }
         let agent = self.profile(&routing.agent).context("routing.agent")?;
         ensure!(
             routing::registered(&agent.kind),
@@ -497,6 +515,34 @@ workers = ["standard", "deep"]
                 .unwrap_err()
                 .to_string(),
             "linear.run_read_interval_seconds must be between 1 and 3600"
+        );
+    }
+
+    #[test]
+    fn only_the_routing_agents_profile_may_set_env() {
+        let with_env = |profile: &str| {
+            SAMPLE.replace(
+                &format!("[profiles.{profile}]\n"),
+                &format!(
+                    "[profiles.{profile}]\nenv = {{ OPENCODE_CONFIG_DIR = \"/tmp/empty\" }}\n"
+                ),
+            )
+        };
+        let config = Config::parse(&with_env("router")).unwrap();
+        assert_eq!(
+            config
+                .profile("router")
+                .unwrap()
+                .env
+                .get("OPENCODE_CONFIG_DIR")
+                .map(String::as_str),
+            Some("/tmp/empty")
+        );
+        assert_eq!(
+            Config::parse(&with_env("standard"))
+                .unwrap_err()
+                .to_string(),
+            "profiles.standard.env applies only to the routing agent, but `standard` is also a coordinator or worker profile"
         );
     }
 
