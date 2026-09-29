@@ -845,7 +845,7 @@ mod tests {
             ],
         );
         Rig {
-            config: Config::parse(crate::config::tests::SAMPLE).unwrap(),
+            config: crate::config::tests::sample(),
             runner: FakeRunner::new(),
             env,
             home,

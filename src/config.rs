@@ -1,4 +1,7 @@
-//! `$XDG_CONFIG_HOME/herdr-linear-agent/config.toml`, written by the user.
+//! `$XDG_CONFIG_HOME/herdr-linear-agent/config.toml` and the profile folders
+//! next to it, `profiles/<name>/config.toml` with an optional
+//! `profiles/<name>/instructions.md`, all written by the user. A profile is a
+//! folder of its own so it can be handed to other people as it is.
 //!
 //! The config is the only place that names Linear teams, repositories, agent
 //! profiles (kind, model, effort, approval flags), the routing candidates, limits and
@@ -14,6 +17,8 @@ use serde::{Deserialize, Serialize};
 use crate::{agents, routing};
 
 pub const FILE_NAME: &str = "config.toml";
+const PROFILES_DIR: &str = "profiles";
+const INSTRUCTIONS_FILE: &str = "instructions.md";
 pub const DEFAULT_CALLBACK_PORT: u16 = 43871;
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -30,7 +35,8 @@ pub struct Config {
     pub claude: Claude,
     #[serde(default)]
     pub repositories: BTreeMap<String, Repository>,
-    #[serde(default)]
+    /// Read from the profile folders, never from `config.toml`.
+    #[serde(skip)]
     pub profiles: BTreeMap<String, Profile>,
     pub routing: Routing,
 }
@@ -147,9 +153,10 @@ pub struct Profile {
     pub args: Vec<String>,
     #[serde(default)]
     pub description: String,
-    /// Markdown the plugin adds to the agent's instructions for work under
-    /// this profile, after the built-in sheet. Only people write it here.
-    #[serde(default)]
+    /// The profile folder's `instructions.md`: Markdown the plugin adds to the
+    /// agent's instructions for work under this profile, after the built-in
+    /// sheet. Only people write it.
+    #[serde(skip)]
     pub instructions: Option<String>,
     /// Environment variables for the routing agent's call. Herdr starts
     /// coordinators and workers and cannot pass them any, so only the
@@ -186,11 +193,18 @@ impl Config {
         let path = Self::path(config_dir);
         let text = std::fs::read_to_string(&path)
             .with_context(|| format!("could not read {}", path.display()))?;
-        Self::parse(&text).with_context(|| format!("{} is not valid", path.display()))
+        let profiles = load_profiles(&config_dir.join(PROFILES_DIR))?;
+        Self::parse(&text, profiles).with_context(|| format!("{} is not valid", path.display()))
     }
 
-    pub fn parse(text: &str) -> Result<Config> {
-        let config: Config = toml::from_str(text)?;
+    fn parse(text: &str, profiles: BTreeMap<String, Profile>) -> Result<Config> {
+        let table: toml::Table = toml::from_str(text)?;
+        ensure!(
+            !table.contains_key("profiles"),
+            "profiles are not set here: put each one in {PROFILES_DIR}/<name>/{FILE_NAME} next to this file"
+        );
+        let mut config: Config = table.try_into()?;
+        config.profiles = profiles;
         config.validate()?;
         Ok(config)
     }
@@ -253,12 +267,12 @@ impl Config {
             );
             ensure!(
                 agents::is_kind(&profile.kind),
-                "profiles.{name}.kind `{}` is not a Herdr agent kind",
+                "profile `{name}`: kind `{}` is not a Herdr agent kind",
                 profile.kind
             );
             if profile.effort.is_some() && !agents::has_effort_flag(&profile.kind) {
                 bail!(
-                    "profiles.{name}: the `{}` CLI has no effort flag; put the effort in the model ID instead",
+                    "profile `{name}`: the `{}` CLI has no effort flag; put the effort in the model ID instead",
                     profile.kind
                 );
             }
@@ -269,13 +283,13 @@ impl Config {
             for key in profile.env.keys() {
                 ensure!(
                     !key.is_empty() && !key.contains('='),
-                    "profiles.{name}.env has an invalid variable name `{key}`"
+                    "profile `{name}`: env has an invalid variable name `{key}`"
                 );
             }
             let used = routing.coordinators.contains(name) || routing.workers.contains(name);
             ensure!(
                 profile.env.is_empty() || !used,
-                "profiles.{name}.env applies only to the routing agent, but `{name}` is also a coordinator or worker profile"
+                "profile `{name}`: env applies only to the routing agent, but `{name}` is also a coordinator or worker profile"
             );
         }
         let agent = self.profile(&routing.agent).context("routing.agent")?;
@@ -307,9 +321,9 @@ impl Config {
     }
 
     pub fn profile(&self, name: &str) -> Result<&Profile> {
-        self.profiles
-            .get(name)
-            .with_context(|| format!("no profile named `{name}` in [profiles]"))
+        self.profiles.get(name).with_context(|| {
+            format!("no profile named `{name}`: add {PROFILES_DIR}/{name}/{FILE_NAME}")
+        })
     }
 
     /// A profile a coordinator may start a worker with.
@@ -338,6 +352,59 @@ impl Config {
     }
 }
 
+/// Reads every profile folder under `dir`: the folder's name is the profile's
+/// name. Entries starting with `.` are skipped, symbolic links are followed,
+/// and files other than the two a profile has are left alone. A missing `dir`
+/// gives no profiles.
+fn load_profiles(dir: &Path) -> Result<BTreeMap<String, Profile>> {
+    let mut profiles = BTreeMap::new();
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(profiles),
+        Err(error) => {
+            return Err(error).with_context(|| format!("could not read {}", dir.display()));
+        }
+    };
+    for entry in entries {
+        let path = entry
+            .with_context(|| format!("could not read {}", dir.display()))?
+            .path();
+        let name = path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        if name.starts_with('.') {
+            continue;
+        }
+        ensure!(
+            path.is_dir(),
+            "{} is not a folder: each profile is a folder with a {FILE_NAME}",
+            path.display()
+        );
+        profiles.insert(name, load_profile(&path)?);
+    }
+    Ok(profiles)
+}
+
+fn load_profile(folder: &Path) -> Result<Profile> {
+    let path = folder.join(FILE_NAME);
+    let text = std::fs::read_to_string(&path)
+        .with_context(|| format!("could not read {}", path.display()))?;
+    let mut profile: Profile =
+        toml::from_str(&text).with_context(|| format!("{} is not valid", path.display()))?;
+    let path = folder.join(INSTRUCTIONS_FILE);
+    profile.instructions = match std::fs::read_to_string(&path) {
+        Ok(text) if text.trim().is_empty() => None,
+        Ok(text) => Some(text),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(error).with_context(|| format!("could not read {}", path.display()));
+        }
+    };
+    Ok(profile)
+}
+
 fn valid_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 64
@@ -351,7 +418,8 @@ fn valid_name(name: &str) -> bool {
 pub mod tests {
     use super::*;
 
-    /// A config with every section, used across the test suite.
+    /// A config with every section, used across the test suite. Its profiles
+    /// are [`SAMPLE_PROFILES`].
     pub const SAMPLE: &str = r#"
 [linear]
 client_id = "client-123"
@@ -370,39 +438,6 @@ description = "The API server"
 path = "/src/web"
 base = "develop"
 
-[profiles.coordinator]
-kind = "claude"
-model = "opus"
-effort = "high"
-args = ["--permission-mode", "auto"]
-description = "default coordinator"
-
-[profiles.coordinator-light]
-kind = "claude"
-model = "sonnet"
-description = "small issues"
-instructions = """
-Prefer one worker. Ask before you split the work.
-"""
-
-[profiles.router]
-kind = "claude"
-model = "haiku"
-
-[profiles.standard]
-kind = "claude"
-model = "sonnet"
-effort = "high"
-args = ["--permission-mode", "auto"]
-description = "scoped features and fixes"
-
-[profiles.deep]
-kind = "codex"
-model = "gpt-6-sol"
-effort = "xhigh"
-args = ["-s", "workspace-write"]
-description = "cross-module changes"
-
 [routing]
 agent = "router"
 coordinators = ["coordinator", "coordinator-light"]
@@ -411,9 +446,68 @@ timeout_seconds = 60
 workers = ["standard", "deep"]
 "#;
 
+    /// The sample's profile folders: name, `config.toml`, `instructions.md`.
+    pub const SAMPLE_PROFILES: [(&str, &str, Option<&str>); 5] = [
+        (
+            "coordinator",
+            "kind = \"claude\"\nmodel = \"opus\"\neffort = \"high\"\nargs = [\"--permission-mode\", \"auto\"]\ndescription = \"default coordinator\"\n",
+            None,
+        ),
+        (
+            "coordinator-light",
+            "kind = \"claude\"\nmodel = \"sonnet\"\ndescription = \"small issues\"\n",
+            Some("Prefer one worker. Ask before you split the work.\n"),
+        ),
+        ("router", "kind = \"claude\"\nmodel = \"haiku\"\n", None),
+        (
+            "standard",
+            "kind = \"claude\"\nmodel = \"sonnet\"\neffort = \"high\"\nargs = [\"--permission-mode\", \"auto\"]\ndescription = \"scoped features and fixes\"\n",
+            None,
+        ),
+        (
+            "deep",
+            "kind = \"codex\"\nmodel = \"gpt-6-sol\"\neffort = \"xhigh\"\nargs = [\"-s\", \"workspace-write\"]\ndescription = \"cross-module changes\"\n",
+            None,
+        ),
+    ];
+
+    /// Writes `config.toml` with `text` and the sample's profile folders.
+    pub fn write_sample(config_dir: &Path, text: &str) {
+        std::fs::create_dir_all(config_dir).unwrap();
+        std::fs::write(config_dir.join(FILE_NAME), text).unwrap();
+        for (name, config, instructions) in SAMPLE_PROFILES {
+            let folder = config_dir.join(PROFILES_DIR).join(name);
+            std::fs::create_dir_all(&folder).unwrap();
+            std::fs::write(folder.join(FILE_NAME), config).unwrap();
+            if let Some(text) = instructions {
+                std::fs::write(folder.join(INSTRUCTIONS_FILE), text).unwrap();
+            }
+        }
+    }
+
+    /// The sample config as the ticker loads it.
+    pub fn sample() -> Config {
+        let dir = tempfile::tempdir().unwrap();
+        write_sample(dir.path(), SAMPLE);
+        Config::load(dir.path()).unwrap()
+    }
+
+    /// Loads the sample with `text` as `config.toml` and `profiles` replacing
+    /// or adding profile folders' `config.toml`. The error is the full chain.
+    fn load_with(text: &str, profiles: &[(&str, &str)]) -> Result<Config, String> {
+        let dir = tempfile::tempdir().unwrap();
+        write_sample(dir.path(), text);
+        for (name, config) in profiles {
+            let folder = dir.path().join(PROFILES_DIR).join(name);
+            std::fs::create_dir_all(&folder).unwrap();
+            std::fs::write(folder.join(FILE_NAME), config).unwrap();
+        }
+        Config::load(dir.path()).map_err(|e| format!("{e:#}"))
+    }
+
     #[test]
     fn the_sample_parses_with_defaults() {
-        let config = Config::parse(SAMPLE).unwrap();
+        let config = sample();
         assert_eq!(config.linear.callback_port, DEFAULT_CALLBACK_PORT);
         assert_eq!(config.linear.review_state, "In Review");
         assert_eq!(config.limits, Limits::default());
@@ -421,6 +515,16 @@ workers = ["standard", "deep"]
         assert_eq!(
             config.routing.coordinators,
             ["coordinator", "coordinator-light"]
+        );
+        assert_eq!(
+            config.profiles.keys().collect::<Vec<_>>(),
+            [
+                "coordinator",
+                "coordinator-light",
+                "deep",
+                "router",
+                "standard"
+            ]
         );
         assert_eq!(
             config
@@ -447,10 +551,9 @@ workers = ["standard", "deep"]
         let bad = |from: &str, to: &str| {
             let text = SAMPLE.replacen(from, to, 1);
             assert_ne!(text, SAMPLE, "{from}");
-            Config::parse(&text).unwrap_err().to_string()
+            load_with(&text, &[]).unwrap_err()
         };
         bad("teams = [\"DATA\"]", "teams = []");
-        bad("kind = \"codex\"", "kind = \"chatgpt\"");
         bad("default = \"coordinator\"", "default = \"missing\"");
         bad(
             "workers = [\"standard\", \"deep\"]",
@@ -473,17 +576,100 @@ workers = ["standard", "deep"]
             "default = \"coordinator\"\nsize_label_group = \"size\"",
         );
         bad("[herdr]", "[herdr]\nunknown = 1");
-        // Effort only for kinds with an effort flag.
-        let cursor = SAMPLE.replace(
-            "[profiles.router]\nkind = \"claude\"",
-            "[profiles.router]\nkind = \"cursor\"\neffort = \"high\"",
+        assert!(
+            load_with(SAMPLE, &[("deep", "kind = \"chatgpt\"\n")])
+                .unwrap_err()
+                .ends_with("profile `deep`: kind `chatgpt` is not a Herdr agent kind")
         );
-        assert!(Config::parse(&cursor).is_err());
+        // Effort only for kinds with an effort flag.
+        assert!(
+            load_with(
+                SAMPLE,
+                &[("router", "kind = \"cursor\"\neffort = \"high\"\n")]
+            )
+            .unwrap_err()
+            .ends_with("profile `router`: the `cursor` CLI has no effort flag; put the effort in the model ID instead")
+        );
+    }
+
+    #[test]
+    fn profiles_come_from_their_folders() {
+        let dir = tempfile::tempdir().unwrap();
+        write_sample(dir.path(), SAMPLE);
+        let profiles = dir.path().join(PROFILES_DIR);
+        std::fs::write(profiles.join(".DS_Store"), "").unwrap();
+        std::fs::write(profiles.join("router").join("README.md"), "Shared router.").unwrap();
+        std::fs::write(profiles.join("standard").join(INSTRUCTIONS_FILE), " \n").unwrap();
+        let shared = tempfile::tempdir().unwrap();
+        std::fs::write(shared.path().join(FILE_NAME), "kind = \"codex\"\n").unwrap();
+        std::fs::write(shared.path().join(INSTRUCTIONS_FILE), "Run `make check`.\n").unwrap();
+        std::os::unix::fs::symlink(shared.path(), profiles.join("shared")).unwrap();
+
+        let config = Config::load(dir.path()).unwrap();
+        assert_eq!(
+            config.profiles.keys().collect::<Vec<_>>(),
+            [
+                "coordinator",
+                "coordinator-light",
+                "deep",
+                "router",
+                "shared",
+                "standard"
+            ]
+        );
+        assert_eq!(config.profile("standard").unwrap().instructions, None);
+        let shared = config.profile("shared").unwrap();
+        assert_eq!(
+            (shared.kind.as_str(), shared.instructions.as_deref()),
+            ("codex", Some("Run `make check`.\n"))
+        );
+    }
+
+    #[test]
+    fn profiles_live_only_in_their_folders() {
+        let in_config = SAMPLE.to_string() + "\n[profiles.extra]\nkind = \"claude\"\n";
+        assert!(load_with(&in_config, &[]).unwrap_err().ends_with(
+            "profiles are not set here: put each one in profiles/<name>/config.toml next to this file"
+        ));
+        let instructions = load_with(
+            SAMPLE,
+            &[("router", "kind = \"claude\"\ninstructions = \"x\"\n")],
+        )
+        .unwrap_err();
+        assert!(
+            instructions.contains("profiles/router/config.toml is not valid"),
+            "{instructions}"
+        );
+        assert!(
+            instructions.contains("unknown field `instructions`"),
+            "{instructions}"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        write_sample(dir.path(), SAMPLE);
+        let profiles = dir.path().join(PROFILES_DIR);
+        std::fs::write(profiles.join("extra.toml"), "kind = \"claude\"\n").unwrap();
+        assert!(
+            format!("{:#}", Config::load(dir.path()).unwrap_err()).ends_with(
+                "extra.toml is not a folder: each profile is a folder with a config.toml"
+            )
+        );
+        std::fs::remove_file(profiles.join("extra.toml")).unwrap();
+        std::fs::create_dir(profiles.join("empty")).unwrap();
+        assert!(format!("{:#}", Config::load(dir.path()).unwrap_err()).contains("could not read "));
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(FILE_NAME), SAMPLE).unwrap();
+        assert!(
+            format!("{:#}", Config::load(dir.path()).unwrap_err()).ends_with(
+                "routing.agent: no profile named `router`: add profiles/router/config.toml"
+            )
+        );
     }
 
     #[test]
     fn linear_intervals_default_to_five_seconds_and_are_checked() {
-        let config = Config::parse(SAMPLE).unwrap();
+        let config = sample();
         assert_eq!(
             (
                 config.linear.intake_interval_seconds,
@@ -492,11 +678,14 @@ workers = ["standard", "deep"]
             (5, 5)
         );
         let set = |lines: &str| {
-            Config::parse(&SAMPLE.replacen(
-                "teams = [\"DATA\"]",
-                &format!("teams = [\"DATA\"]\n{lines}"),
-                1,
-            ))
+            load_with(
+                &SAMPLE.replacen(
+                    "teams = [\"DATA\"]",
+                    &format!("teams = [\"DATA\"]\n{lines}"),
+                    1,
+                ),
+                &[],
+            )
         };
         let config = set("intake_interval_seconds = 30\nrun_read_interval_seconds = 10").unwrap();
         assert_eq!(
@@ -506,29 +695,34 @@ workers = ["standard", "deep"]
             ),
             (30, 10)
         );
-        assert_eq!(
-            set("intake_interval_seconds = 0").unwrap_err().to_string(),
-            "linear.intake_interval_seconds must be between 1 and 3600"
+        assert!(
+            set("intake_interval_seconds = 0")
+                .unwrap_err()
+                .ends_with("linear.intake_interval_seconds must be between 1 and 3600")
         );
-        assert_eq!(
+        assert!(
             set("run_read_interval_seconds = 3601")
                 .unwrap_err()
-                .to_string(),
-            "linear.run_read_interval_seconds must be between 1 and 3600"
+                .ends_with("linear.run_read_interval_seconds must be between 1 and 3600")
         );
     }
 
     #[test]
     fn only_the_routing_agents_profile_may_set_env() {
         let with_env = |profile: &str| {
-            SAMPLE.replace(
-                &format!("[profiles.{profile}]\n"),
-                &format!(
-                    "[profiles.{profile}]\nenv = {{ OPENCODE_CONFIG_DIR = \"/tmp/empty\" }}\n"
-                ),
+            let (_, config, _) = SAMPLE_PROFILES
+                .iter()
+                .find(|(n, _, _)| *n == profile)
+                .unwrap();
+            load_with(
+                SAMPLE,
+                &[(
+                    profile,
+                    &format!("{config}env = {{ OPENCODE_CONFIG_DIR = \"/tmp/empty\" }}\n"),
+                )],
             )
         };
-        let config = Config::parse(&with_env("router")).unwrap();
+        let config = with_env("router").unwrap();
         assert_eq!(
             config
                 .profile("router")
@@ -538,23 +732,17 @@ workers = ["standard", "deep"]
                 .map(String::as_str),
             Some("/tmp/empty")
         );
-        assert_eq!(
-            Config::parse(&with_env("standard"))
-                .unwrap_err()
-                .to_string(),
-            "profiles.standard.env applies only to the routing agent, but `standard` is also a coordinator or worker profile"
-        );
+        assert!(with_env("standard").unwrap_err().ends_with(
+            "profile `standard`: env applies only to the routing agent, but `standard` is also a coordinator or worker profile"
+        ));
     }
 
     #[test]
     fn a_routing_agent_must_be_a_registered_kind() {
-        let text = SAMPLE.replace(
-            "[profiles.router]\nkind = \"claude\"\nmodel = \"haiku\"",
-            "[profiles.router]\nkind = \"gemini\"",
-        );
-        assert_eq!(
-            Config::parse(&text).unwrap_err().to_string(),
-            "routing.agent: the `gemini` kind cannot be a routing agent"
+        assert!(
+            load_with(SAMPLE, &[("router", "kind = \"gemini\"\n")])
+                .unwrap_err()
+                .ends_with("routing.agent: the `gemini` kind cannot be a routing agent")
         );
     }
 }

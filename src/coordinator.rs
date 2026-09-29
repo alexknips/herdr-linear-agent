@@ -322,7 +322,7 @@ mod tests {
     }
 
     fn sample_config() -> Config {
-        Config::parse(crate::config::tests::SAMPLE).unwrap()
+        crate::config::tests::sample()
     }
 
     /// Each needle appears after the previous one.

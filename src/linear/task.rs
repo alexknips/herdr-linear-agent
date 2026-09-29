@@ -781,7 +781,7 @@ mod tests {
     }
 
     fn task() -> LinearTask {
-        let config = config::Config::parse(config::tests::SAMPLE).unwrap();
+        let config = config::tests::sample();
         LinearTask::new(&config.linear)
     }
 

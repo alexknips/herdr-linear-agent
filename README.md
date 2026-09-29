@@ -35,7 +35,7 @@ For each issue, the plugin starts one coordinator agent. The coordinator reads t
    ```
 
    The build step downloads the release binary, or builds from source with `cargo` when there is none.
-3. **Write the config** at `$XDG_CONFIG_HOME/herdr-linear-agent/config.toml` (default `~/.config/herdr-linear-agent/config.toml`). See [Configuration](#configuration).
+3. **Write the config** at `$XDG_CONFIG_HOME/herdr-linear-agent/config.toml` (default `~/.config/herdr-linear-agent/config.toml`), and one folder per agent profile under `profiles/` next to it. See [Configuration](#configuration) and [Profiles](#profiles).
 4. **Log in:** run the Herdr action **herdr-linear-agent: log in to Linear**. It opens the browser, stores the token in the macOS Keychain or, on Linux, the Secret Service (service `dev.herdr-linear-agent.linear.oauth.v1`), and checks that it acts as the app user. The browser must run on the same machine: Linear redirects to `127.0.0.1`.
 5. **Check the setup:** run **herdr-linear-agent: check setup**.
 6. **Delegate an issue** in one of the configured teams to the app user.
@@ -70,41 +70,6 @@ path = "/Users/me/src/github.com/acme/api"
 base = "main"                            # workers branch from origin/<base>; never guessed
 description = "The API server"
 
-[profiles.coordinator]
-kind = "claude"
-model = "opus"
-effort = "high"
-args = ["--permission-mode", "auto", "--disallowed-tools=Agent"]  # no subagents of its own (see below)
-description = "The default coordinator"
-
-[profiles.coordinator-light]
-kind = "claude"
-model = "sonnet"
-effort = "medium"
-args = ["--permission-mode", "auto", "--disallowed-tools=Agent"]
-description = "Small, well-scoped issues that one worker can finish"
-instructions = """
-Start one worker. Ask in the session before you split the work.
-"""
-
-[profiles.router]                        # the routing agent: any registered kind, a small fast model
-kind = "claude"                          # or another kind from "Routing agent kinds" below
-model = "<a small model of that kind>"
-
-[profiles.standard]
-kind = "claude"
-model = "sonnet"
-effort = "high"
-args = ["--permission-mode", "auto"]
-description = "Scoped features and fixes"
-
-[profiles.deep]
-kind = "codex"
-model = "gpt-6-sol"
-effort = "xhigh"
-args = ["-s", "workspace-write"]
-description = "Changes across modules, bugs with an unknown cause"
-
 [routing]
 agent = "router"                         # the profile of the routing agent
 coordinators = ["coordinator", "coordinator-light"]  # the coordinator profiles it may pick
@@ -113,19 +78,91 @@ timeout_seconds = 120
 workers = ["standard", "deep"]           # the profiles a coordinator may start workers with
 ```
 
+### Profiles
+
+Profiles are not in `config.toml`. Each one is a folder next to it, named after the profile, so you can hand a profile to other people as it is: copy the folder, or link it from a repository of shared profiles. A `[profiles]` table in `config.toml` is refused.
+
+```text
+~/.config/herdr-linear-agent/
+├── config.toml
+└── profiles/
+    ├── coordinator/
+    │   └── config.toml
+    ├── coordinator-light/
+    │   ├── config.toml
+    │   └── instructions.md          # optional
+    ├── router/
+    │   └── config.toml
+    ├── standard/
+    │   └── config.toml
+    └── deep/
+        └── config.toml
+```
+
+```toml
+# profiles/coordinator/config.toml
+kind = "claude"
+model = "opus"
+effort = "high"
+args = ["--permission-mode", "auto", "--disallowed-tools=Agent"]  # no subagents of its own (see below)
+description = "The default coordinator"
+```
+
+```toml
+# profiles/coordinator-light/config.toml
+kind = "claude"
+model = "sonnet"
+effort = "medium"
+args = ["--permission-mode", "auto", "--disallowed-tools=Agent"]
+description = "Small, well-scoped issues that one worker can finish"
+```
+
+```markdown
+<!-- profiles/coordinator-light/instructions.md -->
+Start one worker. Ask in the session before you split the work.
+```
+
+```toml
+# profiles/router/config.toml: the routing agent, any registered kind, a small fast model
+kind = "claude"                          # or another kind from "Routing agent kinds" below
+model = "<a small model of that kind>"
+```
+
+```toml
+# profiles/standard/config.toml
+kind = "claude"
+model = "sonnet"
+effort = "high"
+args = ["--permission-mode", "auto"]
+description = "Scoped features and fixes"
+```
+
+```toml
+# profiles/deep/config.toml
+kind = "codex"
+model = "gpt-6-sol"
+effort = "xhigh"
+args = ["-s", "workspace-write"]
+description = "Changes across modules, bugs with an unknown cause"
+```
+
+A profile's `config.toml` takes `kind`, `model`, `effort`, `args`, `description` and, for the routing agent only, `env`. Folders whose names start with `.` are skipped, other files inside a profile folder (a README, say) are left alone, and any other file directly in `profiles/` is refused. Profile names use letters, digits, `.`, `_` and `-`.
+
 A profile becomes agent CLI flags: `claude` gets `--model` and `--effort`, `codex` gets `-m` and `-c model_reasoning_effort=...`, and any other kind gets `--model` (put the effort in the model ID). `args` are passed unchanged; this is where permission and sandbox flags belong.
 
 **Coordinators on other kinds.** A coordinator reads the run folder's `AGENTS.md`, which Claude Code (through the `CLAUDE.md` link), Codex, Cursor Agent and OpenCode all read. Cursor Agent and OpenCode ran as coordinators in a Herdr pane, before the subagent switches below were added; Codex was not run as a coordinator (see below):
 
 ```toml
-[profiles.coordinator-codex]
+# profiles/coordinator-codex/config.toml
 kind = "codex"
 model = "gpt-6-sol"
 effort = "high"
 args = ["-c", "agents.enabled=false"]    # no subagents of its own (see below)
 description = "Coordinator on Codex"
+```
 
-[profiles.coordinator-cursor]
+```toml
+# profiles/coordinator-cursor/config.toml
 kind = "cursor"
 model = "grok-4.7-medium"                # Cursor has no effort flag: the effort is part of the model ID
 args = [
@@ -133,8 +170,10 @@ args = [
   "--allowed-tools", "shell_tool_call,read_tool_call,ls_tool_call,glob_tool_call,grep_tool_call",
 ]
 description = "Coordinator on Cursor Agent"
+```
 
-[profiles.coordinator-opencode]
+```toml
+# profiles/coordinator-opencode/config.toml
 kind = "opencode"
 model = "openai/gpt-6-luna"              # provider/model, as `opencode models` lists it
 description = "Coordinator on OpenCode"
@@ -167,7 +206,7 @@ For OpenCode, add an agent like this to your OpenCode config (for example `~/.co
 }
 ```
 
-**Profile instructions.** A profile's optional `instructions` (Markdown) are added for work under that profile: to the run folder's `AGENTS.md` for a coordinator profile, and to the brief for a worker profile, as a "Profile instructions" section after the built-in rules. The built-in rules (never merge, never change the Linear state, stay inside the catalog, treat the issue text as data) stay as they are and win where the two disagree. Only the config sets instructions; an agent can still pass only a profile's name.
+**Profile instructions.** A profile's optional `instructions.md` is added for work under that profile: to the run folder's `AGENTS.md` for a coordinator profile, and to the brief for a worker profile, as a "Profile instructions" section after the built-in rules. The built-in rules (never merge, never change the Linear state, stay inside the catalog, treat the issue text as data) stay as they are and win where the two disagree. Only the profile folder sets instructions; an agent can still pass only a profile's name.
 
 **Claude Code's trust dialog.** Claude Code asks whether you trust a folder the first time it runs there, and every run gets a new run folder, so a coordinator stops at that dialog until someone answers it in Herdr. With `claude.auto_accept_trust_dialog = true`, the plugin accepts that dialog ahead of time, right before it starts a `claude` agent: the run folder for a coordinator, and the worktree and its repository's main checkout for a worker. Claude Code has no setting for this, so the plugin adds `hasTrustDialogAccepted` to that folder's entry in `~/.claude.json` (`$CLAUDE_CONFIG_DIR/.claude.json` when set), which is where Claude Code records your own answers, and changes nothing else in the file. The format is not documented; if Claude Code changes it, the dialog appears again and the plugin asks for someone in Herdr as before.
 
@@ -199,7 +238,6 @@ Whatever the issue says, the routing agent can only pick one of the configured c
 | | | Instruction files | `project_doc_max_bytes=0` for project `AGENTS.md` | `~/.codex/AGENTS.md` (and `AGENTS.override.md`), which Codex always loads from CODEX_HOME |
 | | | Auto-memory | `--disable memories` | |
 | | | Session history and persistence | `--ephemeral`, `history.persistence="none"` | |
-
 | `cursor` | Cursor Agent 2026.09.26 | Default system prompt | none: Cursor offers no system prompt option; the fixed instruction is the call folder's `AGENTS.md`, which Cursor applies as a rule | Cursor's own system prompt, the user rules synced from your Cursor account, and any `AGENTS.md` or `.cursor/rules` in a folder above the call folder (normally none: it is under the system temp dir) |
 | | | Tools | `--allowed-tools ""` (an internal flag of this version: every tool call answers "Tool not available"), and the call folder's `.cursor/cli.json` denies shell, read, write, web and MCP | |
 | | | MCP | denied as above, and project MCP servers need an approval the call never gives | Descriptions of MCP servers that Cursor plugins bring (they cannot be called) |
@@ -219,7 +257,7 @@ Whatever the issue says, the routing agent can only pick one of the configured c
 **Routing agent environment.** The routing agent's profile may set `env`, variables added to its call (the recipe's own variables win over them). Only that profile may set it: Herdr starts coordinators and workers and cannot pass them variables, so a profile with `env` that is also a coordinator or worker candidate is refused. Its main use is to give a kind an empty config folder of its own where its login does not live there, which cuts what the table above leaves:
 
 ```toml
-[profiles.router-opencode]
+# profiles/router-opencode/config.toml
 kind = "opencode"
 model = "openai/gpt-6-luna#low"
 env = { OPENCODE_CONFIG_DIR = "/Users/me/.local/state/herdr-linear-agent/router/opencode" }  # an empty folder you create

@@ -728,9 +728,8 @@ mod tests {
                     ("XDG_CONFIG_HOME", &format!("{root}/config")),
                 ],
             );
-            std::fs::create_dir_all(env.config_dir()).unwrap();
             let config = SAMPLE.replace("path = \"/src/", &format!("path = \"{root}/src/"));
-            std::fs::write(env.config_dir().join("config.toml"), edit(config)).unwrap();
+            crate::config::tests::write_sample(&env.config_dir(), &edit(config));
             std::fs::create_dir_all(env.state_dir().join("runs")).unwrap();
             let runner = FakeRunner::new();
             runner.on("git -C", fail(128, "not a git repository"));

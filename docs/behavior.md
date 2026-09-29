@@ -97,32 +97,39 @@ File: `<config_dir>/config.toml`. Unknown keys are refused in every table. The k
 | `repositories.<name>.path` | absolute path | required | `repositories.<name>.path must be an absolute path` |
 | `repositories.<name>.base` | branch | required | not blank, not starting with `-`: `repositories.<name>.base is not a branch name` |
 | `repositories.<name>.description` | string | `""` | |
-| `profiles.<name>.kind` | Herdr agent kind | required | `profiles.<name>.kind \`<kind>\` is not a Herdr agent kind` |
-| `profiles.<name>.model` | string | none | |
-| `profiles.<name>.effort` | string | none | only for kinds with an effort flag: ``profiles.<name>: the `<kind>` CLI has no effort flag; put the effort in the model ID instead`` |
-| `profiles.<name>.args` | list | `[]` | passed unchecked |
-| `profiles.<name>.description` | string | `""` | shown to the routing agent for coordinator candidates |
-| `profiles.<name>.instructions` | Markdown | none | added after the built-in rules: to `AGENTS.md` for a coordinator profile, to the brief for a worker profile |
-| `profiles.<name>.env` | table of strings | `{}` | added to the routing agent's call before the recipe's variables; only the routing agent's profile may set it: ``profiles.<name>.env applies only to the routing agent, but `<name>` is also a coordinator or worker profile``; variable names may not be empty or contain `=`. `src/config.rs:only_the_routing_agents_profile_may_set_env`, `src/routing.rs:the_profiles_env_reaches_the_agent_and_the_recipe_wins` |
 | `routing.agent` | profile name | required | must exist (context `routing.agent`); its kind must be registered (`src/routing.rs` `RECIPES`): ``routing.agent: the `<kind>` kind cannot be a routing agent`` |
 | `routing.coordinators` | profile names | required | non-empty (`routing.coordinators lists no profile`), each must exist |
 | `routing.default` | profile name | required | must exist (context `routing.default`) |
 | `routing.timeout_seconds` | u64 | `120` | at least 1: `routing.timeout_seconds must be at least 1` |
 | `routing.workers` | profile names | required | non-empty (`routing.workers lists no profile`), each must exist |
 
+Profiles are not in `config.toml`: a `profiles` key there is refused with `profiles are not set here: put each one in profiles/<name>/config.toml next to this file`. Each profile is a folder `<config dir>/profiles/<name>/`, so one can be handed to other people as it is; the folder's name is the profile's name. Its `config.toml` has these keys (unknown keys are refused, `instructions` among them), and its optional `instructions.md` is the profile's instructions (blank gives none):
+
+| Key | Type | Default | Rule and message |
+| --- | --- | --- | --- |
+| `kind` | Herdr agent kind | required | ``profile `<name>`: kind `<kind>` is not a Herdr agent kind`` |
+| `model` | string | none | |
+| `effort` | string | none | only for kinds with an effort flag: ``profile `<name>`: the `<kind>` CLI has no effort flag; put the effort in the model ID instead`` |
+| `args` | list | `[]` | passed unchecked |
+| `description` | string | `""` | shown to the routing agent for coordinator candidates |
+| `env` | table of strings | `{}` | added to the routing agent's call before the recipe's variables; only the routing agent's profile may set it: ``profile `<name>`: env applies only to the routing agent, but `<name>` is also a coordinator or worker profile``; variable names may not be empty or contain `=`. `src/config.rs:only_the_routing_agents_profile_may_set_env`, `src/routing.rs:the_profiles_env_reaches_the_agent_and_the_recipe_wins` |
+| `instructions.md` (a file) | Markdown | none | added after the built-in rules: to `AGENTS.md` for a coordinator profile, to the brief for a worker profile |
+
+Reading the folders (`load_profiles`): a missing `profiles` folder gives no profiles; entries starting with `.` are skipped; symbolic links are followed; any other file in `profiles/` is refused with `<path> is not a folder: each profile is a folder with a config.toml`; a folder without `config.toml` gives `could not read <path>`; other files inside a profile folder are left alone. `src/config.rs:profiles_come_from_their_folders`, `src/config.rs:profiles_live_only_in_their_folders`
+
 **Spec change:** the size-based routing (`routing.size_label_group`, `[routing.agent]`, `[[routing.rules]]`) is removed; a config that still has those keys is refused as having unknown fields.
 
 Rules:
 
 - Repository and profile names: 1 to 64 characters of ASCII letters, digits, `.`, `_`, `-`, not starting with `-` or `.`. Messages: ``repository name `<name>` may use only letters, digits, `.`, `_` and `-` `` and the same with `profile name`.
-- `profile(name)` fails with ``no profile named `<name>` in [profiles]``.
+- `profile(name)` fails with ``no profile named `<name>`: add profiles/<name>/config.toml``.
 - `worker_profile(name)` fails when the name is not in `routing.workers`: `` `<name>` is not a worker profile; routing.workers lists <a, b> ``.
 - `repository(name)` fails with `` `<name>` is not in the repository catalog (<api, web>) `` or `(empty)` for an empty catalog.
 - `Config::load` errors read `could not read <path>` or `<path> is not valid`.
 - `src/config.rs:a_routing_agent_must_be_a_registered_kind`
 - Pinned by `src/config.rs:the_sample_parses_with_defaults` and `src/config.rs:invalid_configs_are_refused`.
 
-The shared test config (`SAMPLE`) has teams `["DATA"]`, allowed user `user-1`, session `work`, repositories `api` (`/src/api`, base `main`, description `The API server`) and `web` (`/src/web`, base `develop`), profiles `coordinator` (claude opus high, `--permission-mode auto`), `coordinator-light` (claude sonnet, with instructions), `router` (claude haiku), `standard` (claude sonnet high, `--permission-mode auto`), `deep` (codex gpt-6-sol xhigh, `-s workspace-write`), routing agent `router`, candidates `coordinator, coordinator-light`, default `coordinator`, timeout 60 s, workers `standard, deep`. The World's fake `claude` routing agent picks `coordinator` unless a test replaces it. The rewrite keeps it and adds the new interval keys only through defaults.
+The shared test config (`SAMPLE`, with its profile folders in `SAMPLE_PROFILES`) has teams `["DATA"]`, allowed user `user-1`, session `work`, repositories `api` (`/src/api`, base `main`, description `The API server`) and `web` (`/src/web`, base `develop`), profiles `coordinator` (claude opus high, `--permission-mode auto`), `coordinator-light` (claude sonnet, with instructions), `router` (claude haiku), `standard` (claude sonnet high, `--permission-mode auto`), `deep` (codex gpt-6-sol xhigh, `-s workspace-write`), routing agent `router`, candidates `coordinator, coordinator-light`, default `coordinator`, timeout 60 s, workers `standard, deep`. The World's fake `claude` routing agent picks `coordinator` unless a test replaces it. The rewrite keeps it and adds the new interval keys only through defaults.
 
 ## Run folder layout and state files
 

@@ -138,9 +138,8 @@ impl World {
         let text = crate::config::tests::SAMPLE
             .replace("path = \"/src/", &format!("path = \"{root}/src/"));
         let text = edit(text);
-        std::fs::create_dir_all(env.config_dir()).unwrap();
-        std::fs::write(env.config_dir().join("config.toml"), &text).unwrap();
-        let config = Config::parse(&text).unwrap();
+        crate::config::tests::write_sample(&env.config_dir(), &text);
+        let config = Config::load(&env.config_dir()).unwrap();
         write_router(&bin, &answer_with("coordinator"));
         let runner = FakeRunner::new();
         runner.on("git -C", fail(128, "not a git repository"));
