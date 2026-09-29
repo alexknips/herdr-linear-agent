@@ -133,3 +133,19 @@ Each kind was asked to start a subagent that replies `pong`, in a temporary fold
 | `opencode` 2.0.15, `mini` in a Herdr pane | The `subagent` tool started `general` | `"permission": {"subagent": "deny"}`, globally or in an agent chosen with `--agent`: no subagent tool |
 
 Interactive Codex was not run past its first screen: it asks to trust every new folder, with `-a never`, with `--dangerously-bypass-approvals-and-sandbox`, and with a `-c projects."<folder>".trust_level="trusted"` override for the folder or its parent. No answer was given, so the Codex config was not changed.
+
+## Workspace-qualified runs (2026-09-29)
+
+With the config moved to `[workspaces.civitaspo]` and `[workspaces.civitaspo.teams.THLA]` and a build of `532c219`, in the scratch Linear team (one workspace):
+
+| Step | Result |
+| --- | --- |
+| Login | `action login` stored the token under the Keychain account `civitaspo` and read the app user `herdr-agent`; `doctor` reported ``Linear `civitaspo`: credential stored`` and the workspace's budget |
+| Pick up and routing | THLA-15 was picked up 2.3 s after it was created, as `civitaspo/THLA-15` in `runs/civitaspo/THLA-15`, moved to In Progress, and the routing agent chose `coordinator` |
+| Coordinator | `civitaspo-thla-15-coordinator` followed `AGENTS.md` (`skill civitaspo/THLA-15`, `context civitaspo/THLA-15`) and started worker w1 with `worker start civitaspo/THLA-15` |
+| Worker | `civitaspo-thla-15-w1` worked on `herdr-linear-agent/civitaspo/thla-15/w1-add-title-case-helper-with-tests`, with its brief in `.herdr-linear-agent/civitaspo-THLA-15-w1`, opened PR #10 of the sandbox and waited for its checks with one `gh pr checks 10 --watch` (the 90 s `slow` check passed) |
+| Finish | the coordinator ran `finish`; the issue moved to In Review 4 min 13 s after it was created, with the PR attached |
+| focus-run | the issue's URL focused the run; the same key under another organization gave `there is no run for THLA-15` |
+| Close | Canceled closed the run and its workspaces 5 s later |
+
+Two workspaces at once were not run against Linear yet.
