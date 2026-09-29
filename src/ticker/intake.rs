@@ -9,7 +9,7 @@ use super::reconcile::{
 };
 use crate::herdr::{Herdr, Snapshot, WorkspaceId};
 use crate::linear::api::{Activity, Content, IssueDetail, IssueRef, Prompt, RunUpdate};
-use crate::linear::task::{LinearEvent, LinearLevel};
+use crate::linear::task::{Levels, LinearEvent, LinearLevel};
 use crate::outbox::{self, Op, StateTarget};
 use crate::run::{AgentRecord, AgentStatus, Interrupt, Run, RunRecord, Status};
 use crate::{coordinator, files, routing, worker};
@@ -34,7 +34,7 @@ impl Reconciler {
     pub(super) async fn apply_event<H: Herdr + Clone + 'static>(
         &mut self,
         d: &Deps<'_, H>,
-        level: &LinearLevel,
+        levels: &Levels,
         snap: Option<&Snapshot>,
         event: LinearEvent,
         now: Timestamp,
@@ -94,10 +94,11 @@ impl Reconciler {
                 if record.status != Status::Active || stale {
                     return;
                 }
+                let level = levels.get(&record.workspace).cloned().unwrap_or_default();
                 let result = self
                     .apply_read(
                         d,
-                        level,
+                        &level,
                         snap,
                         &run,
                         &record,
@@ -197,6 +198,14 @@ impl Reconciler {
         prompts: &[Prompt],
         now: Timestamp,
     ) -> Result<()> {
+        // The run's team decides whose replies count; a team no longer in the
+        // config lets nobody's through.
+        let record = run.record()?;
+        let allowed = d
+            .config
+            .team(&record.workspace, &record.team_key)
+            .map(|team| team.allowed_user_ids.clone())
+            .unwrap_or_default();
         for prompt in prompts {
             let (created, user, body) = (
                 prompt.created_at.clone(),
@@ -206,7 +215,7 @@ impl Reconciler {
             if !after_cursor(&created, &run.record()?.prompt_cursor) {
                 continue;
             }
-            if !d.config.linear.allowed_user_ids.contains(&prompt.user_id) {
+            if !allowed.contains(&prompt.user_id) {
                 self.guarded(run, move |run, lock| {
                     if after_cursor(&created, &run.record()?.prompt_cursor) {
                         run.record_ignored_prompt_held(lock, &created, &user, &body)?;
@@ -406,20 +415,38 @@ impl Reconciler {
     pub(super) async fn intake<H: Herdr>(
         &mut self,
         d: &Deps<'_, H>,
+        levels: &Levels,
+        now: Timestamp,
+    ) {
+        for (workspace, level) in levels {
+            self.intake_workspace(d, workspace, level, now).await;
+        }
+    }
+
+    async fn intake_workspace<H: Herdr>(
+        &mut self,
+        d: &Deps<'_, H>,
+        workspace: &str,
         level: &LinearLevel,
         now: Timestamp,
     ) {
         let Some(delegated) = &level.delegated else {
             return;
         };
-        if self.intake_read.is_some_and(|at| at >= delegated.read_at) {
+        if self
+            .intake_read
+            .get(workspace)
+            .is_some_and(|at| *at >= delegated.read_at)
+        {
             return;
         }
-        self.intake_read = Some(delegated.read_at);
+        self.intake_read
+            .insert(workspace.to_string(), delegated.read_at);
         let runs_dir = d.ctx.runs_dir();
         let paused = d.ctx.state_dir().join("paused").exists();
         for issue in &delegated.issues {
-            if let Ok(run) = Run::load(&runs_dir, &issue.identifier) {
+            let key = crate::run::run_key(workspace, &issue.identifier);
+            if let Ok(run) = Run::load(&runs_dir, &key) {
                 if let Err(error) = self.reactivate(&run, delegated.read_at).await {
                     d.fail(&run.key, &error);
                 }
@@ -438,11 +465,11 @@ impl Reconciler {
             {
                 break;
             }
-            if let Err(error) = self.claim(d, issue, delegated.read_at, now).await {
-                d.log.line(&format!(
-                    "{}: could not pick up: {error:#}",
-                    issue.identifier
-                ));
+            if let Err(error) = self
+                .claim(d, workspace, issue, delegated.read_at, now)
+                .await
+            {
+                d.log.line(&format!("{key}: could not pick up: {error:#}"));
             }
         }
     }
@@ -490,15 +517,17 @@ impl Reconciler {
     async fn claim<H: Herdr>(
         &mut self,
         d: &Deps<'_, H>,
+        workspace: &str,
         issue: &IssueRef,
         read_at: Timestamp,
         now: Timestamp,
     ) -> Result<()> {
-        crate::run::validate_key(&issue.identifier)?;
+        crate::run::validate_issue_key(&issue.identifier)?;
         d.ctx.ensure_state_dir()?;
         std::fs::create_dir_all(d.ctx.runs_dir())?;
         let now = now.to_string();
         let record = RunRecord {
+            workspace: workspace.to_string(),
             issue_id: issue.id.clone(),
             identifier: issue.identifier.clone(),
             title: issue.title.clone(),
@@ -515,7 +544,7 @@ impl Reconciler {
         let run = blocking(move || Run::create(&runs_dir, record)).await?;
         self.changed_at.insert(issue.id.clone(), read_at);
         d.log.line(&format!("{}: picked up", run.key));
-        let key = run.key.clone();
+        let key = issue.identifier.clone();
         self.update_and_push(&run, move |r| {
             r.announce_pending = false;
             vec![
@@ -545,7 +574,7 @@ impl Reconciler {
         let queued = outbox::queued(run)
             .iter()
             .any(|request| matches!(request.op, Op::IssueState { .. }));
-        let key = run.key.clone();
+        let key = crate::run::split_key(&run.key).1.to_string();
         self.update_and_push(run, move |r| {
             let mut ops = Vec::new();
             if std::mem::take(&mut r.announce_pending) {

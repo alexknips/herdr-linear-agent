@@ -21,11 +21,11 @@ For each issue, the plugin starts one coordinator agent. The coordinator reads t
 - macOS or Linux, and Herdr 0.9.1 or later
 - On Linux: a Secret Service provider (GNOME Keyring, KWallet) for the token, and `xdg-open`
 - The agent CLIs your profiles use (`claude`, `codex`, `cursor-agent`, ...) and `git`
-- A Linear workspace where you can install an OAuth application (workspace admin)
+- One or more Linear workspaces where you can install an OAuth application (workspace admin)
 
 ## Set up
 
-1. **Create a Linear OAuth application** (Settings → API → OAuth applications) for this plugin. Its name becomes the app user's name: pick one that people cannot mistake for Linear's own `@Linear` (for example `herdr-linear-agent`). Add the callback URL `http://127.0.0.1:43871/oauth/callback` and note the client ID. The plugin uses the authorization code flow with PKCE and never needs the client secret. It installs the app with `actor=app` and the scopes `read`, `write` and `app:assignable`, which creates an app user you can delegate issues to.
+1. **Create a Linear OAuth application** (Settings → API → OAuth applications) for this plugin, in each workspace you use. Its name becomes the app user's name: pick one that people cannot mistake for Linear's own `@Linear` (for example `herdr-linear-agent`). Add the callback URL `http://127.0.0.1:43871/oauth/callback` and note the client ID. The plugin uses the authorization code flow with PKCE and never needs the client secret. It installs the app with `actor=app` and the scopes `read`, `write` and `app:assignable`, which creates an app user you can delegate issues to.
 
    **Register a webhook with the "Agent session events" category (required).** Linear enables Agent Sessions for an app only when it subscribes to that category, and without them the plugin cannot pick up any issue ("Agent sessions are not enabled for this application"). The plugin never reads webhooks, since it polls Linear, so the URL only has to accept the request and discard it. Point it at an endpoint you control: the payloads contain issue and session content, so do not use a public URL you do not own. Enable webhooks before you log in; an app that was authorized before needs to log in again before its webhooks take effect.
 2. **Install the plugin:**
@@ -36,19 +36,32 @@ For each issue, the plugin starts one coordinator agent. The coordinator reads t
 
    The build step downloads the release binary, or builds from source with `cargo` when there is none.
 3. **Write the config** at `$XDG_CONFIG_HOME/herdr-linear-agent/config.toml` (default `~/.config/herdr-linear-agent/config.toml`), and one folder per agent profile under `profiles/` next to it. See [Configuration](#configuration) and [Profiles](#profiles).
-4. **Log in:** run the Herdr action **herdr-linear-agent: log in to Linear**. It opens the browser, stores the token in the macOS Keychain or, on Linux, the Secret Service (service `dev.herdr-linear-agent.linear.oauth.v1`), and checks that it acts as the app user. The browser must run on the same machine: Linear redirects to `127.0.0.1`.
+4. **Log in:** run the Herdr action **herdr-linear-agent: log in to Linear**. For each workspace without a stored token, it opens the browser, stores the token in the macOS Keychain or, on Linux, the Secret Service (service `dev.herdr-linear-agent.linear.oauth.v1`, one account per workspace named after it), and checks that it acts as the app user; when every workspace has a token, it logs in to all of them again. `herdr-linear-agent action login --workspace <name>` logs in to one workspace again. The browser must run on the same machine: Linear redirects to `127.0.0.1`.
 5. **Check the setup:** run **herdr-linear-agent: check setup**.
 6. **Delegate an issue** in one of the configured teams to the app user.
 
 ## Configuration
 
 ```toml
-[linear]
-client_id = "your-oauth-client-id"
-teams = ["DATA"]                         # team keys to pick issues from
+[workspaces.acme]                        # a name for the workspace: lower-case letters, digits and `-`
+client_id = "your-oauth-client-id"       # the OAuth application of this workspace
+# callback_port = 43871                  # the port of the callback URL you registered
+# intake_interval_seconds = 5            # how often delegated issues are polled
+# run_read_interval_seconds = 5          # how often active runs are read
+
+[workspaces.acme.teams.DATA]             # a team to pick issues from, by team key
 allowed_user_ids = ["linear-user-uuid"]  # whose replies reach the coordinator
-review_state = "In Review"               # where `finish` moves the issue
-# callback_port = 43871
+review_state = "In Review"               # where `finish` moves the issue (default)
+
+[workspaces.acme.teams.OPS]              # each team has its own allowed users and review state
+allowed_user_ids = ["another-user-uuid"]
+review_state = "Ready for review"
+
+[workspaces.other]                       # another workspace, with its own OAuth application
+client_id = "another-oauth-client-id"
+
+[workspaces.other.teams.DATA]            # the same team key as in `acme` is fine
+allowed_user_ids = ["linear-user-uuid-in-other"]
 
 [herdr]
 session = "default"                      # the Herdr session runs start in; omit for the default session
@@ -77,6 +90,8 @@ default = "coordinator"                  # when it gives no valid answer
 timeout_seconds = 120
 workers = ["standard", "deep"]           # the profiles a coordinator may start workers with
 ```
+
+**Workspaces and teams.** Each workspace polls Linear with its own OAuth application, token and app user. Runs are named `<workspace>/<ISSUE-KEY>`, for example `acme/DATA-1`, so the same issue key in two workspaces makes two runs; the name is what agents pass to `herdr-linear-agent` commands, and the workspace is part of agent names (`acme-data-1-coordinator`), branches (`herdr-linear-agent/acme/data-1/w1-...`) and brief folders. A team's `allowed_user_ids` and `review_state` apply to that team's issues only. A run whose team was removed from the config keeps running, relays nobody's replies and moves to `In Review` on `finish`.
 
 ### Profiles
 
@@ -273,12 +288,12 @@ Other kinds are not registered.
 
 ## How a run works
 
-1. The ticker (a background process the startup hook starts) polls Linear every 5 seconds (`linear.intake_interval_seconds`) for issues delegated to the app user in the configured teams that are neither completed nor canceled.
+1. The ticker (a background process the startup hook starts) polls each workspace every 5 seconds (`intake_interval_seconds`) for issues delegated to its app user in the configured teams that are neither completed nor canceled.
 2. For a new issue it creates a run folder, creates an Agent Session, posts a first thought, moves the issue to the team's first started state, picks the coordinator profile, and opens a Herdr workspace with the coordinator in the run folder.
-3. The coordinator runs `herdr-linear-agent context` every turn, publishes a plan, asks questions, and starts workers with `herdr-linear-agent worker start`. Each worker gets a worktree created by `herdr worktree create` on a branch `herdr-linear-agent/<issue-key>/<id>-<title>`.
+3. The coordinator runs `herdr-linear-agent context` every turn, publishes a plan, asks questions, and starts workers with `herdr-linear-agent worker start`. Each worker gets a worktree created by `herdr worktree create` on a branch `herdr-linear-agent/<workspace>/<issue-key>/<id>-<title>`.
 4. Workers write a report (`PR: <url>`, `## Report`, `## Next`). The ticker copies it into the run folder, posts pull requests to the session, and tells the coordinator through its inbox.
 5. Replies in the session from allowed users are appended to `conversation.md` and the coordinator is prompted with one fixed line. A stop signal interrupts the run's agents.
-6. `herdr-linear-agent finish` posts the summary and moves the issue to the review state once every worker has reported.
+6. `herdr-linear-agent finish` posts the summary and moves the issue to its team's review state once every worker has reported.
 7. When the issue is completed or canceled, the ticker stops the agents and closes their workspaces. Checkouts and branches are kept.
 
 When a pane needs a person (a permission or trust dialog), the ticker says so in the session with the pane to go to, and shows a Herdr notification.
@@ -287,22 +302,22 @@ When a pane needs a person (a permission or trust dialog), the ticker says so in
 
 | Action | What it does |
 | --- | --- |
-| herdr-linear-agent: log in to Linear | Authorizes the app in the browser and stores the token in the Keychain or Secret Service |
+| herdr-linear-agent: log in to Linear | Authorizes each workspace's app without a token in the browser (all of them again when each has one) and stores the tokens in the Keychain or Secret Service |
 | herdr-linear-agent: status | Lists the runs, their coordinators and workers |
 | herdr-linear-agent: open this run's issue | Opens the issue of the focused pane's run in the browser |
 | herdr-linear-agent: focus the run of a Linear issue | Ctrl-click a Linear issue link to focus its run |
 | herdr-linear-agent: stop taking new issues | Pauses intake; running runs continue |
 | herdr-linear-agent: take new issues again | Resumes intake |
-| herdr-linear-agent: check setup | Checks Herdr, the config, the agent CLIs, the login and the ticker |
+| herdr-linear-agent: check setup | Checks Herdr, the config, the agent CLIs, each workspace's login and the ticker |
 
 ## Files
 
 | Place | Contents |
 | --- | --- |
 | `$XDG_CONFIG_HOME/herdr-linear-agent/config.toml` | Your config |
-| `$XDG_STATE_HOME/herdr-linear-agent/runs/<ISSUE-KEY>/` | A run: `issue.md`, `conversation.md`, worker records and reports, the coordinator's inbox, the outbox |
+| `$XDG_STATE_HOME/herdr-linear-agent/runs/<workspace>/<ISSUE-KEY>/` | A run: `issue.md`, `conversation.md`, worker records and reports, the coordinator's inbox, the outbox |
 | `$XDG_STATE_HOME/herdr-linear-agent/ticker.log` | The ticker's log |
-| `<worktree>/.herdr-linear-agent/<ISSUE-KEY>-<id>/` | A worker's brief and report (see below) |
+| `<worktree>/.herdr-linear-agent/<workspace>-<ISSUE-KEY>-<id>/` | A worker's brief and report (see below) |
 
 `$XDG_STATE_HOME` defaults to `~/.local/state` on Linux and macOS alike.
 
@@ -317,7 +332,7 @@ A worker's brief and report live inside its worktree because the worker runs the
 - Agents run as your user. The allow-list the plugin writes for Claude Code and the rules in the coordinator sheet are guidance, not a sandbox: an agent can run any command your shell can.
 - `claude.auto_accept_trust_dialog` makes the plugin accept Claude Code's trust dialog for you in its run folders and in worktrees of your catalog repositories. Turn it on only for repositories you already trust.
 - The plugin has no subcommand that prints the token. The macOS Keychain may ask for confirmation when a rebuilt binary reads it; a locked Secret Service collection asks to be unlocked.
-- The issue text, reports and comments are treated as data. Only replies from `allowed_user_ids` reach the coordinator as instructions.
+- The issue text, reports and comments are treated as data. Only replies from the `allowed_user_ids` of the issue's team reach the coordinator as instructions.
 
 ## Status
 

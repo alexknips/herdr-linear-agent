@@ -38,6 +38,8 @@ pub struct World {
     pub linear: Mutex<FakeLinear>,
     pub config: Config,
     task: LinearTask,
+    /// The workspaces other than `acme`, each with its own fake and task.
+    others: BTreeMap<String, Remote>,
     reconciler: Reconciler,
     effects: mpsc::Receiver<EffectDone>,
     routing: mpsc::Receiver<RoutingDone>,
@@ -59,6 +61,29 @@ pub struct World {
     /// had before, and the new level to the next pass.
     pub split_level: bool,
     seen_level: LinearLevel,
+}
+
+/// A workspace of the config other than `acme`.
+struct Remote {
+    linear: Mutex<FakeLinear>,
+    task: LinearTask,
+}
+
+fn remotes(config: &Config) -> BTreeMap<String, Remote> {
+    config
+        .workspaces
+        .iter()
+        .filter(|(name, _)| *name != "acme")
+        .map(|(name, workspace)| {
+            let mut fake = FakeLinear::default();
+            fake.organization = name.clone();
+            let remote = Remote {
+                linear: Mutex::new(fake),
+                task: LinearTask::new(name, workspace),
+            };
+            (name.clone(), remote)
+        })
+        .collect()
 }
 
 /// Every file under the runs folder with its bytes.
@@ -121,6 +146,16 @@ fn channels() -> (
     (reconciler, effects, routing)
 }
 
+/// The issue key of a run key or of an issue key.
+fn issue_key(key: &str) -> &str {
+    crate::run::split_key(key).1
+}
+
+/// The sample's one workspace, `acme`, at `level`.
+fn levels_of(level: &LinearLevel) -> crate::linear::task::Levels {
+    crate::linear::task::Levels::from([("acme".to_string(), level.clone())])
+}
+
 impl World {
     /// The sample config, unchanged apart from the World's paths.
     pub fn sample() -> World {
@@ -148,7 +183,8 @@ impl World {
         World {
             herdr: FakeHerdr::new(home.path()),
             linear: Mutex::new(FakeLinear::default()),
-            task: LinearTask::new(&config.linear),
+            task: LinearTask::new("acme", config.workspace("acme").unwrap()),
+            others: remotes(&config),
             log: Log::new(home.path().join("ticker.log")),
             now: Timestamp::now().round(jiff::Unit::Second).unwrap(),
             injected: Vec::new(),
@@ -175,7 +211,8 @@ impl World {
         self.reconciler = reconciler;
         self.effects = effects;
         self.routing = routing;
-        self.task = LinearTask::new(&self.config.linear);
+        self.task = LinearTask::new("acme", self.config.workspace("acme").unwrap());
+        self.others = remotes(&self.config);
         self.published.clear();
         self.held.clear();
         self.seen_level = LinearLevel::default();
@@ -206,6 +243,24 @@ impl World {
 
     pub fn fake(&self) -> MutexGuard<'_, FakeLinear> {
         self.linear.lock().unwrap()
+    }
+
+    /// The fake of the workspace a run key names; `acme`'s for an issue key.
+    pub fn fake_for(&self, key: &str) -> MutexGuard<'_, FakeLinear> {
+        match crate::run::split_key(key).0 {
+            "" | "acme" => self.fake(),
+            other => self.others[other].linear.lock().unwrap(),
+        }
+    }
+
+    /// The levels a pass sees: `acme`'s as given, the others' as their tasks
+    /// have them.
+    fn levels(&self, acme: &LinearLevel) -> crate::linear::task::Levels {
+        let mut levels = levels_of(acme);
+        for (name, remote) in &self.others {
+            levels.insert(name.clone(), remote.task.level().clone());
+        }
+        levels
     }
 
     /// Hands the next pass an event as if the Linear task had sent it.
@@ -281,9 +336,27 @@ impl World {
         let mut events = std::mem::take(&mut self.injected);
         events.append(&mut self.held);
         let (sender, mut sent) = mpsc::channel(1024);
+        let of = |workspace: &str| -> Vec<RunQuery> {
+            queries
+                .iter()
+                .filter(|q| crate::run::split_key(&q.key).0 == workspace)
+                .cloned()
+                .collect()
+        };
         self.task
-            .step_into(&self.linear, &queries, self.now, &sender)
+            .step_into(&self.linear, &of("acme"), self.now, &sender)
             .await;
+        for (name, remote) in &mut self.others {
+            remote.task.force_due();
+            remote.linear.lock().unwrap().present = Some(self.now);
+            remote
+                .task
+                .step_into(&remote.linear, &of(name), self.now, &sender)
+                .await;
+            for line in remote.task.take_log() {
+                self.log.line(&line);
+            }
+        }
         for event in std::iter::from_fn(|| sent.try_recv().ok()) {
             if self.hold_activity_sent && matches!(event, LinearEvent::ActivitySent { .. }) {
                 self.held.push(event);
@@ -328,7 +401,8 @@ impl World {
             socket: SOCKET,
             log: &self.log,
         };
-        self.reconciler.pass(&deps, level, wake, self.now).await;
+        let levels = self.levels(level);
+        self.reconciler.pass(&deps, &levels, wake, self.now).await;
         if !self.every_pass_twice {
             return;
         }
@@ -339,7 +413,7 @@ impl World {
         let asked = self.herdr.requests().len();
         let in_flight = self.reconciler.effects_in_flight();
         self.reconciler
-            .pass(&deps, level, Wake::default(), self.now)
+            .pass(&deps, &levels, Wake::default(), self.now)
             .await;
         assert_eq!(
             in_flight,
@@ -386,10 +460,11 @@ impl World {
             herdr: self.herdr.clone(),
             socket: SOCKET.into(),
         };
-        let pass = self.reconciler.pass(&deps, &level, wake, self.now);
+        let levels = self.levels(&level);
+        let pass = self.reconciler.pass(&deps, &levels, wake, self.now);
         let restart = async {
             taken.await.expect("the pass took no snapshot");
-            let restarted = commands::worker_restart(&ctx, &session, "DATA-1", id, None)
+            let restarted = commands::worker_restart(&ctx, &session, "acme/DATA-1", id, None)
                 .await
                 .unwrap();
             go.send(()).unwrap();
@@ -449,11 +524,11 @@ impl World {
     }
 
     pub fn move_issue(&self, key: &str, state: &str) {
-        self.fake().set_state(key, state);
+        self.fake_for(key).set_state(issue_key(key), state);
     }
 
     pub fn set_delegate(&self, key: &str, delegate: Value) {
-        self.fake().issue_mut(key)["delegate"] = delegate;
+        self.fake_for(key).issue_mut(issue_key(key))["delegate"] = delegate;
     }
 
     /// Writes the worker's report in its worktree.
@@ -492,8 +567,14 @@ impl World {
             .unwrap_or_default()
     }
 
+    /// The run of `key`: a run key, or an issue key of the `acme` workspace.
     pub fn run(&self, key: &str) -> Run {
-        Run::load(&self.ctx().runs_dir(), key).unwrap()
+        let key = if key.contains('/') {
+            key.to_string()
+        } else {
+            crate::run::run_key("acme", key)
+        };
+        Run::load(&self.ctx().runs_dir(), &key).unwrap()
     }
 
     pub fn record(&self, key: &str) -> RunRecord {
@@ -506,17 +587,17 @@ impl World {
 
     /// An issue of the DATA team delegated to the app user.
     pub fn delegate(&self, key: &str, title: &str, estimate: Option<f64>) -> String {
-        let mut fake = self.fake();
-        let id = fake.add_issue(key, "DATA", title);
-        fake.issue_mut(key)["estimate"] = json!(estimate);
+        let mut fake = self.fake_for(key);
+        let id = fake.add_issue(issue_key(key), "DATA", title);
+        fake.issue_mut(issue_key(key))["estimate"] = json!(estimate);
         id
     }
 
     /// A person's message in the issue's session, stamped after the clock.
     pub fn message(&self, key: &str, user: &str, body: &str, signal: Option<&str>) {
-        let mut fake = self.fake();
+        let mut fake = self.fake_for(key);
         fake.present = Some(self.now);
-        fake.add_prompt(key, user, body, signal);
+        fake.add_prompt(issue_key(key), user, body, signal);
     }
 
     /// DATA-1, estimate 2 (size S), claimed and its coordinator prompted.
@@ -535,7 +616,7 @@ impl World {
             title: format!("Change {repo}"),
             task: "Make the change and open a PR.".into(),
         };
-        commands::worker_start(&self.ctx(), &self.session(), "DATA-1", &args)
+        commands::worker_start(&self.ctx(), &self.session(), "acme/DATA-1", &args)
             .await
             .unwrap()
     }
@@ -550,7 +631,7 @@ impl World {
 
     /// Activities of one type the plugin sent to the issue's session.
     pub fn sent(&self, key: &str, kind: &str) -> Vec<Value> {
-        self.fake().session(key).sent(kind)
+        self.fake_for(key).session(issue_key(key)).sent(kind)
     }
 
     /// The bodies of the sent activities of one type.
@@ -567,7 +648,7 @@ impl World {
     }
 
     pub fn issue_state(&self, key: &str) -> String {
-        self.fake().issue(key)["state"]["name"]
+        self.fake_for(key).issue(issue_key(key))["state"]["name"]
             .as_str()
             .unwrap_or_default()
             .to_string()

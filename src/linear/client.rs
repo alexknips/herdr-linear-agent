@@ -8,7 +8,6 @@
 //! drives the HTTP call on the runtime with `Handle::block_on` while the lease
 //! is held.
 
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use serde_json::{Value, json};
@@ -66,16 +65,21 @@ pub struct Client {
 }
 
 impl Client {
-    /// Builds the client with the production credential manager.
+    /// Builds the client of the workspace called `name` with the production
+    /// credential manager.
     // Tests cannot reach the Keychain; they build the client with a test lease.
     #[cfg_attr(test, allow(dead_code))]
     pub async fn production(
-        client_id: String,
-        callback_port: u16,
-        lock_path: PathBuf,
+        name: &str,
+        workspace: &crate::config::Workspace,
+        state_dir: &std::path::Path,
     ) -> Result<Client, ApiError> {
+        let account = name.to_owned();
+        let client_id = workspace.client_id.clone();
+        let callback_port = workspace.callback_port;
+        let lock_path = crate::linear::credentials::lock_path(state_dir, name);
         Self::with_lease(
-            move || CredentialManager::production(client_id, callback_port, lock_path),
+            move || CredentialManager::production(&account, client_id, callback_port, lock_path),
             GRAPHQL_ENDPOINT,
         )
         .await

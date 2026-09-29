@@ -14,10 +14,10 @@ use crate::linear::task::LinearEvent;
 use crate::run::{AgentStatus, Status};
 use crate::{inbox, worker};
 
-const KEY: &str = "DATA-1";
+const KEY: &str = "acme/DATA-1";
 const PR: &str = "https://github.com/acme/api/pull/7";
-const LAUNCH: &str = "[herdr-linear-agent ticker] Start DATA-1. Follow AGENTS.md.";
-const RESUMED_WITH: [&str; 2] = ["--resume", "sess-data-1-coordinator"];
+const LAUNCH: &str = "[herdr-linear-agent ticker] Start acme/DATA-1. Follow AGENTS.md.";
+const RESUMED_WITH: [&str; 2] = ["--resume", "sess-acme-data-1-coordinator"];
 
 fn request(repo: &str, profile: &str, title: &str) -> WorkerStart {
     WorkerStart {
@@ -98,7 +98,7 @@ async fn a_delegated_issue_is_claimed_placed_started_and_prompted_once() {
         .collect();
     assert_eq!(order, ["workspace.create", "agent.start", "agent.prompt"]);
     let start = &world.herdr.starts()[0];
-    assert_eq!(start.name, "data-1-coordinator");
+    assert_eq!(start.name, "acme-data-1-coordinator");
     assert!(
         ends_with(
             &start.args,
@@ -126,6 +126,71 @@ async fn a_delegated_issue_is_claimed_placed_started_and_prompted_once() {
     );
 }
 
+/// A second workspace whose `DATA` team has its own allowed user and review
+/// state.
+const BETA: &str = r#"
+[workspaces.beta]
+client_id = "client-456"
+
+[workspaces.beta.teams.DATA]
+allowed_user_ids = ["user-2"]
+review_state = "Ready for review"
+"#;
+
+#[tokio::test]
+async fn two_workspaces_with_the_same_issue_key_run_apart_under_their_own_team_rules() {
+    let mut world = World::with(|c| c + BETA);
+    world.delegate("acme/DATA-1", "Fix the login", Some(2.0));
+    world.delegate("beta/DATA-1", "Fix the export", Some(2.0));
+    world.settle().await;
+
+    let keys: Vec<String> = crate::run::Run::list(&world.ctx().runs_dir())
+        .into_iter()
+        .map(|run| run.key)
+        .collect();
+    assert_eq!(keys, ["acme/DATA-1", "beta/DATA-1"]);
+    let mut names: Vec<String> = world.herdr.starts().into_iter().map(|s| s.name).collect();
+    names.sort();
+    assert_eq!(
+        names,
+        ["acme-data-1-coordinator", "beta-data-1-coordinator"]
+    );
+    for key in ["acme/DATA-1", "beta/DATA-1"] {
+        assert_eq!(
+            world.bodies(key, "thought")[0],
+            "Picked up DATA-1.",
+            "{key}"
+        );
+        assert_eq!(world.issue_state(key), "In Progress", "{key}");
+    }
+    assert_eq!(
+        world.record("beta/DATA-1").url,
+        "https://linear.app/beta/issue/DATA-1/x"
+    );
+
+    // Each run's team decides whose replies count.
+    world.message("beta/DATA-1", "user-1", "From acme's user.", None);
+    world.message("beta/DATA-1", "user-2", "From beta's user.", None);
+    world.settle().await;
+    let relayed = world.text("beta/DATA-1", "conversation.md");
+    assert!(
+        relayed.contains("From beta's user.") && !relayed.contains("From acme's user."),
+        "{relayed}"
+    );
+
+    // `finish` moves the issue to its own team's review state.
+    world.fake_for("beta/DATA-1").issue_mut("DATA-1")["team"]["states"]["nodes"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({ "id": "state-ready", "name": "Ready for review", "type": "started", "position": 3.5 }));
+    commands::finish(&world.ctx(), &world.session(), "beta/DATA-1", "Done.")
+        .await
+        .unwrap();
+    world.settle().await;
+    assert_eq!(world.issue_state("beta/DATA-1"), "Ready for review");
+    assert_eq!(world.issue_state("acme/DATA-1"), "In Progress");
+}
+
 #[tokio::test]
 async fn intake_stops_at_max_runs_and_while_paused() {
     let mut full = World::with(limit("max_runs", 1));
@@ -145,7 +210,7 @@ async fn intake_stops_at_max_runs_and_while_paused() {
 async fn the_session_linear_opened_on_delegation_is_the_runs_session() {
     let mut world = World::sample();
     world.delegate(KEY, "Delegated", None);
-    let opened = world.fake().delegate_session(KEY);
+    let opened = world.fake().delegate_session("DATA-1");
     world.settle().await;
     assert_eq!(world.record(KEY).session_id, opened);
     assert_eq!(world.sessions(), 1, "no second session");
@@ -207,7 +272,9 @@ async fn the_routing_agent_picks_a_candidate_and_its_instructions_reach_agents_m
         )
     );
     let agents_md = world.text(KEY, "AGENTS.md");
-    let sheet = agents_md.find("skill DATA-1").expect("the sheet pointer");
+    let sheet = agents_md
+        .find("skill acme/DATA-1")
+        .expect("the sheet pointer");
     let own = agents_md
         .find("## Profile instructions")
         .expect("the profile's section");
@@ -262,7 +329,7 @@ async fn a_worker_report_with_a_pr_reaches_the_inbox_and_linear() {
         .await
         .unwrap();
     let w = world.start_worker("api").await;
-    assert_eq!(w.branch, "herdr-linear-agent/data-1/w1-change-api");
+    assert_eq!(w.branch, "herdr-linear-agent/acme/data-1/w1-change-api");
     assert!(world.runner.count("git -C") > 0);
     assert!(!world.brief(&w).is_empty(), "brief.md is written");
     assert_eq!(world.herdr.worktrees()[0].2, "origin/main", "--base");
@@ -279,7 +346,7 @@ async fn a_worker_report_with_a_pr_reaches_the_inbox_and_linear() {
     assert!(ends_with(&last_args(&world), &flags));
     assert_eq!(
         to(&world, &w.agent.pane_id),
-        ["Read .herdr-linear-agent/DATA-1-w1/brief.md and do what it says."]
+        ["Read .herdr-linear-agent/acme-DATA-1-w1/brief.md and do what it says."]
     );
 
     world.report(
@@ -293,7 +360,7 @@ async fn a_worker_report_with_a_pr_reaches_the_inbox_and_linear() {
     assert_eq!(world.actions(KEY), ["Start worker", "Pull request"]);
     {
         let linear = world.fake();
-        let session = linear.session(KEY);
+        let session = linear.session("DATA-1");
         let urls: Vec<&str> = session
             .external_urls
             .iter()
@@ -409,12 +476,12 @@ async fn a_worker_waiting_on_a_dialog_refuses_a_prompt() {
     world.start_worker("api").await;
     world.settle().await;
     let (ctx, session) = (world.ctx(), world.session());
-    world.herdr.set_status("data-1-w1", "blocked");
+    world.herdr.set_status("acme-data-1-w1", "blocked");
     let refused = commands::worker_prompt(&ctx, &session, KEY, "w1", "Answer")
         .await
         .unwrap_err();
     assert!(refused.to_string().contains("dialog"), "{refused}");
-    world.herdr.set_status("data-1-w1", "working");
+    world.herdr.set_status("acme-data-1-w1", "working");
     commands::worker_prompt(&ctx, &session, KEY, "w1", "Also add a test.")
         .await
         .unwrap();
@@ -619,7 +686,7 @@ async fn a_dialog_is_reported_once_and_a_gone_coordinator_resumes_on_request() {
     let questions = world.bodies(KEY, "elicitation");
     assert_eq!(questions.len(), 1, "{questions:?}");
     assert!(questions[0].contains(&w.agent.pane_id), "{questions:?}");
-    assert_eq!(world.herdr.notifications()[0].0, "DATA-1 needs you");
+    assert_eq!(world.herdr.notifications()[0].0, "acme/DATA-1 needs you");
     assert!(mentions(&world.inbox(KEY), "Waiting on you"));
 
     // A person closes the coordinator's workspace.
@@ -702,7 +769,7 @@ async fn a_worker_pane_that_shows_up_late_is_not_lost() {
         .herdr
         .starts()
         .into_iter()
-        .filter(|s| s.name == "data-1-w1")
+        .filter(|s| s.name == "acme-data-1-w1")
         .map(|s| s.pane)
         .collect();
     assert_eq!(starts, [PaneId(w.agent.pane_id.clone())]);
@@ -829,7 +896,7 @@ async fn a_blocked_episode_missed_between_passes_is_still_a_new_episode() {
     world.running_issue().await;
     world.start_worker("api").await;
     world.settle().await;
-    world.herdr.set_status("data-1-w1", "blocked");
+    world.herdr.set_status("acme-data-1-w1", "blocked");
     world.settle().await;
     let blocked_at = world.now();
     assert_eq!(
@@ -842,8 +909,8 @@ async fn a_blocked_episode_missed_between_passes_is_still_a_new_episode() {
 
     // Answered and blocked again with no pass in between: the snapshot
     // shows the same status with a newer sequence.
-    world.herdr.set_status("data-1-w1", "idle");
-    world.herdr.set_status("data-1-w1", "blocked");
+    world.herdr.set_status("acme-data-1-w1", "idle");
+    world.herdr.set_status("acme-data-1-w1", "blocked");
     world.later(5);
     world.settle().await;
     assert_eq!(world.bodies(KEY, "elicitation").len(), 1, "not 30 s yet");
@@ -883,12 +950,12 @@ async fn a_list_read_with_the_detaching_read_does_not_bring_the_run_back() {
 async fn an_agent_that_lost_its_name_is_renamed_and_still_watched() {
     let mut world = World::sample();
     let pane = world.running_issue().await;
-    world.herdr.forget_name("data-1-coordinator");
+    world.herdr.forget_name("acme-data-1-coordinator");
     world.later(5);
     world.settle().await;
     assert_eq!(
         world.herdr.renames(),
-        [(PaneId(pane.clone()), "data-1-coordinator".to_string())]
+        [(PaneId(pane.clone()), "acme-data-1-coordinator".to_string())]
     );
     let c = world.record(KEY);
     assert_eq!((c.coordinator_lost, c.coordinator.pane_id), (false, pane));
@@ -990,8 +1057,9 @@ async fn a_claim_cut_short_before_its_first_thought_still_announces_it() {
     crate::run::Run::create(
         &world.ctx().runs_dir(),
         crate::run::RunRecord {
+            workspace: "acme".into(),
             issue_id,
-            identifier: KEY.into(),
+            identifier: "DATA-1".into(),
             title: "Fix the login".into(),
             team_key: "DATA".into(),
             created: at.clone(),
@@ -1316,7 +1384,7 @@ async fn an_agent_whose_entry_does_not_parse_is_not_started_again() {
             .herdr
             .starts()
             .into_iter()
-            .filter(|s| s.name == "data-1-w1")
+            .filter(|s| s.name == "acme-data-1-w1")
             .count()
     };
     assert_eq!(starts(&world), 1);
@@ -1365,7 +1433,7 @@ async fn a_routing_agent_that_never_reads_its_input_times_out() {
     let mut world = World::with(|c| c.replace("timeout_seconds = 60", "timeout_seconds = 1"));
     world.router("sleep 30\n");
     world.delegate(KEY, "Huge", None);
-    world.fake().issue_mut(KEY)["description"] = json!("x".repeat(1 << 20));
+    world.fake().issue_mut("DATA-1")["description"] = json!("x".repeat(1 << 20));
     world.settle().await;
     let routed = world.record(KEY);
     assert_eq!(
@@ -1477,7 +1545,7 @@ async fn a_worker_idle_right_after_its_launch_prompt_is_not_reported_idle() {
     world.settle().await;
     assert_eq!(
         to(&world, &w.agent.pane_id),
-        ["Read .herdr-linear-agent/DATA-1-w1/brief.md and do what it says."]
+        ["Read .herdr-linear-agent/acme-DATA-1-w1/brief.md and do what it says."]
     );
     let idle = |world: &World| mentions(&world.inbox(KEY), "is idle without a report");
     assert!(!idle(&world), "the prompt has not been picked up yet");
@@ -1526,13 +1594,13 @@ async fn only_a_person_editing_the_issue_writes_an_issue_item() {
 
     world
         .fake()
-        .add_comment(KEY, "someone", "Note the API change in #12.");
+        .add_comment("DATA-1", "someone", "Note the API change in #12.");
     world.later(5);
     world.settle().await;
     assert_eq!(issue_items(&world), 1, "a person's comment on the issue is");
 
-    world.fake().issue_mut(KEY)["description"] = json!("A new description.");
-    world.fake().issue_mut(KEY)["updatedAt"] = json!("2027-01-01T00:00:00.000Z");
+    world.fake().issue_mut("DATA-1")["description"] = json!("A new description.");
+    world.fake().issue_mut("DATA-1")["updatedAt"] = json!("2027-01-01T00:00:00.000Z");
     world.later(5);
     world.settle().await;
     assert_eq!(issue_items(&world), 2, "an edited description is");

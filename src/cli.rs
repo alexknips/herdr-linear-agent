@@ -28,7 +28,12 @@ enum Command {
     /// The plugin's startup hook: starts the ticker detached and exits.
     Startup,
     /// A Herdr action.
-    Action { action: Action },
+    Action {
+        action: Action,
+        /// For `login`: log in to this workspace of the config again.
+        #[arg(long)]
+        workspace: Option<String>,
+    },
     /// Manage the background ticker.
     Ticker {
         #[command(subcommand)]
@@ -190,7 +195,9 @@ pub async fn run() -> Result<()> {
             command: DebugCommand::HerdrWatch { socket },
         } => herdr_watch(socket).await,
         Command::Startup => ticker::start(&ctx).await,
-        Command::Action { action } => actions::run(&ctx, action).await,
+        Command::Action { action, workspace } => {
+            actions::run(&ctx, action, workspace.as_deref()).await
+        }
         Command::Ticker { command } => match command {
             TickerCommand::Start => ticker::start(&ctx).await,
             TickerCommand::Stop => ticker::stop(&ctx.state_dir()).await,

@@ -26,7 +26,7 @@ use tokio::sync::{Notify, mpsc, watch};
 use crate::VERSION;
 use crate::config::Config;
 use crate::herdr::{self, Link};
-use crate::linear::task::{LinearLevel, LinearTask, Links};
+use crate::linear::task::{Levels, LinearTask, Links};
 use crate::paths::Ctx;
 
 /// The log stays below this size; trimming keeps its newer half.
@@ -342,21 +342,40 @@ async fn serve(ctx: &Ctx<'_>, config: &Config, state_dir: &Path, log: &Arc<Log>)
         log.clone(),
     ));
     let (queries_tx, queries_rx) = watch::channel(Vec::new());
-    let (level_tx, level_rx) = watch::channel(LinearLevel::default());
+    let (level_tx, level_rx) = watch::channel(Levels::new());
+    let level_tx = Arc::new(level_tx);
     let (events_tx, events_rx) = mpsc::channel(EVENT_QUEUE);
-    let linear_wake = Arc::new(Notify::new());
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let linear = linear(
-        config,
-        state_dir,
-        Links {
-            queries: queries_rx,
-            level: level_tx,
-            events: events_tx,
-            wake: linear_wake.clone(),
-        },
-        log.clone(),
-    );
+    // One Linear task per workspace, each with its own client and wake.
+    let (ended_tx, mut ended) = mpsc::channel::<()>(1);
+    let mut linear_wake = Vec::new();
+    let mut tasks = Vec::new();
+    for (name, workspace) in &config.workspaces {
+        let wake = Arc::new(Notify::new());
+        linear_wake.push(wake.clone());
+        let links = Links {
+            queries: queries_rx.clone(),
+            level: level_tx.clone(),
+            events: events_tx.clone(),
+            wake,
+        };
+        let task = linear(
+            name.clone(),
+            workspace.clone(),
+            state_dir.to_path_buf(),
+            links,
+            log.clone(),
+        );
+        let ended_tx = ended_tx.clone();
+        tasks.push(tokio::spawn(async move {
+            task.await;
+            let _ = ended_tx.send(()).await;
+        }));
+    }
+    drop((queries_rx, level_tx, events_tx, ended_tx));
+    let linear = async move {
+        ended.recv().await;
+    };
     let reconciler = reconcile::run(reconcile::Inputs {
         ctx,
         config,
@@ -376,12 +395,14 @@ async fn serve(ctx: &Ctx<'_>, config: &Config, state_dir: &Path, log: &Arc<Log>)
     let reason = tokio::select! {
         result = &mut reconciler => {
             finder.abort();
+            tasks.iter().for_each(tokio::task::JoinHandle::abort);
             return result.map(|()| "the reconciler ended".into());
         }
         reason = supervise(state_dir, link) => reason,
-        () = &mut linear => "the Linear task ended".into(),
+        () = &mut linear => "a Linear task ended".into(),
     };
     finder.abort();
+    tasks.iter().for_each(tokio::task::JoinHandle::abort);
     let _ = shutdown_tx.send(true);
     reconciler.await?;
     let _ = std::fs::remove_file(poke_path(state_dir));
@@ -436,25 +457,25 @@ async fn supervise(state_dir: &Path, link: watch::Receiver<Link>) -> String {
     }
 }
 
-/// Builds the Linear client from the stored credential, retrying on the
-/// intake interval, and runs the Linear task on it.
-async fn linear(config: &Config, state_dir: &Path, links: Links, log: Arc<Log>) {
-    let lock = state_dir.join("credentials.lock");
-    let retry = Duration::from_secs(config.linear.intake_interval_seconds);
+/// Builds the workspace's Linear client from its stored credential, retrying
+/// on the intake interval, and runs the Linear task on it.
+async fn linear(
+    name: String,
+    workspace: crate::config::Workspace,
+    state_dir: std::path::PathBuf,
+    links: Links,
+    log: Arc<Log>,
+) {
+    let retry = Duration::from_secs(workspace.intake_interval_seconds);
     let mut logged = false;
     let client = loop {
-        let built = crate::linear::client::Client::production(
-            config.linear.client_id.clone(),
-            config.linear.callback_port,
-            lock.clone(),
-        )
-        .await;
+        let built = crate::linear::client::Client::production(&name, &workspace, &state_dir).await;
         match built {
             Ok(client) => break client,
             Err(error) => {
                 if !logged {
                     log.line(&format!(
-                        "Linear is not available: {error}; run the login action"
+                        "{name}: Linear is not available: {error}; run the login action"
                     ));
                     logged = true;
                 }
@@ -465,7 +486,7 @@ async fn linear(config: &Config, state_dir: &Path, links: Links, log: Arc<Log>) 
             }
         }
     };
-    LinearTask::new(&config.linear)
+    LinearTask::new(&name, &workspace)
         .run(&client, links, Timestamp::now, |line| log.line(line))
         .await;
 }

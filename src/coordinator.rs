@@ -46,9 +46,10 @@ pub fn sheet(bin: &str, key: &str) -> String {
 pub fn agents_md(bin: &str, record: &RunRecord, instructions: Option<&str>) -> String {
     format!(
         "# herdr-linear-agent run {key}\n\n\
-         If your working directory is this folder, you are the coordinator of the herdr-linear-agent run for the Linear issue {key} ({title}).\n\n\
+         If your working directory is this folder, you are the coordinator of the herdr-linear-agent run for the Linear issue {issue} ({title}).\n\n\
          Run `{bin} skill {key}` now and follow the sheet it prints. Then run `{bin} context {key}` at the start of every turn.\n",
-        key = record.identifier,
+        key = crate::run::run_key(&record.workspace, &record.identifier),
+        issue = record.identifier,
         title = record.title.replace('\n', " "),
     ) + &profile_section(&record.coordinator.profile, "the sheet", instructions)
 }
@@ -113,7 +114,11 @@ pub fn pending_record(record: &RunRecord, profile: &str, kind: &str) -> AgentRec
         status: AgentStatus::Pending,
         profile: profile.to_string(),
         kind: kind.to_string(),
-        agent_name: names::agent_name(&record.identifier, &record.issue_id, "coordinator"),
+        agent_name: names::agent_name(
+            &crate::run::run_key(&record.workspace, &record.identifier),
+            &record.issue_id,
+            "coordinator",
+        ),
         ..AgentRecord::default()
     }
 }
@@ -125,7 +130,10 @@ pub fn workspace_label(record: &RunRecord) -> String {
         .filter(|c| !c.is_control())
         .take(60)
         .collect();
-    format!("{} {title}", record.identifier)
+    format!(
+        "{} {title}",
+        crate::run::run_key(&record.workspace, &record.identifier)
+    )
 }
 
 pub fn launch_prompt(key: &str, resume: bool) -> String {
@@ -306,6 +314,7 @@ mod tests {
     fn folder(title: &str) -> Folder {
         let home = tempfile::tempdir().unwrap();
         let record = RunRecord {
+            workspace: "acme".into(),
             issue_id: "0b7c6c1e-issue".into(),
             identifier: "DATA-1".into(),
             title: title.into(),
@@ -344,13 +353,13 @@ mod tests {
 
         let agents = std::fs::read_to_string(f.run.dir.join("AGENTS.md")).unwrap();
         let expected = [
-            "# herdr-linear-agent run DATA-1",
+            "# herdr-linear-agent run acme/DATA-1",
             "",
             "If your working directory is this folder, you are the coordinator of the \
              herdr-linear-agent run for the Linear issue DATA-1 (Fix the login).",
             "",
-            "Run `/opt/hla/bin/herdr-linear-agent skill DATA-1` now and follow the sheet it \
-             prints. Then run `/opt/hla/bin/herdr-linear-agent context DATA-1` at the start \
+            "Run `/opt/hla/bin/herdr-linear-agent skill acme/DATA-1` now and follow the sheet it \
+             prints. Then run `/opt/hla/bin/herdr-linear-agent context acme/DATA-1` at the start \
              of every turn.",
         ];
         assert_eq!(agents, format!("{}\n", expected.join("\n")));
@@ -400,7 +409,7 @@ mod tests {
         assert!(
             std::fs::read_to_string(f.run.dir.join("CLAUDE.md"))
                 .unwrap()
-                .contains("Run `/usr/local/bin/hla skill DATA-1`")
+                .contains("Run `/usr/local/bin/hla skill acme/DATA-1`")
         );
     }
 
@@ -437,13 +446,13 @@ mod tests {
 
         let f = folder(&format!("Tab\there {}", "z".repeat(80)));
         let label = workspace_label(&f.record);
-        assert_eq!(label, format!("DATA-1 Tabhere {}", "z".repeat(52)));
+        assert_eq!(label, format!("acme/DATA-1 Tabhere {}", "z".repeat(52)));
 
         let pending = pending_record(&f.record, "coordinator-light", "claude");
         assert_eq!(pending.status, AgentStatus::Pending);
         assert_eq!(pending.profile, "coordinator-light");
         assert_eq!(pending.kind, "claude");
-        assert_eq!(pending.agent_name, "data-1-coordinator");
+        assert_eq!(pending.agent_name, "acme-data-1-coordinator");
     }
 
     #[test]

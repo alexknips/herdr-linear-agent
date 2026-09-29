@@ -188,7 +188,7 @@ pub async fn finish<H: Herdr>(
     text: &str,
 ) -> Result<()> {
     non_empty(text, "summary")?;
-    let (config, run, _) = load_active(ctx, key).await?;
+    let (config, run, record) = load_active(ctx, key).await?;
     let snapshot = session.herdr.snapshot().await.context(UNREACHABLE)?;
     let now = jiff::Timestamp::now();
     let state_dir = ctx.state_dir();
@@ -229,10 +229,10 @@ pub async fn finish<H: Herdr>(
     )?;
     run.update(|r| r.finished = true)?;
     ticker::poke(&ctx.state_dir());
-    println!(
-        "the summary is queued; the issue moves to `{}`",
-        config.linear.review_state
-    );
+    let review_state = config
+        .team(&record.workspace, &record.team_key)
+        .map_or("In Review", |team| team.review_state.as_str());
+    println!("the summary is queued; the issue moves to `{review_state}`");
     Ok(())
 }
 
@@ -465,7 +465,7 @@ async fn place(
     std::fs::create_dir_all(&worker.brief_dir)
         .with_context(|| format!("could not create {}", worker.brief_dir))?;
     let brief = worker::compose_brief(&worker::BriefInput {
-        issue_key: &run.key,
+        issue_key: &record.identifier,
         issue_title: &record.title,
         issue_url: &record.url,
         worker: &worker,
@@ -701,9 +701,10 @@ mod tests {
         exclude_from_git(&runner, &cwd).await.unwrap();
         let text = std::fs::read_to_string(repo.path().join(".git/info/exclude")).unwrap();
         assert_eq!(text.matches(".herdr-linear-agent/").count(), 1);
-        std::fs::create_dir_all(repo.path().join(".herdr-linear-agent/DATA-1-w1")).unwrap();
+        std::fs::create_dir_all(repo.path().join(".herdr-linear-agent/acme-DATA-1-w1")).unwrap();
         std::fs::write(
-            repo.path().join(".herdr-linear-agent/DATA-1-w1/report.md"),
+            repo.path()
+                .join(".herdr-linear-agent/acme-DATA-1-w1/report.md"),
             "r",
         )
         .unwrap();
@@ -747,6 +748,7 @@ mod tests {
             Run::create(
                 &setup.ctx().runs_dir(),
                 RunRecord {
+                    workspace: "acme".into(),
                     identifier: "DATA-1".into(),
                     issue_id: "issue-1".into(),
                     title: "Fix the login".into(),
@@ -767,7 +769,7 @@ mod tests {
         }
 
         fn run(&self) -> Run {
-            Run::load(&self.ctx().runs_dir(), "DATA-1").unwrap()
+            Run::load(&self.ctx().runs_dir(), "acme/DATA-1").unwrap()
         }
 
         async fn start(&self, repo: &str, profile: &str) -> Result<Worker> {
@@ -777,7 +779,7 @@ mod tests {
                 title: format!("Change {repo}"),
                 task: "Make the change and open a PR.".into(),
             };
-            worker_start(&self.ctx(), &self.session, "DATA-1", &args).await
+            worker_start(&self.ctx(), &self.session, "acme/DATA-1", &args).await
         }
     }
 
@@ -785,13 +787,13 @@ mod tests {
     async fn a_worker_is_placed_in_a_worktree_with_its_brief() {
         let setup = Setup::new(|c| c);
         let w = setup.start("api", "standard").await.unwrap();
-        assert_eq!(w.branch, "herdr-linear-agent/data-1/w1-change-api");
+        assert_eq!(w.branch, "herdr-linear-agent/acme/data-1/w1-change-api");
         let root = setup.home.path().to_string_lossy();
         assert_eq!(
             setup.session.herdr.worktrees(),
             [(
                 format!("{root}/src/api"),
-                "herdr-linear-agent/data-1/w1-change-api".into(),
+                "herdr-linear-agent/acme/data-1/w1-change-api".into(),
                 "origin/main".into()
             )]
         );
@@ -803,14 +805,14 @@ mod tests {
         assert_eq!(setup.runner.count("rev-parse --git-common-dir"), 1);
         assert_eq!(w.agent.status, AgentStatus::Open);
         assert!(w.agent.prompt_pending);
-        assert_eq!(w.agent.agent_name, "data-1-w1");
+        assert_eq!(w.agent.agent_name, "acme-data-1-w1");
         assert_eq!(w.agent.kind, "claude");
         assert_eq!(
             (w.agent.pane_id.as_str(), w.agent.workspace_id.as_str()),
             ("w1:p1", "w1")
         );
         assert_eq!(w.agent.cwd, w.worktree_path);
-        assert!(w.brief_dir.ends_with(".herdr-linear-agent/DATA-1-w1"));
+        assert!(w.brief_dir.ends_with(".herdr-linear-agent/acme-DATA-1-w1"));
         let brief = std::fs::read_to_string(Path::new(&w.brief_dir).join("brief.md")).unwrap();
         assert!(brief.contains("Make the change and open a PR."));
         assert!(!brief.contains("previous attempt"));
@@ -908,7 +910,7 @@ mod tests {
         );
         // A restart places it again from its base.
         setup.session.herdr.set_down(false);
-        let w = worker_restart(&setup.ctx(), &setup.session, "DATA-1", "w1", None)
+        let w = worker_restart(&setup.ctx(), &setup.session, "acme/DATA-1", "w1", None)
             .await
             .unwrap();
         assert_eq!((w.agent.status, w.restarts), (AgentStatus::Open, 1));
@@ -932,7 +934,7 @@ mod tests {
     #[tokio::test]
     async fn a_worktree_created_without_an_answer_is_opened_not_failed() {
         let setup = Setup::new(|c| c);
-        let branch = "herdr-linear-agent/data-1/w1-change-api";
+        let branch = "herdr-linear-agent/acme/data-1/w1-change-api";
         setup
             .runner
             .on("worktree list --porcelain", ok(&listing(&setup, branch)));
@@ -951,7 +953,7 @@ mod tests {
         assert_eq!(w.agent.pane_id, "w2:p1");
         assert!(
             w.worktree_path
-                .ends_with("herdr-linear-agent-data-1-w1-change-api")
+                .ends_with("herdr-linear-agent-acme-data-1-w1-change-api")
         );
     }
 
@@ -966,7 +968,7 @@ mod tests {
             "worktree list --porcelain",
             ok(&listing(&setup, &failed.branch)),
         );
-        let w = worker_restart(&setup.ctx(), &setup.session, "DATA-1", "w1", None)
+        let w = worker_restart(&setup.ctx(), &setup.session, "acme/DATA-1", "w1", None)
             .await
             .unwrap();
         assert_eq!(
@@ -991,9 +993,15 @@ mod tests {
             w.agent.launch_attempts = 2;
         })
         .unwrap();
-        let restarted = worker_restart(&setup.ctx(), &setup.session, "DATA-1", "w1", Some("deep"))
-            .await
-            .unwrap();
+        let restarted = worker_restart(
+            &setup.ctx(),
+            &setup.session,
+            "acme/DATA-1",
+            "w1",
+            Some("deep"),
+        )
+        .await
+        .unwrap();
         assert_eq!(
             (restarted.agent.kind.as_str(), restarted.restarts),
             ("codex", 1)
@@ -1023,7 +1031,7 @@ mod tests {
         let error = worker_restart(
             &setup.ctx(),
             &setup.session,
-            "DATA-1",
+            "acme/DATA-1",
             "w1",
             Some("coordinator"),
         )
@@ -1031,10 +1039,10 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(error.contains("not a worker profile"), "{error}");
-        worker_restart(&setup.ctx(), &setup.session, "DATA-1", "w1", None)
+        worker_restart(&setup.ctx(), &setup.session, "acme/DATA-1", "w1", None)
             .await
             .unwrap();
-        let error = worker_restart(&setup.ctx(), &setup.session, "DATA-1", "w1", None)
+        let error = worker_restart(&setup.ctx(), &setup.session, "acme/DATA-1", "w1", None)
             .await
             .unwrap_err()
             .to_string();
@@ -1046,7 +1054,7 @@ mod tests {
         let setup = Setup::new(|c| c);
         let w = setup.start("api", "standard").await.unwrap();
         let herdr = &setup.session.herdr;
-        let error = worker_prompt(&setup.ctx(), &setup.session, "DATA-1", "w1", "Hi")
+        let error = worker_prompt(&setup.ctx(), &setup.session, "acme/DATA-1", "w1", "Hi")
             .await
             .unwrap_err()
             .to_string();
@@ -1058,17 +1066,17 @@ mod tests {
             .agent_start(&w.agent.agent_name, "claude", &pane(&w.agent), &[])
             .await
             .unwrap();
-        herdr.set_status("data-1-w1", "blocked");
-        let error = worker_prompt(&setup.ctx(), &setup.session, "DATA-1", "w1", "Answer")
+        herdr.set_status("acme-data-1-w1", "blocked");
+        let error = worker_prompt(&setup.ctx(), &setup.session, "acme/DATA-1", "w1", "Answer")
             .await
             .unwrap_err()
             .to_string();
         assert!(error.contains("dialog"), "{error}");
-        herdr.set_status("data-1-w1", "working");
+        herdr.set_status("acme-data-1-w1", "working");
         worker_prompt(
             &setup.ctx(),
             &setup.session,
-            "DATA-1",
+            "acme/DATA-1",
             "w1",
             "Also add a test.\n",
         )
@@ -1083,7 +1091,7 @@ mod tests {
     async fn finish_waits_for_every_worker() {
         let setup = Setup::new(|c| c);
         let w = setup.start("api", "standard").await.unwrap();
-        let error = finish(&setup.ctx(), &setup.session, "DATA-1", "Done")
+        let error = finish(&setup.ctx(), &setup.session, "acme/DATA-1", "Done")
             .await
             .unwrap_err()
             .to_string();
@@ -1097,9 +1105,14 @@ mod tests {
             .await
             .unwrap();
         worker::update(&setup.run(), "w1", |w| w.report_hash = "h".into()).unwrap();
-        finish(&setup.ctx(), &setup.session, "DATA-1", " Opened the PR. ")
-            .await
-            .unwrap();
+        finish(
+            &setup.ctx(),
+            &setup.session,
+            "acme/DATA-1",
+            " Opened the PR. ",
+        )
+        .await
+        .unwrap();
         let ops: Vec<Op> = outbox::pending(&setup.run())
             .into_iter()
             .map(|(_, r)| r.op)
@@ -1120,7 +1133,7 @@ mod tests {
         assert!(setup.run().record().unwrap().finished);
 
         herdr.set_down(true);
-        let error = finish(&setup.ctx(), &setup.session, "DATA-1", "Again")
+        let error = finish(&setup.ctx(), &setup.session, "acme/DATA-1", "Again")
             .await
             .unwrap_err()
             .to_string();
@@ -1140,20 +1153,24 @@ mod tests {
             let mut byte = [0u8; 8];
             listener.recv(&mut byte).is_ok()
         };
-        say(&setup.ctx(), "DATA-1", "Working on it.").await.unwrap();
+        say(&setup.ctx(), "acme/DATA-1", "Working on it.")
+            .await
+            .unwrap();
         assert!(poked(), "say");
-        plan_set(&setup.ctx(), "DATA-1", "- [ ] One").await.unwrap();
+        plan_set(&setup.ctx(), "acme/DATA-1", "- [ ] One")
+            .await
+            .unwrap();
         assert!(poked(), "plan set");
         setup.start("api", "standard").await.unwrap();
         assert!(poked(), "worker start");
-        inbox_done(&setup.ctx(), "DATA-1", &[], true).unwrap();
+        inbox_done(&setup.ctx(), "acme/DATA-1", &[], true).unwrap();
         assert!(poked(), "inbox done");
     }
 
     #[tokio::test]
     async fn a_poke_without_a_ticker_is_ignored() {
         let setup = Setup::new(|c| c);
-        say(&setup.ctx(), "DATA-1", "Nobody listens.")
+        say(&setup.ctx(), "acme/DATA-1", "Nobody listens.")
             .await
             .unwrap();
     }
@@ -1163,18 +1180,24 @@ mod tests {
         let setup = Setup::new(|c| c);
         let run = setup.run();
         inbox::write(&run, "worker", "w1", "shown").unwrap();
-        context(&setup.ctx(), Some(&setup.session), "DATA-1")
+        context(&setup.ctx(), Some(&setup.session), "acme/DATA-1")
             .await
             .unwrap();
         let later = inbox::write(&run, "worker", "w2", "later").unwrap();
-        inbox_done(&setup.ctx(), "DATA-1", &[], true).unwrap();
+        inbox_done(&setup.ctx(), "acme/DATA-1", &[], true).unwrap();
         let left: Vec<String> = inbox::unhandled(&run).into_iter().map(|i| i.id).collect();
         assert_eq!(left, std::slice::from_ref(&later));
         assert_eq!(
             done_message(&run, 1),
             "1 item(s) handled; 1 new item(s) since your last context, run context"
         );
-        inbox_done(&setup.ctx(), "DATA-1", std::slice::from_ref(&later), false).unwrap();
+        inbox_done(
+            &setup.ctx(),
+            "acme/DATA-1",
+            std::slice::from_ref(&later),
+            false,
+        )
+        .unwrap();
         assert_eq!(done_message(&run, 1), "1 item(s) handled");
     }
 
@@ -1183,25 +1206,28 @@ mod tests {
         let setup = Setup::new(|c| c);
         let run = setup.run();
         let id = inbox::write(&run, "worker", "w1", "item").unwrap();
-        context(&setup.ctx(), Some(&setup.session), "DATA-1")
+        context(&setup.ctx(), Some(&setup.session), "acme/DATA-1")
             .await
             .unwrap();
         assert!(inbox::seen(&run).contains(&id));
-        context::<FakeHerdr>(&setup.ctx(), None, "DATA-1")
+        context::<FakeHerdr>(&setup.ctx(), None, "acme/DATA-1")
             .await
             .unwrap();
-        inbox_done(&setup.ctx(), "DATA-1", &[], true).unwrap();
+        inbox_done(&setup.ctx(), "acme/DATA-1", &[], true).unwrap();
         assert!(inbox::unhandled(&run).is_empty());
-        assert!(inbox_done(&setup.ctx(), "DATA-1", &[], false).is_err());
+        assert!(inbox_done(&setup.ctx(), "acme/DATA-1", &[], false).is_err());
 
         run.update(|r| r.status = Status::Detached).unwrap();
-        let error = say(&setup.ctx(), "DATA-1", "x")
+        let error = say(&setup.ctx(), "acme/DATA-1", "x")
             .await
             .unwrap_err()
             .to_string();
-        assert_eq!(error, "run DATA-1 is Detached; nothing more is done for it");
         assert_eq!(
-            say(&setup.ctx(), "DATA-1", " ")
+            error,
+            "run acme/DATA-1 is Detached; nothing more is done for it"
+        );
+        assert_eq!(
+            say(&setup.ctx(), "acme/DATA-1", " ")
                 .await
                 .unwrap_err()
                 .to_string(),

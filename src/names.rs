@@ -10,11 +10,12 @@ fn is_valid(name: &str) -> bool {
         && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
 }
 
-/// `<key>-<suffix>` with the key in lower case, for example
-/// `data-123-coordinator` or `data-123-w2`. When that is not a valid Herdr
-/// name, the key is replaced by a stand-in made from the issue UUID.
+/// `<key>-<suffix>` with the run key in lower case and its `/` as `-`, for
+/// example `acme-data-123-coordinator` or `acme-data-123-w2`. When that is not
+/// a valid Herdr name, the key is replaced by a stand-in made from the issue
+/// UUID.
 pub fn agent_name(key: &str, issue_id: &str, suffix: &str) -> String {
-    let plain = format!("{}-{suffix}", key.to_ascii_lowercase());
+    let plain = format!("{}-{suffix}", key.replace('/', "-").to_ascii_lowercase());
     if is_valid(&plain) {
         return plain;
     }
@@ -25,6 +26,14 @@ pub fn agent_name(key: &str, issue_id: &str, suffix: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn run_keys_become_names_with_their_workspace() {
+        assert_eq!(
+            agent_name("acme/DATA-123", "u-1", "coordinator"),
+            "acme-data-123-coordinator"
+        );
+    }
 
     #[test]
     fn names_use_the_lower_case_key() {

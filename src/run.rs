@@ -1,10 +1,12 @@
-//! Runs: one per Linear issue. A run folder under
-//! `$XDG_STATE_HOME/herdr-linear-agent/runs/<ISSUE-KEY>/` is the coordinator's
-//! working directory and holds everything the ticker needs to continue the run
-//! after a restart.
+//! Runs: one per Linear issue. A run is named by its key,
+//! `<workspace>/<ISSUE-KEY>` (for example `acme/DATA-1`), since issue keys of
+//! two workspaces may be the same. Its folder under
+//! `$XDG_STATE_HOME/herdr-linear-agent/runs/<workspace>/<ISSUE-KEY>/` is the
+//! coordinator's working directory and holds everything the ticker needs to
+//! continue the run after a restart.
 //!
 //! ```text
-//! runs/<ISSUE-KEY>/
+//! runs/<workspace>/<ISSUE-KEY>/
 //!   AGENTS.md, CLAUDE.md          the coordinator's priming (CLAUDE.md links to AGENTS.md)
 //!   issue.md                      the issue snapshot
 //!   conversation.md               replies from allowed users
@@ -35,14 +37,31 @@ pub const SUBDIRS: [&str; 6] = [
     ".claude",
 ];
 
+/// A workspace name from the config: a lower-case letter, then lower-case
+/// letters, digits or `-`, at most 16 characters. It is part of run keys,
+/// agent names and branch names.
+pub fn valid_workspace(name: &str) -> bool {
+    name.chars().next().is_some_and(|c| c.is_ascii_lowercase())
+        && name.len() <= 16
+        && name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
+/// A Linear team key: an upper-case letter, then upper-case letters or
+/// digits, at most 16 characters.
+pub fn valid_team_key(team: &str) -> bool {
+    team.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+        && team.len() <= 16
+        && team
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+}
+
 /// A Linear issue key: `TEAM-123`.
-pub fn validate_key(key: &str) -> Result<()> {
+pub fn validate_issue_key(key: &str) -> Result<()> {
     let ok = key.split_once('-').is_some_and(|(team, number)| {
-        team.chars().next().is_some_and(|c| c.is_ascii_uppercase())
-            && team
-                .chars()
-                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
-            && team.len() <= 16
+        valid_team_key(team)
             && !number.is_empty()
             && number.len() <= 12
             && number.chars().all(|c| c.is_ascii_digit())
@@ -51,6 +70,27 @@ pub fn validate_key(key: &str) -> Result<()> {
         bail!("`{key}` is not a Linear issue key (expected the form TEAM-123)");
     }
     Ok(())
+}
+
+/// The key of the run of `issue` (`TEAM-123`) in `workspace`.
+pub fn run_key(workspace: &str, issue: &str) -> String {
+    format!("{workspace}/{issue}")
+}
+
+/// A run key: `<workspace>/TEAM-123`.
+pub fn validate_key(key: &str) -> Result<()> {
+    let ok = key.split_once('/').is_some_and(|(workspace, issue)| {
+        valid_workspace(workspace) && validate_issue_key(issue).is_ok()
+    });
+    if !ok {
+        bail!("`{key}` is not a run key (expected the form workspace/TEAM-123)");
+    }
+    Ok(())
+}
+
+/// The workspace and the issue key of a valid run key.
+pub fn split_key(key: &str) -> (&str, &str) {
+    key.split_once('/').unwrap_or(("", key))
 }
 
 /// Where a run is in its life.
@@ -156,6 +196,8 @@ pub enum Interrupt {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(default)]
 pub struct RunRecord {
+    /// The config's name for the issue's Linear workspace.
+    pub workspace: String,
     pub issue_id: String,
     pub identifier: String,
     pub title: String,
@@ -228,12 +270,23 @@ impl Run {
 
     /// Every run folder with a record, sorted by key.
     pub fn list(runs_dir: &Path) -> Vec<Run> {
-        let Ok(entries) = std::fs::read_dir(runs_dir) else {
-            return Vec::new();
+        let names = |dir: &Path| -> Vec<String> {
+            std::fs::read_dir(dir)
+                .map(|entries| {
+                    entries
+                        .flatten()
+                        .filter_map(|e| e.file_name().into_string().ok())
+                        .collect()
+                })
+                .unwrap_or_default()
         };
-        let mut runs: Vec<Run> = entries
-            .flatten()
-            .filter_map(|e| e.file_name().into_string().ok())
+        let mut runs: Vec<Run> = names(runs_dir)
+            .into_iter()
+            .flat_map(|workspace| {
+                names(&runs_dir.join(&workspace))
+                    .into_iter()
+                    .map(move |issue| run_key(&workspace, &issue))
+            })
             .filter_map(|key| Run::load(runs_dir, &key).ok())
             .collect();
         runs.sort_by(|a, b| a.key.cmp(&b.key));
@@ -242,7 +295,7 @@ impl Run {
 
     /// Creates the run folder and its first record.
     pub fn create(runs_dir: &Path, record: RunRecord) -> Result<Run> {
-        let run = Self::at(runs_dir, &record.identifier)?;
+        let run = Self::at(runs_dir, &run_key(&record.workspace, &record.identifier))?;
         if run.record_path().exists() {
             bail!("a run for {} already exists", run.key);
         }
@@ -430,27 +483,57 @@ mod tests {
 
     #[test]
     fn keys_are_validated_before_any_path_is_built() {
-        for good in ["DATA-1", "A1B-123456"] {
+        for good in ["acme/DATA-1", "a-1/A1B-123456"] {
             assert!(validate_key(good).is_ok(), "{good}");
         }
         for bad in [
             "",
-            "data-1",
-            "DATA",
-            "DATA-",
-            "-1",
+            "DATA-1",
+            "acme/data-1",
+            "acme/DATA",
+            "acme/DATA-",
+            "acme/-1",
             "../DATA-1",
-            "DATA-1/x",
-            "DATA-1a",
+            "acme/../DATA-1",
+            "acme/DATA-1/x",
+            "acme/DATA-1a",
+            "Acme/DATA-1",
+            "1acme/DATA-1",
+            "acme-with-a-long-name/DATA-1",
         ] {
             assert!(validate_key(bad).is_err(), "{bad}");
         }
+        assert_eq!(
+            validate_key("DATA-1").unwrap_err().to_string(),
+            "`DATA-1` is not a run key (expected the form workspace/TEAM-123)"
+        );
+        assert_eq!(split_key("acme/DATA-1"), ("acme", "DATA-1"));
+    }
+
+    #[test]
+    fn runs_of_two_workspaces_with_the_same_issue_key_are_apart() {
+        let dir = tempfile::tempdir().unwrap();
+        for workspace in ["beta", "acme"] {
+            Run::create(
+                dir.path(),
+                RunRecord {
+                    workspace: workspace.into(),
+                    identifier: "DATA-1".into(),
+                    ..RunRecord::default()
+                },
+            )
+            .unwrap();
+        }
+        let keys: Vec<String> = Run::list(dir.path()).into_iter().map(|r| r.key).collect();
+        assert_eq!(keys, ["acme/DATA-1", "beta/DATA-1"]);
+        assert!(dir.path().join("acme/DATA-1/.state/run.json").is_file());
     }
 
     #[test]
     fn a_record_with_an_older_builds_routing_fields_still_reads() {
         let dir = tempfile::tempdir().unwrap();
         let record = RunRecord {
+            workspace: "acme".into(),
             identifier: "DATA-1".into(),
             ..RunRecord::default()
         };
@@ -472,6 +555,7 @@ mod tests {
     fn runs_are_created_listed_and_updated_under_the_lock() {
         let dir = tempfile::tempdir().unwrap();
         let record = RunRecord {
+            workspace: "acme".into(),
             identifier: "DATA-1".into(),
             title: "First".into(),
             ..RunRecord::default()
@@ -483,7 +567,10 @@ mod tests {
         }
         run.update(|r| r.session_id = "s".into()).unwrap();
         run.update(|r| r.finished = true).unwrap();
-        let loaded = Run::load(dir.path(), "DATA-1").unwrap().record().unwrap();
+        let loaded = Run::load(dir.path(), "acme/DATA-1")
+            .unwrap()
+            .record()
+            .unwrap();
         assert_eq!(
             (
                 loaded.session_id.as_str(),

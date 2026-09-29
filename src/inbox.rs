@@ -255,6 +255,7 @@ summary = \"w1 (testing) is idle without a report; check its pane wH:p1.\"
         let run = Run::create(
             home.path(),
             RunRecord {
+                workspace: "acme".into(),
                 identifier: "DATA-7".into(),
                 issue_id: "issue-7".into(),
                 ..RunRecord::default()

@@ -8,7 +8,7 @@ use anyhow::{Context, Result, bail};
 use crate::config::Config;
 use crate::herdr::{self, Client, Herdr, HerdrError, WorkspaceId};
 use crate::linear::client::LinearApi;
-use crate::linear::credentials::{CredentialManager, CredentialStatus};
+use crate::linear::credentials::{self, CredentialManager, CredentialStatus};
 use crate::linear::transport::RateHeaders;
 use crate::paths::Ctx;
 use crate::process::Cmd;
@@ -56,9 +56,14 @@ pub enum Action {
     Doctor,
 }
 
-pub async fn run(ctx: &Ctx<'_>, action: Action) -> Result<()> {
+/// `workspace` names the one workspace `login` logs in to again; the other
+/// actions take none.
+pub async fn run(ctx: &Ctx<'_>, action: Action, workspace: Option<&str>) -> Result<()> {
+    if workspace.is_some() && !matches!(action, Action::Login) {
+        bail!("--workspace applies only to the login action");
+    }
     let result = match action {
-        Action::Login => login(ctx).await,
+        Action::Login => login(ctx, workspace).await,
         Action::Status => Ok(status_text(ctx)),
         Action::OpenIssue => open_issue(ctx).await,
         Action::FocusRun => focus_run(ctx).await,
@@ -78,20 +83,78 @@ pub async fn run(ctx: &Ctx<'_>, action: Action) -> Result<()> {
     }
 }
 
-fn credential_lock(ctx: &Ctx) -> Result<std::path::PathBuf> {
-    Ok(ctx.ensure_state_dir()?.join("credentials.lock"))
+/// The workspace's stored credential, read without the network.
+async fn credential_status(
+    ctx: &Ctx<'_>,
+    name: &str,
+) -> Result<CredentialStatus, credentials::CredentialError> {
+    let (name, lock) = (
+        name.to_string(),
+        credentials::lock_path(&ctx.state_dir(), name),
+    );
+    blocking(move || CredentialManager::production_status(&name, lock).map(|mut m| m.status()))
+        .await
 }
 
-/// Authorizes the app in the browser, stores the token in the Keychain and
-/// checks that the token acts as an app user. A stored credential is revoked
-/// and replaced.
-async fn login(ctx: &Ctx<'_>) -> Result<String> {
+fn stored(status: &Result<CredentialStatus, credentials::CredentialError>) -> bool {
+    matches!(
+        status,
+        Ok(CredentialStatus::Ready | CredentialStatus::ExpiredOrRefreshNeeded)
+    )
+}
+
+/// Logs in to `only`, or else to every workspace without a stored
+/// credential, or to all of them again when each has one. Each login opens
+/// the browser in turn.
+async fn login(ctx: &Ctx<'_>, only: Option<&str>) -> Result<String> {
     let config = Config::load(&ctx.config_dir())?;
-    let lock = credential_lock(ctx)?;
-    let (client_id, port) = (config.linear.client_id.clone(), config.linear.callback_port);
-    let login_lock = lock.clone();
+    let names: Vec<String> = match only {
+        Some(name) => {
+            config.workspace(name)?;
+            vec![name.to_string()]
+        }
+        None => {
+            let mut missing = Vec::new();
+            for name in config.workspaces.keys() {
+                if !stored(&credential_status(ctx, name).await) {
+                    missing.push(name.clone());
+                }
+            }
+            if missing.is_empty() {
+                config.workspaces.keys().cloned().collect()
+            } else {
+                missing
+            }
+        }
+    };
+    let mut lines = Vec::new();
+    for name in &names {
+        let line = login_workspace(ctx, name, config.workspace(name)?)
+            .await
+            .with_context(|| format!("workspace `{name}`"))?;
+        lines.push(line);
+    }
+    ticker::start(ctx).await?;
+    Ok(lines.join("\n"))
+}
+
+/// Authorizes the workspace's app in the browser, stores the token and checks
+/// that the token acts as an app user. A stored credential is revoked and
+/// replaced.
+async fn login_workspace(
+    ctx: &Ctx<'_>,
+    name: &str,
+    workspace: &crate::config::Workspace,
+) -> Result<String> {
+    let state_dir = ctx.ensure_state_dir()?;
+    let lock = credentials::lock_path(&state_dir, name);
+    let (account, client_id, port) = (
+        name.to_string(),
+        workspace.client_id.clone(),
+        workspace.callback_port,
+    );
     blocking(move || -> Result<()> {
-        let mut manager = CredentialManager::production(client_id, port, login_lock)?;
+        let mut manager = CredentialManager::production(&account, client_id, port, lock)?;
         if manager.status() != CredentialStatus::SignedOut {
             manager
                 .logout(true)
@@ -101,16 +164,10 @@ async fn login(ctx: &Ctx<'_>) -> Result<String> {
         Ok(())
     })
     .await?;
-    let linear = crate::linear::client::Client::production(
-        config.linear.client_id.clone(),
-        config.linear.callback_port,
-        lock,
-    )
-    .await?;
+    let linear = crate::linear::client::Client::production(name, workspace, &state_dir).await?;
     let viewer = linear.viewer().await?;
-    ticker::start(ctx).await?;
     Ok(format!(
-        "Logged in to Linear as the app user {}.",
+        "Logged in to the Linear workspace `{name}` as the app user {}.",
         if viewer.name.is_empty() {
             viewer.id
         } else {
@@ -171,7 +228,7 @@ pub fn status_text(ctx: &Ctx) -> String {
         };
         lines.push(format!(
             "{} {:?}{finished}: {coordinator}{workers}",
-            record.identifier, record.status
+            run.key, record.status
         ));
     }
     lines.join("\n")
@@ -227,11 +284,13 @@ async fn open_issue(ctx: &Ctx<'_>) -> Result<String> {
     Ok(format!("Opened {} in the browser.", record.identifier))
 }
 
-/// The issue key in a Linear issue URL.
-pub fn key_from_url(url: &str) -> Option<String> {
+/// The organization's URL key and the issue key in a Linear issue URL.
+pub fn issue_from_url(url: &str) -> Option<(String, String)> {
     let rest = url.strip_prefix("https://linear.app/")?;
-    let key = rest.split('/').nth(2)?;
-    crate::run::validate_key(key).ok().map(|_| key.to_string())
+    let mut parts = rest.split('/');
+    let (organization, kind, key) = (parts.next()?, parts.next()?, parts.next()?);
+    (kind == "issue" && !organization.is_empty() && crate::run::validate_issue_key(key).is_ok())
+        .then(|| (organization.to_string(), key.to_string()))
 }
 
 async fn focus_run(ctx: &Ctx<'_>) -> Result<String> {
@@ -239,10 +298,15 @@ async fn focus_run(ctx: &Ctx<'_>) -> Result<String> {
         .env
         .var("HERDR_PLUGIN_CLICKED_URL")
         .context("Ctrl-click a Linear issue link to focus its run")?;
-    let key = key_from_url(url).with_context(|| format!("{url} is not a Linear issue URL"))?;
-    let run =
-        Run::load(&ctx.runs_dir(), &key).with_context(|| format!("there is no run for {key}"))?;
-    let record = run.record()?;
+    let issue = issue_from_url(url).with_context(|| format!("{url} is not a Linear issue URL"))?;
+    // Issue keys repeat across workspaces; the organization in the URL tells
+    // them apart.
+    let (run, record) = Run::list(&ctx.runs_dir())
+        .into_iter()
+        .filter_map(|run| run.record().ok().map(|record| (run, record)))
+        .find(|(_, record)| issue_from_url(&record.url).as_ref() == Some(&issue))
+        .with_context(|| format!("there is no run for {}", issue.1))?;
+    let key = run.key;
     if record.coordinator.workspace_id.is_empty() {
         bail!("{key} has no coordinator workspace yet");
     }
@@ -298,14 +362,14 @@ async fn herdr_version(client: Client) -> (Option<String>, Option<HerdrError>) {
 
 /// The budget one viewer read reports; `None` when the read fails or a
 /// value is missing.
-async fn linear_budget(ctx: &Ctx<'_>, config: &Config) -> Option<String> {
-    let linear = crate::linear::client::Client::production(
-        config.linear.client_id.clone(),
-        config.linear.callback_port,
-        ctx.state_dir().join("credentials.lock"),
-    )
-    .await
-    .ok()?;
+async fn linear_budget(
+    ctx: &Ctx<'_>,
+    name: &str,
+    workspace: &crate::config::Workspace,
+) -> Option<String> {
+    let linear = crate::linear::client::Client::production(name, workspace, &ctx.state_dir())
+        .await
+        .ok()?;
     linear.viewer().await.ok()?;
     let mut budget = RateHeaders::default();
     for headers in linear.take_headers() {
@@ -380,32 +444,27 @@ async fn doctor(ctx: &Ctx<'_>) -> Result<String> {
                 ));
             }
         }
-        let lock = ctx.state_dir().join("credentials.lock");
-        let status =
-            blocking(move || CredentialManager::production_status(lock).map(|mut m| m.status()))
-                .await;
-        let stored = matches!(
-            status,
-            Ok(CredentialStatus::Ready | CredentialStatus::ExpiredOrRefreshNeeded)
-        );
-        match status {
-            Ok(CredentialStatus::Ready | CredentialStatus::ExpiredOrRefreshNeeded) => {
-                ok.push("Linear credential stored".into())
+        for (name, workspace) in &config.workspaces {
+            let status = credential_status(ctx, name).await;
+            match &status {
+                Ok(CredentialStatus::Ready | CredentialStatus::ExpiredOrRefreshNeeded) => {
+                    ok.push(format!("Linear `{name}`: credential stored"))
+                }
+                Ok(other) => problems.push(format!(
+                    "Linear `{name}`: credential is {other}; run the login action"
+                )),
+                Err(error) => problems.push(format!("Linear `{name}`: credential: {error}")),
             }
-            Ok(other) => problems.push(format!(
-                "Linear credential is {other}; run the login action"
-            )),
-            Err(error) => problems.push(format!("Linear credential: {error}")),
+            let budget = if stored(&status) {
+                linear_budget(ctx, name, workspace).await
+            } else {
+                None
+            };
+            ok.push(format!(
+                "Linear `{name}`: budget {}",
+                budget.as_deref().unwrap_or("unknown")
+            ));
         }
-        let budget = if stored {
-            linear_budget(ctx, config).await
-        } else {
-            None
-        };
-        ok.push(format!(
-            "Linear budget: {}",
-            budget.as_deref().unwrap_or("unknown")
-        ));
     }
     match ticker::lock_state(&ctx.state_dir()) {
         ticker::LockState::Held(info) if info.version == crate::VERSION => {
@@ -445,18 +504,19 @@ mod tests {
     use crate::run::RunRecord;
 
     #[test]
-    fn issue_urls_give_their_key() {
+    fn issue_urls_give_their_organization_and_key() {
+        let issue = |org: &str, key: &str| Some((org.to_string(), key.to_string()));
         assert_eq!(
-            key_from_url("https://linear.app/acme/issue/DATA-12/fix-login"),
-            Some("DATA-12".into())
+            issue_from_url("https://linear.app/acme/issue/DATA-12/fix-login"),
+            issue("acme", "DATA-12")
         );
         assert_eq!(
-            key_from_url("https://linear.app/acme/issue/DATA-12"),
-            Some("DATA-12".into())
+            issue_from_url("https://linear.app/beta/issue/DATA-12"),
+            issue("beta", "DATA-12")
         );
-        assert_eq!(key_from_url("https://linear.app/acme/project/x"), None);
+        assert_eq!(issue_from_url("https://linear.app/acme/project/x"), None);
         assert_eq!(
-            key_from_url("https://evil.example/acme/issue/DATA-12"),
+            issue_from_url("https://evil.example/acme/issue/DATA-12"),
             None
         );
     }
@@ -476,6 +536,7 @@ mod tests {
         let run = Run::create(
             &ctx.runs_dir(),
             RunRecord {
+                workspace: "acme".into(),
                 identifier: "DATA-1".into(),
                 ..RunRecord::default()
             },
@@ -503,10 +564,10 @@ mod tests {
             text.contains("DATA-1 Active: coordinator idle; w1 working (api)"),
             "{text}"
         );
-        assert_eq!(run_for_cwd(&ctx, "/wt/api/src").unwrap().key, "DATA-1");
+        assert_eq!(run_for_cwd(&ctx, "/wt/api/src").unwrap().key, "acme/DATA-1");
         assert_eq!(
             run_for_cwd(&ctx, "/state/runs/DATA-1").unwrap().key,
-            "DATA-1"
+            "acme/DATA-1"
         );
         assert!(run_for_cwd(&ctx, "/elsewhere").is_none());
 
@@ -524,7 +585,7 @@ mod tests {
         let coordinator = crate::run::AgentRecord {
             status: AgentStatus::Open,
             kind: "claude".into(),
-            agent_name: "data-1-coordinator".into(),
+            agent_name: "acme-data-1-coordinator".into(),
             pane_id: "w1:p1".into(),
             // Recorded before Herdr renumbered the workspace.
             workspace_id: "w9".into(),
@@ -533,7 +594,7 @@ mod tests {
         };
         focus_coordinator(&herdr, &coordinator).await.unwrap();
         herdr
-            .agent_start("data-1-coordinator", "claude", &placed.pane, &[])
+            .agent_start("acme-data-1-coordinator", "claude", &placed.pane, &[])
             .await
             .unwrap();
         focus_coordinator(&herdr, &coordinator).await.unwrap();

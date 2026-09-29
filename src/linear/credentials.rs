@@ -11,8 +11,10 @@
 //! environment variable, or secret.
 //!
 //! Ported from Nagi (`crates/nagi/src/linear/credentials.rs` at `ee7d657`).
-//! The secret's service name is `dev.herdr-linear-agent.linear.oauth.v1`, and
-//! the advisory lock file lives in `$XDG_STATE_HOME/herdr-linear-agent/`.
+//! The secret's service name is `dev.herdr-linear-agent.linear.oauth.v1`, with
+//! one account per Linear workspace named after the workspace in the config,
+//! and each workspace's advisory lock file lives in
+//! `$XDG_STATE_HOME/herdr-linear-agent/` (see [`lock_path`]).
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use crate::linear::oauth::{self, OAuthConfig};
@@ -30,7 +32,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer as SerdeSerializer}
 use std::fmt;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::io::{self, Read};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::sync::MutexGuard;
 #[cfg(any(test, target_os = "macos", target_os = "linux"))]
@@ -64,6 +66,12 @@ const REVOKE_ENDPOINT: &str = "https://api.linear.app/oauth/revoke";
 static PROCESS_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 #[cfg(any(test, target_os = "macos", target_os = "linux"))]
+/// A workspace's advisory lock file: `credentials-<workspace>.lock` in the
+/// state dir.
+pub fn lock_path(state_dir: &Path, workspace: &str) -> PathBuf {
+    state_dir.join(format!("credentials-{workspace}.lock"))
+}
+
 fn process_lock() -> &'static Mutex<()> {
     PROCESS_LOCK.get_or_init(|| Mutex::new(()))
 }
@@ -620,7 +628,6 @@ mod keychain {
     use security_framework_sys::base::{errSecDuplicateItem, errSecItemNotFound, errSecParam};
 
     const KEYCHAIN_SERVICE: &str = "dev.herdr-linear-agent.linear.oauth.v1";
-    const KEYCHAIN_ACCOUNT: &str = "default";
 
     /// Generic-password store backed by the user's default file-based
     /// Keychain (normally the login Keychain).
@@ -637,8 +644,9 @@ mod keychain {
     }
 
     impl KeychainStore {
-        pub fn production() -> Result<Self, SecurityError> {
-            Self::new(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)
+        /// The item of one workspace: the account is the workspace's name.
+        pub fn production(account: &str) -> Result<Self, SecurityError> {
+            Self::new(KEYCHAIN_SERVICE, account)
         }
 
         fn new(service: &str, account: &str) -> Result<Self, SecurityError> {
@@ -758,9 +766,9 @@ mod keychain {
 }
 
 #[cfg(target_os = "macos")]
-fn platform_store() -> Result<Box<dyn CredentialStore>, CredentialError> {
+fn platform_store(account: &str) -> Result<Box<dyn CredentialStore>, CredentialError> {
     Ok(Box::new(
-        keychain::KeychainStore::production().map_err(|_| CredentialError::Storage)?,
+        keychain::KeychainStore::production(account).map_err(|_| CredentialError::Storage)?,
     ))
 }
 
@@ -774,13 +782,24 @@ mod secret_store {
     use std::collections::HashMap;
 
     const SERVICE: &str = "dev.herdr-linear-agent.linear.oauth.v1";
-    const ACCOUNT: &str = "default";
     const LABEL: &str = "herdr-linear-agent Linear OAuth credential";
 
-    pub struct SecretServiceStore;
+    /// The secret of one workspace: the account is the workspace's name.
+    pub struct SecretServiceStore {
+        pub account: String,
+    }
 
-    fn attributes() -> HashMap<&'static str, &'static str> {
-        HashMap::from([("service", SERVICE), ("account", ACCOUNT)])
+    impl SecretServiceStore {
+        fn attributes(&self) -> HashMap<&str, &str> {
+            HashMap::from([("service", SERVICE), ("account", self.account.as_str())])
+        }
+
+        fn items<'a>(&self, service: &'a SecretService<'a>) -> Result<Vec<Item<'a>>, StoreError> {
+            let found = service
+                .search_items(self.attributes())
+                .map_err(|_| StoreError::Unavailable)?;
+            Ok(found.unlocked.into_iter().chain(found.locked).collect())
+        }
     }
 
     // Error details stay out of logs and public errors, as for the Keychain.
@@ -788,17 +807,10 @@ mod secret_store {
         SecretService::connect(EncryptionType::Dh).map_err(|_| StoreError::Unavailable)
     }
 
-    fn items<'a>(service: &'a SecretService<'a>) -> Result<Vec<Item<'a>>, StoreError> {
-        let found = service
-            .search_items(attributes())
-            .map_err(|_| StoreError::Unavailable)?;
-        Ok(found.unlocked.into_iter().chain(found.locked).collect())
-    }
-
     impl CredentialStore for SecretServiceStore {
         fn read(&mut self) -> Result<Option<Zeroizing<Vec<u8>>>, StoreError> {
             let service = connect()?;
-            let Some(item) = items(&service)?.into_iter().next() else {
+            let Some(item) = self.items(&service)?.into_iter().next() else {
                 return Ok(None);
             };
             item.unlock().map_err(|_| StoreError::Unavailable)?;
@@ -814,14 +826,20 @@ mod secret_store {
                 .map_err(|_| StoreError::Unavailable)?;
             collection.unlock().map_err(|_| StoreError::Unavailable)?;
             collection
-                .create_item(LABEL, attributes(), bytes, true, "application/octet-stream")
+                .create_item(
+                    LABEL,
+                    self.attributes(),
+                    bytes,
+                    true,
+                    "application/octet-stream",
+                )
                 .map(|_| ())
                 .map_err(|_| StoreError::Unavailable)
         }
 
         fn delete(&mut self) -> Result<(), StoreError> {
             let service = connect()?;
-            for item in items(&service)? {
+            for item in self.items(&service)? {
                 item.delete().map_err(|_| StoreError::Unavailable)?;
             }
             Ok(())
@@ -834,8 +852,10 @@ mod secret_store {
 }
 
 #[cfg(target_os = "linux")]
-fn platform_store() -> Result<Box<dyn CredentialStore>, CredentialError> {
-    Ok(Box::new(secret_store::SecretServiceStore))
+fn platform_store(account: &str) -> Result<Box<dyn CredentialStore>, CredentialError> {
+    Ok(Box::new(secret_store::SecretServiceStore {
+        account: account.to_owned(),
+    }))
 }
 
 trait WallClock {
@@ -1000,9 +1020,11 @@ impl fmt::Debug for CredentialManager {
 }
 
 impl CredentialManager {
-    /// Constructs the production manager. `lock_path` is the advisory
-    /// lock file, `$XDG_STATE_HOME/herdr-linear-agent/credentials.lock`.
+    /// Constructs the production manager for one workspace: `account` is its
+    /// name, which keys the stored secret, and `lock_path` its advisory lock
+    /// file (see [`lock_path`]).
     pub fn production(
+        account: &str,
         client_id: impl Into<String>,
         callback_port: u16,
         lock_path: PathBuf,
@@ -1017,7 +1039,7 @@ impl CredentialManager {
                 HttpsProviderTransport::new().map_err(|_| CredentialError::Configuration)?;
             Ok(Self {
                 client_id,
-                store: platform_store()?,
+                store: platform_store(account)?,
                 transport: Some(Box::new(transport)),
                 clock: Box::new(SystemWallClock),
                 critical_section: Box::new(SystemCriticalSection { lock_path }),
@@ -1026,7 +1048,7 @@ impl CredentialManager {
         }
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         {
-            let _ = (client_id, callback_port, lock_path);
+            let _ = (account, client_id, callback_port, lock_path);
             Err(CredentialError::UnsupportedPlatform)
         }
     }
@@ -1034,12 +1056,12 @@ impl CredentialManager {
     /// Constructs the production manager for local status inspection.  It
     /// installs no network-capable transport, because status is intentionally
     /// side-effect free.
-    pub fn production_status(lock_path: PathBuf) -> Result<Self, CredentialError> {
+    pub fn production_status(account: &str, lock_path: PathBuf) -> Result<Self, CredentialError> {
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         {
             Ok(Self {
                 client_id: String::new(),
-                store: platform_store()?,
+                store: platform_store(account)?,
                 transport: None,
                 clock: Box::new(SystemWallClock),
                 critical_section: Box::new(SystemCriticalSection { lock_path }),
@@ -1048,7 +1070,7 @@ impl CredentialManager {
         }
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         {
-            let _ = lock_path;
+            let _ = (account, lock_path);
             Err(CredentialError::UnsupportedPlatform)
         }
     }

@@ -5,7 +5,7 @@ This document is the behavior specification for the async (tokio) rewrite of her
 Conventions:
 
 - `tests/<file>:<test>` cites a test in `tests/` that pins the rule. `src/<file>:<test>` cites a test inside a kept module. Port every cited test.
-- Literal strings are in code spans and must be reproduced byte for byte. `<KEY>` is the issue key (for example `DATA-1`), `<key>` is its lower-case form, `<id>` is a worker id (`w1`), `<bin>` is the shell-quoted absolute path of the binary.
+- Literal strings are in code spans and must be reproduced byte for byte. `<KEY>` is the run key, the config's workspace name and the issue key (for example `acme/DATA-1`); `<ISSUE>` is the issue key alone (`DATA-1`); `<key>` is the run key in lower case (`acme/data-1`); `<id>` is a worker id (`w1`), `<bin>` is the shell-quoted absolute path of the binary.
 - Two literals contain characters that are shown here by code point: the digest's catalog separator is written `<U+2014>`, and the pane display separator `·` is U+00B7.
 - "Pass" means one reconciliation of one run (see [The ticker process](#the-ticker-process)). The tests count ticks; in the rewrite they count passes or wait until the ticker is quiescent.
 
@@ -80,13 +80,14 @@ File: `<config_dir>/config.toml`. Unknown keys are refused in every table. The k
 
 | Key | Type | Default | Validation |
 | --- | --- | --- | --- |
-| `linear.client_id` | string | required | not blank: `linear.client_id is empty` |
-| `linear.callback_port` | u16 | `43871` | not 0: `linear.callback_port may not be 0` |
-| `linear.teams` | list of team keys | required | non-empty: `linear.teams lists no team` |
-| `linear.allowed_user_ids` | list | `[]` | |
-| `linear.review_state` | string | `In Review` | not blank: `linear.review_state is empty` |
-| `linear.intake_interval_seconds` (new, name proposed) | u64 | `5` | at least 1 |
-| `linear.run_read_interval_seconds` (new, name proposed) | u64 | `5` | at least 1 |
+| `workspaces` | table of workspaces by name | required | at least one: `no workspace is configured`; a name is a lower-case letter, then lower-case letters, digits or `-`, at most 16 characters: ``workspace name `<name>` may use only lower-case letters, digits and `-`, start with a letter, and have at most 16 characters`` |
+| `workspaces.<name>.client_id` | string | required | not blank: `workspaces.<name>.client_id is empty` |
+| `workspaces.<name>.callback_port` | u16 | `43871` | not 0: `workspaces.<name>.callback_port may not be 0` |
+| `workspaces.<name>.intake_interval_seconds` | u64 | `5` | 1 to 3600: `workspaces.<name>.intake_interval_seconds must be between 1 and 3600` |
+| `workspaces.<name>.run_read_interval_seconds` | u64 | `5` | 1 to 3600, likewise |
+| `workspaces.<name>.teams` | table of teams by team key | required | non-empty: `workspaces.<name>.teams lists no team`; a key is a Linear team key: ``workspaces.<name>.teams.<key>: `<key>` is not a Linear team key`` |
+| `workspaces.<name>.teams.<key>.allowed_user_ids` | list | `[]` | whose replies in that team's sessions reach the coordinator |
+| `workspaces.<name>.teams.<key>.review_state` | string | `In Review` | not blank: `workspaces.<name>.teams.<key>.review_state is empty`; where `finish` moves that team's issues |
 | `herdr.session` | string | unset: Herdr's default session | |
 | `limits.max_runs` | u32 | `2` | the three limits must satisfy `max_runs >= 1`, `max_workers_per_run >= 1`, `max_agents >= 2`: `limits must allow one run with one worker` |
 | `limits.max_workers_per_run` | u32 | `4` | |
@@ -117,6 +118,8 @@ Profiles are not in `config.toml`: a `profiles` key there is refused with `profi
 
 Reading the folders (`load_profiles`): a missing `profiles` folder gives no profiles; entries starting with `.` are skipped; symbolic links are followed; any other file in `profiles/` is refused with `<path> is not a folder: each profile is a folder with a config.toml`; a folder without `config.toml` gives `could not read <path>`; other files inside a profile folder are left alone. `src/config.rs:profiles_come_from_their_folders`, `src/config.rs:profiles_live_only_in_their_folders`
 
+**Spec change:** `[linear]` is replaced by `[workspaces.<name>]`, one per Linear workspace with its own OAuth application, and its teams by `[workspaces.<name>.teams.<key>]`, each with its own allowed users and review state. The same team key may appear in two workspaces. `config.workspace(name)` fails with ``no workspace named `<name>` in the config``, `config.team(workspace, key)` with ``team `<key>` is not configured in workspace `<workspace>` ``. `src/config.rs:workspaces_and_their_teams_have_their_own_settings`, `tests/scenarios:two_workspaces_with_the_same_issue_key_run_apart_under_their_own_team_rules`
+
 **Spec change:** the size-based routing (`routing.size_label_group`, `[routing.agent]`, `[[routing.rules]]`) is removed; a config that still has those keys is refused as having unknown fields.
 
 Rules:
@@ -129,7 +132,7 @@ Rules:
 - `src/config.rs:a_routing_agent_must_be_a_registered_kind`
 - Pinned by `src/config.rs:the_sample_parses_with_defaults` and `src/config.rs:invalid_configs_are_refused`.
 
-The shared test config (`SAMPLE`, with its profile folders in `SAMPLE_PROFILES`) has teams `["DATA"]`, allowed user `user-1`, session `work`, repositories `api` (`/src/api`, base `main`, description `The API server`) and `web` (`/src/web`, base `develop`), profiles `coordinator` (claude opus high, `--permission-mode auto`), `coordinator-light` (claude sonnet, with instructions), `router` (claude haiku), `standard` (claude sonnet high, `--permission-mode auto`), `deep` (codex gpt-6-sol xhigh, `-s workspace-write`), routing agent `router`, candidates `coordinator, coordinator-light`, default `coordinator`, timeout 60 s, workers `standard, deep`. The World's fake `claude` routing agent picks `coordinator` unless a test replaces it. The rewrite keeps it and adds the new interval keys only through defaults.
+The shared test config (`SAMPLE`, with its profile folders in `SAMPLE_PROFILES`) has one workspace `acme` (client `client-123`) with the team `DATA` (allowed user `user-1`, review state `In Review`), session `work`, repositories `api` (`/src/api`, base `main`, description `The API server`) and `web` (`/src/web`, base `develop`), profiles `coordinator` (claude opus high, `--permission-mode auto`), `coordinator-light` (claude sonnet, with instructions), `router` (claude haiku), `standard` (claude sonnet high, `--permission-mode auto`), `deep` (codex gpt-6-sol xhigh, `-s workspace-write`), routing agent `router`, candidates `coordinator, coordinator-light`, default `coordinator`, timeout 60 s, workers `standard, deep`. The World's fake `claude` routing agent picks `coordinator` unless a test replaces it. The rewrite keeps it and adds the new interval keys only through defaults.
 
 ## Run folder layout and state files
 
@@ -137,14 +140,14 @@ State directory:
 
 ```text
 <state_dir>/
-  runs/<KEY>/                 one run per Linear issue
+  runs/<KEY>/                 one run per Linear issue: runs/<workspace>/<ISSUE>/
   ticker.lock                 the ticker's lock and its {"version","pid"}
   ticker.log                  the ticker's log, capped
   ticker.sock                 the datagram socket subcommands poke the ticker through
   <stop file>                 asks the running ticker to exit (name: open question)
   paused                      intake is paused while this file exists
   progress/                   progress records written by `report`
-  credentials.lock            the Linear credential lock
+  credentials-<workspace>.lock  a workspace's Linear credential lock
 ```
 
 Run folder (`src/run.rs`):
@@ -172,8 +175,8 @@ runs/<KEY>/
 Rules:
 
 - `Run::create` makes the subdirectories `workers`, `inbox`, `inbox/done`, `.state`, `.state/outbox`, `.claude`, then writes the first record. A second create for the same key fails: `a run for <KEY> already exists`. `src/run.rs:runs_are_created_listed_and_updated_under_the_lock`
-- `Run::load` fails with `there is no run for <KEY>` when `.state/run.json` is missing. `Run::list` returns every folder with a record, sorted by key.
-- The key is validated before any path is built: `TEAM-NUMBER`, team starts with an ASCII upper-case letter, then upper-case letters or digits, at most 16 characters; number 1 to 12 digits. Error: ``\`<key>\` is not a Linear issue key (expected the form TEAM-123)``. `src/run.rs:keys_are_validated_before_any_path_is_built`
+- `Run::load` fails with `there is no run for <KEY>` when `.state/run.json` is missing. `Run::list` returns every `runs/<workspace>/<ISSUE>` folder with a record, sorted by key. `src/run.rs:runs_of_two_workspaces_with_the_same_issue_key_are_apart`
+- The run key is validated before any path is built: `<workspace>/<ISSUE>`. The workspace is a lower-case ASCII letter, then lower-case letters, digits or `-`, at most 16 characters. The issue key is `TEAM-NUMBER`: the team starts with an ASCII upper-case letter, then upper-case letters or digits, at most 16 characters; the number has 1 to 12 digits. Errors: ``\`<key>\` is not a run key (expected the form workspace/TEAM-123)``, and for an issue key alone (a claim, a URL) ``\`<key>\` is not a Linear issue key (expected the form TEAM-123)``. `src/run.rs:keys_are_validated_before_any_path_is_built`
 - The run lock is an exclusive file lock on `.state/lock`. It is held while reading and rewriting anything under `workers/`, `inbox/` or `.state/`, and never across a Herdr, git or Linear call. In the async rewrite, take it on a blocking thread or with an async file lock; never hold it across an `.await` on I/O to Herdr, git or Linear.
 - `update(change)` is a read-modify-write of the record under the lock; each step changes only the fields it owns.
 - A Linear write the reconciler queues is pushed in the same critical section (one hold of the run lock) that stores the field guarding it (`report_hash`, `pr_url`, `blocked_reported`, `gone_reported`, `coordinator_lost`, `timeout_asked`, `prompt_cursor`, `announce_pending`, the coordinator profile, `prompt_pending`), so a failure later in the pass never sends it twice. `tests/scenarios:a_pull_request_goes_out_once_while_a_later_write_of_the_pass_fails`
@@ -184,6 +187,7 @@ Run record (`run.json`), every field defaulted when missing:
 
 | Field | Meaning |
 | --- | --- |
+| `workspace` | the config's name for the issue's Linear workspace; with `identifier` it makes the run key |
 | `issue_id`, `identifier`, `title`, `url`, `team_key` | the issue |
 | `labels` | label names |
 | `session_id` | the Agent Session; empty until one is opened |
@@ -203,7 +207,7 @@ Run record (`run.json`), every field defaulted when missing:
 | `coordinator_lost` | the coordinator's pane is gone and the resume question was asked |
 | `stopped` | a person pressed stop; no prompt or heartbeat goes out until they reply |
 | `interrupt` | `stop` or `detach`: Escape keys still owed to the run's agents, sent by the first pass with a snapshot |
-| `announce_pending` | the claim's `Picked up <KEY>.` thought is not queued yet; missing in an older record, which reads as announced |
+| `announce_pending` | the claim's `Picked up <ISSUE>.` thought is not queued yet; missing in an older record, which reads as announced |
 
 Agent record (coordinator and every worker's `agent`):
 
@@ -255,7 +259,7 @@ Issue snapshot `issue.md` (`issue_markdown`):
 
 Agent names (`names`):
 
-- Coordinator: `<key>-coordinator`. Worker: `<key>-<id>`. Example: `data-123-coordinator`, `data-123-w2`.
+- Coordinator: `<key>-coordinator`. Worker: `<key>-<id>`, with the run key's `/` as `-`. Example: `acme-data-123-coordinator`, `acme-data-123-w2`. `src/names.rs:run_keys_become_names_with_their_workspace`
 - A valid name matches `[a-z][a-z0-9_-]{0,31}`. `Hla-x` and the empty string are invalid.
 - When the lower-case form is invalid (longer than 32 characters, or the key starts with a digit), the key part becomes `i` plus the first 8 hex characters of the SHA-256 of the issue UUID. `VERYLONGTEAMKEY-123456` gives `i<8 hex>-coordinator`. `tests/names:names_are_lower_case_and_fall_back_to_a_hash`
 
@@ -418,7 +422,7 @@ Once per pass the reconciler drops what its in-memory maps (launched starts, Not
 
 | Line | When |
 | --- | --- |
-| `Linear is not available: <error>; run the login action` | the credential cannot be used; logged once |
+| `<workspace>: Linear is not available: <error>; run the login action` | the workspace's credential cannot be used; logged once |
 | `intake: <error>` | the delegated-issue poll failed |
 | `<KEY>: picked up` | a claim |
 | `<KEY>: could not pick up: <error>` | a claim failed |
@@ -465,12 +469,14 @@ Activity content JSON: `{"type":"thought","body"}`, `{"type":"action","action","
 
 ## Linear polling and rate limits
 
+The ticker runs one Linear task per workspace, each with its own client, token (the credential stored under the workspace's name), app user and rate budget. They share the query list the reconciler publishes, and each reads and flushes only the runs of its workspace (the workspace part of `RunQuery.key`); a query also carries the review state of the run's team, the default `In Review` when the team is no longer configured. They share one level channel, a map from workspace name to that workspace's level (app user and delegated list), and each sets only its own entry. Events are keyed by issue UUID, which is unique across workspaces. The reconciler wakes each task after queuing requests. Log lines about a whole workspace start with `<workspace>: ` (the intake error, the rate-limit pause, the budget and the run read cost); per-run lines start with `<KEY>: `. A task ending ends the ticker (`a Linear task ended`).
+
 Operations of the Linear task:
 
 | Operation | Interval | Behavior |
 | --- | --- | --- |
-| intake poll | `linear.intake_interval_seconds` (default 5) | `delegated_issues`, published for the reconciler's intake |
-| run read | `linear.run_read_interval_seconds` (default 5) | `run_updates` for every active run with a session, then per-run handling |
+| intake poll | `workspaces.<name>.intake_interval_seconds` (default 5) | `delegated_issues`, published for the reconciler's intake |
+| run read | `workspaces.<name>.run_read_interval_seconds` (default 5) | `run_updates` for every active run with a session, then per-run handling |
 | viewer | once, cached | the app user id; retried until known; run reads wait for it |
 | flush | after new outbox requests and after each read | see [Outbox and flush](#outbox-and-flush) |
 
@@ -497,13 +503,13 @@ Rules:
   - While the budget is short the order of a step is flush, viewer, run read, delegated poll; otherwise viewer, delegated poll, run read, flush.
   - Every run-read batch answered by one request updates the cost per run (its `X-Complexity` divided by its runs, rounded up); a batch takes at most `4999 / cost` runs, at least 1; with no measurement, 10.
   - A rate-limited run read or delegated poll logs no per-run line; the pause line reports it. A rate-limited write still logs `<KEY>: Linear write failed, will retry: <error>`.
-  - Ticker log lines: `Linear budget is short (<budget>): the intake poll runs every <d> and the run read every <d>`, the same with `is no longer short`, and `Linear rate-limited the requests (<budget>): every read and write waits <d>, until <time>`, where `<budget>` is the doctor's text or `the budget is unknown`, `<d>` is jiff's friendly duration (`10s`, `5m`, `8s 421ms`) and `<time>` is in whole seconds.
+  - Ticker log lines, each after `<workspace>: `: `Linear budget is short (<budget>): the intake poll runs every <d> and the run read every <d>`, the same with `is no longer short`, and `Linear rate-limited the requests (<budget>): every read and write waits <d>, until <time>`, where `<budget>` is the doctor's text or `the budget is unknown`, `<d>` is jiff's friendly duration (`10s`, `5m`, `8s 421ms`) and `<time>` is in whole seconds.
 
 ## Intake and claim
 
 ### `intake(issues)`
 
-For each delegated issue in the order returned:
+Per workspace, from a delegated list of that workspace the reconciler has not used yet (the read time of the last one used is kept per workspace), for each delegated issue in the order returned; its key is `<workspace>/<ISSUE>`:
 
 1. A run exists for the key:
    - Active, with no coordinator profile decided and no routing job (a claim cut short, or an older build): read the issue and run `finish_claim`. Log errors as `<KEY>: <error>`.
@@ -517,16 +523,16 @@ Agent count: over active runs, one for a coordinator that is `pending` or `open`
 
 ### `claim(issue)`
 
-1. Validate the key; read the issue detail.
-2. Create the state and runs directories. Create the run with `issue_id`, `identifier`, `title`, `url`, `team_key`, `labels`, `created = now`, `issue_updated_at`, `issue_hash`, `prompt_cursor = last_activity = timeout_since = now` and `announce_pending = true`.
+1. Validate the issue key; read the issue detail.
+2. Create the state and runs directories. Create the run with `workspace`, `issue_id`, `identifier`, `title`, `url`, `team_key`, `labels`, `created = now`, `issue_updated_at`, `issue_hash`, `prompt_cursor = last_activity = timeout_since = now` and `announce_pending = true`.
 3. Log `<KEY>: picked up`.
-4. Queue the thought `Picked up <KEY>.` and the issue-state request with target `started`, clearing `announce_pending` in the same critical section.
+4. Queue the thought `Picked up <ISSUE>.` and the issue-state request with target `started`, clearing `announce_pending` in the same critical section.
 5. The run's query has no `issue_updated_at`, so the next run read brings the issue detail; that writes `issue.md` (the first write is not an edit) and runs `finish_claim`. The session is opened by the flush (Linear's auto-created one, or a new one).
 
 ### `finish_claim(run, detail)`
 
 1. The session is opened by the flush, never here.
-2. When `announce_pending` is still set (a crash between creating the run and queuing its first thought), queue `Picked up <KEY>.` and clear it. `tests/scenarios:a_claim_cut_short_before_its_first_thought_still_announces_it`
+2. When `announce_pending` is still set (a crash between creating the run and queuing its first thought), queue `Picked up <ISSUE>.` and clear it. `tests/scenarios:a_claim_cut_short_before_its_first_thought_still_announces_it`
 3. Queue an issue-state request with target `started`, unless one is queued or the issue is already started, completed or canceled.
 4. Route.
 
@@ -559,7 +565,7 @@ Rules pinned:
 For every active run with a session, per update, in this order. A read that started before the run's last status change (a re-delegation, a reopen, a close or a detach) is ignored, so a read made with an old query cannot undo a newer state:
 
 1. State type `completed` or `canceled`: close the run.
-2. Delegate is not the app user: detach the run.
+2. Delegate is not the app user of the run's workspace: detach the run.
 3. `updatedAt` differs from `issue_updated_at`: refresh the issue.
 4. Relay the prompts.
 
@@ -582,7 +588,7 @@ Checkouts and branches are never removed.
 
 `relay(run, prompts)`, prompts oldest first. Nothing happens for an empty list. For each prompt:
 
-- A user not in `linear.allowed_user_ids`: append to `.state/ignored-prompts.md`; nothing else. Stop signals from such users are ignored too.
+- A user not in the `allowed_user_ids` of the run's team (`workspaces.<workspace>.teams.<team_key>`; nobody when that team is no longer configured): append to `.state/ignored-prompts.md`; nothing else. Stop signals from such users are ignored too.
 - Signal `stop` from an allowed user: set `stopped = true` and a pending interrupt (`interrupt = stop`). The first pass with a snapshot, which may be this one, interrupts the agents, clears it and queues the response `Stopped <n> agent(s) as asked. Their worktrees are kept; reply here to continue.` with the true count. `tests/scenarios:a_stop_while_herdr_is_down_interrupts_once_herdr_is_back`
 - Any other allowed prompt:
   1. Append it to `conversation.md`.
@@ -623,7 +629,7 @@ A blocked status for 29 s does not count: a quickly answered prompt never shows.
 <who> needs someone in Herdr: it is waiting on a dialog in pane `<pane id>` (session `<herdr.session or default>`, run <KEY> <title>). Answer it there.
 ```
 
-`<KEY> <title>` is the workspace label: the key, a space, and the title without control characters, at most 60 characters. `<who>` is `The coordinator` or `Worker <id> (<repo>)`. It is sent once per episode (`blocked_reported`). `tests/scenarios:a_dialog_in_a_pane_is_reported_once_and_a_lost_coordinator_can_be_resumed`
+`<KEY> <title>` is the workspace label: the run key, a space, and the title without control characters, at most 60 characters. `<who>` is `The coordinator` or `Worker <id> (<repo>)`. It is sent once per episode (`blocked_reported`). `tests/scenarios:a_dialog_in_a_pane_is_reported_once_and_a_lost_coordinator_can_be_resumed`
 
 Notifications (`notify`) are shown only when `notifications.herdr` is true.
 
@@ -700,7 +706,7 @@ For an active run whose coordinator is `pending`:
      ```text
      # herdr-linear-agent run <KEY>
 
-     If your working directory is this folder, you are the coordinator of the herdr-linear-agent run for the Linear issue <KEY> (<title with newlines as spaces>).
+     If your working directory is this folder, you are the coordinator of the herdr-linear-agent run for the Linear issue <ISSUE> (<title with newlines as spaces>).
 
      Run `<bin> skill <KEY>` now and follow the sheet it prints. Then run `<bin> context <KEY>` at the start of every turn.
      ```
@@ -739,7 +745,7 @@ When `prompt_pending` and our agent is in the pane and ready for input (idle or 
 | --- | --- |
 | coordinator | `[herdr-linear-agent ticker] Start <KEY>. Follow AGENTS.md.` |
 | resumed coordinator | `[herdr-linear-agent ticker] You were restarted as the coordinator of <KEY>. Run context.` |
-| worker | `Read .herdr-linear-agent/<KEY>-<id>/brief.md and do what it says.` |
+| worker | `Read .herdr-linear-agent/<workspace>-<ISSUE>-<id>/brief.md and do what it says.` |
 
 `tests/worker:ids_branches_briefs_and_pr_lines`, `tests/scenarios:a_worker_runs_in_a_worktree_and_its_report_and_pr_reach_linear`, `tests/scenarios:a_dialog_in_a_pane_is_reported_once_and_a_lost_coordinator_can_be_resumed`
 
@@ -815,7 +821,7 @@ Requests queued before the session existed wait and go out once it exists. `test
 
 | Event | Write |
 | --- | --- |
-| claim | session (when none), thought `Picked up <KEY>.`, issue state `started` |
+| claim | session (when none), thought `Picked up <ISSUE>.`, issue state `started` |
 | coordinator decided | thought with the profile and the reason |
 | delegated again | thought `The issue was delegated again; the run continues.` |
 | `plan set` | plan |
@@ -875,8 +881,8 @@ Fields: `id`, `title`, `repo`, `repo_path`, `branch`, `base`, `worktree_path`, `
 | `allocate(run, check, init)` | under the run lock, gives the next id (`w1`, `w2`, ...), lets `check(existing workers)` refuse, applies `init`, writes the record |
 | `update(run, id, change)` / `load(run, id)` / `list(run)` | read-modify-write, read, all records by id |
 | `validate_id` | `w` then a positive number without leading zero: `w1`, `w12` pass; `""`, `w`, `w0`, `w01`, `x1`, `../w1`, `w1a` fail |
-| `branch_name(KEY, id, title)` | `herdr-linear-agent/<key>/<id>-<slug(title)>`, or `herdr-linear-agent/<key>/<id>` when the slug is empty |
-| `brief_dir(worktree, KEY, id)` | `<worktree without trailing slash>/.herdr-linear-agent/<KEY>-<id>` |
+| `branch_name(KEY, id, title)` | `herdr-linear-agent/<key>/<id>-<slug(title)>`, or `herdr-linear-agent/<key>/<id>` when the slug is empty; `<key>` keeps its `/`, so the workspace is a branch segment (`herdr-linear-agent/acme/data-1/w1-change-api`) |
+| `brief_dir(worktree, KEY, id)` | `<worktree without trailing slash>/.herdr-linear-agent/<workspace>-<ISSUE>-<id>` (the run key with `/` as `-`) |
 | `task_path(run, id)` | `workers/<id>.task.md` |
 | `append_follow_up(run, id, text)` | adds `## Follow-ups` once, then `### <timestamp>` and the trimmed text |
 | `home_report_path(run, id)` | `workers/<id>.md` |
@@ -942,7 +948,7 @@ All take `<KEY>`. `plan set`, `say`, `ask`, `finish` and the worker commands req
 | `plan set <KEY> --file` | parses the checklist, queues the plan | `the plan is queued for Linear` |
 | `say <KEY> --text-file` | queues a thought with the trimmed text; empty: `the text is empty` | `queued for the Linear session` |
 | `ask <KEY> --text-file [--option label=value]...` | queues an elicitation; options add `select`; empty: `the question is empty` | `the question is queued for the Linear session; end your turn, the answer arrives in your inbox` |
-| `finish <KEY> --text-file` | see below; empty: `the summary is empty` | ``the summary is queued; the issue moves to `<review_state>` `` |
+| `finish <KEY> --text-file` | see below; empty: `the summary is empty` | ``the summary is queued; the issue moves to `<review_state>` `` with the run team's review state (`In Review` when the team is no longer configured) |
 
 - `parse_option`: `label=value`, or a bare label used as its own value; both trimmed and non-empty, else ``an option looks like `label=value`; got `<text>` ``. `tests/commands:options_parse_as_label_and_value`
 - `finish`: needs the Herdr view (error `the configured Herdr session is not reachable`). Every worker that is `open`, `failed` or `pending` must be in the Reported group, else `not finished: <id> is <Label>, ... . Every worker must have written a report and be neither working nor waiting` (exactly `not finished: ` + the list joined by `, ` + `. Every worker ...`). Then queue the response and the `review` state, and set `finished`. `tests/scenarios:finish_waits_for_every_worker_and_limits_hold` (`w1 is Working`), `tests/scenarios:a_worker_runs_in_a_worktree_and_its_report_and_pr_reach_linear` (issue `In Review`, response body).
@@ -980,25 +986,25 @@ Each action prints its result and shows it as a notification titled `herdr-linea
 
 | Action (manifest id) | Behavior | Result |
 | --- | --- | --- |
-| `login` | revoke a stored credential, run the OAuth login, read the viewer, `ticker start` | `Logged in to Linear as the app user <name, or id when the name is empty>.` |
+| `login [--workspace <name>]` | for the named workspace, else each workspace without a stored credential (ready or refresh needed), else every workspace, one after another: revoke a stored credential, run the OAuth login, read the viewer; then `ticker start`. `--workspace` given to another action: `--workspace applies only to the login action` | one line per workspace, ``Logged in to the Linear workspace `<name>` as the app user <name, or id when the name is empty>.``; a failure is ``workspace `<name>`: <error>`` |
 | `status` | status text | see below |
-| `open-issue` | the run of the invoking pane's cwd (`HERDR_PLUGIN_CONTEXT_JSON` `focused_pane_cwd`, else `workspace_cwd`); runs `open`/`xdg-open` on its URL | `Opened <KEY> in the browser.` |
-| `focus-run` | the key from `HERDR_PLUGIN_CLICKED_URL`; focuses the coordinator's live workspace, else the recorded one | `Focused the run of <KEY>.` |
+| `open-issue` | the run of the invoking pane's cwd (`HERDR_PLUGIN_CONTEXT_JSON` `focused_pane_cwd`, else `workspace_cwd`); runs `open`/`xdg-open` on its URL | `Opened <ISSUE> in the browser.` |
+| `focus-run` | the run whose recorded URL has the organization and issue key of `HERDR_PLUGIN_CLICKED_URL` (issue keys repeat across workspaces); focuses the coordinator's live workspace, else the recorded one | `Focused the run of <KEY>.` |
 | `pause` | writes `<state_dir>/paused` | `Paused: new issues are not picked up. Running runs continue.` |
 | `resume` | removes it, `ticker start` | `Resumed: delegated issues are picked up again.` |
 | `doctor` | checks | see below |
 
-Errors: `this action needs a pane of a run`, `this pane does not belong to a run`, `could not open <url>: <error>`, `Ctrl-click a Linear issue link to focus its run`, `<url> is not a Linear issue URL`, `there is no run for <KEY>`, `<KEY> has no coordinator workspace yet`.
+Errors: `this action needs a pane of a run`, `this pane does not belong to a run`, `could not open <url>: <error>`, `Ctrl-click a Linear issue link to focus its run`, `<url> is not a Linear issue URL`, `there is no run for <ISSUE>`, `<KEY> has no coordinator workspace yet`.
 
-- `key_from_url`: `https://linear.app/<workspace>/issue/<KEY>[/...]` with a valid key; other hosts and paths give none. `src/actions.rs:issue_urls_give_their_key`
+- `issue_from_url`: the organization and the issue key of `https://linear.app/<organization>/issue/<ISSUE>[/...]` with a valid key; other hosts and paths give none. `src/actions.rs:issue_urls_give_their_organization_and_key`
 - `run_for_cwd(cwd)`: the run whose coordinator cwd or a worker's worktree path is a path prefix of `cwd`. `src/actions.rs:status_lists_runs_and_panes_map_to_their_run`
 - Status text, one line each: `describe`; `paused: new issues are not picked up` when paused; `no runs` when none; per run `<KEY> <Status>[, finished]: <coordinator>[; <workers>]`. Coordinator: `coordinator gone` (open and lost), `coordinator <last_state or starting>` (open), `coordinator pending`, `coordinator failed: <error>`, `coordinator stopped`. Workers other than stopped, joined by `, `: `<id> <failed | starting (empty last_group) | last_group> (<repo>)`. Example: `DATA-1 Active: coordinator idle; w1 working (api)`. `src/actions.rs:status_lists_runs_and_panes_map_to_their_run`
 - Doctor collects problems and OK lines:
   - herdr version: `herdr <v>` OK, or `herdr <v> is older than 0.9.1`, or `herdr: <error>`;
   - config: `config <path>` OK or its error;
-  - with a config: ``Herdr session `<name or default>` is reachable`` (a snapshot or ping answers), `the configured Herdr session does not answer`, or the session error; each distinct executable of the profiles' kinds and `git`: `` `<program>` found `` or `` `<program>` is not on the ticker's PATH `` (resolved from this process's `PATH`); each repository without `.git`: ``repository `<name>`: <path> is not a git checkout``; credential: `Linear credential stored` (ready or refresh needed), else `Linear credential is <status>; run the login action` or `Linear credential: <error>`;
+  - with a config: ``Herdr session `<name or default>` is reachable`` (a snapshot or ping answers), `the configured Herdr session does not answer`, or the session error; each distinct executable of the profiles' kinds and `git`: `` `<program>` found `` or `` `<program>` is not on the ticker's PATH `` (resolved from this process's `PATH`); each repository without `.git`: ``repository `<name>`: <path> is not a git checkout``; credential, per workspace: ``Linear `<name>`: credential stored`` (ready or refresh needed), else ``Linear `<name>`: credential is <status>; run the login action`` or ``Linear `<name>`: credential: <error>``;
   - ticker: `ticker running` (same version), `the ticker runs <v>, this binary is <v>`, `the ticker is not running`;
-  - with a stored credential, one viewer read: `Linear budget: <requests remaining>/<limit> requests, <points remaining>/<limit> points, resets <latest reset, whole seconds>` OK, or `Linear budget: unknown` when the read failed, a header was missing, or no credential is stored;
+  - per workspace, with a stored credential, one viewer read: ``Linear `<name>`: budget <requests remaining>/<limit> requests, <points remaining>/<limit> points, resets <latest reset, whole seconds>`` OK, or ``Linear `<name>`: budget unknown`` when the read failed, a header was missing, or no credential is stored;
   - `<n> active run(s)` OK.
   - Text: `All checks passed.` or `<n> problem(s):\n- <problem>\n- ...`, then `\nOK:\n- <ok>\n- ...`.
 - The manifest names only existing actions; `command[2]` equals the action id; every link handler has a non-empty title (Herdr 0.9.1 refuses one without). `src/cli.rs:the_manifest_names_only_existing_actions`
@@ -1033,7 +1039,7 @@ report [--percent N | --unknown] --activity TEXT
 - `scripts/install.sh` downloads the release binary for `.release-version` and the host target (`aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`), asset `herdr-linear-agent-<target>` with `herdr-linear-agent-<target>.sha256`, into `target/release/herdr-linear-agent`. Without a release binary it runs `cargo build --release --locked`.
 - `VERSION` = `<HLA_RELEASE_VERSION>+<HLA_BUILD_ID>`: the release version (from `.release-version`) plus a build id (short git hash and build time), so a rebuilt binary always differs from the one a running ticker came from. The release workflow checks that the binary reports the tag's version.
 - The versions in `Cargo.toml` and `herdr-plugin.toml` are not bumped by releases.
-- Linux needs a Secret Service provider and `xdg-open`. The Keychain / Secret Service service is `dev.herdr-linear-agent.linear.oauth.v1`. OAuth uses the authorization code flow with PKCE, `actor=app`, scopes `read write app:assignable`, callback `http://127.0.0.1:<callback_port>/oauth/callback`; Linear reports the granted scope space-separated.
+- Linux needs a Secret Service provider and `xdg-open`. The Keychain / Secret Service service is `dev.herdr-linear-agent.linear.oauth.v1`, with one item per workspace whose account is the workspace's name. OAuth uses the authorization code flow with PKCE, `actor=app`, scopes `read write app:assignable`, callback `http://127.0.0.1:<callback_port>/oauth/callback`; Linear reports the granted scope space-separated.
 
 ## Porting the scenario tests
 

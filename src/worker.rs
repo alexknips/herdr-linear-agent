@@ -185,15 +185,24 @@ pub fn branch_name(key: &str, id: &str, title: &str) -> String {
     }
 }
 
+/// The worker's brief folder, `<worktree>/.herdr-linear-agent/<workspace>-<KEY>-<id>`.
 pub fn brief_dir(worktree: &str, key: &str, id: &str) -> String {
     format!(
-        "{}/{BRIEF_FOLDER}/{key}-{id}",
-        worktree.trim_end_matches('/')
+        "{}/{BRIEF_FOLDER}/{}",
+        worktree.trim_end_matches('/'),
+        brief_name(key, id)
     )
 }
 
+fn brief_name(key: &str, id: &str) -> String {
+    format!("{}-{id}", key.replace('/', "-"))
+}
+
 pub fn launch_prompt(key: &str, id: &str) -> String {
-    format!("Read {BRIEF_FOLDER}/{key}-{id}/brief.md and do what it says.")
+    format!(
+        "Read {BRIEF_FOLDER}/{}/brief.md and do what it says.",
+        brief_name(key, id)
+    )
 }
 
 /// The `Start worker` action, queued when the worker's launch prompt is
@@ -582,6 +591,7 @@ mod tests {
 
         fn add(&self, key: &str, status: Status, coordinator: AgentStatus) -> Run {
             let record = RunRecord {
+                workspace: "acme".into(),
                 issue_id: format!("uuid-{key}"),
                 identifier: key.into(),
                 title: "Fix login".into(),
@@ -601,7 +611,7 @@ mod tests {
             status: AgentStatus::Open,
             profile: "standard".into(),
             kind: "claude".into(),
-            agent_name: "data-1-w1".into(),
+            agent_name: "acme-data-1-w1".into(),
             pane_id: pane.into(),
             cwd: WORKTREE.into(),
             ..AgentRecord::default()
@@ -648,7 +658,7 @@ mod tests {
     }
 
     fn ours_in(pane: &str, status: HerdrStatus) -> Agent {
-        herdr_sees(pane, Some("data-1-w1"), WORKTREE, "claude", status)
+        herdr_sees(pane, Some("acme-data-1-w1"), WORKTREE, "claude", status)
     }
 
     fn session_with(panes: &[&str], agents: Vec<Agent>) -> Snapshot {
@@ -703,31 +713,36 @@ mod tests {
     fn branches_briefs_and_prompts_are_named_from_the_key_and_id() {
         let names = [
             (
-                "DATA-1",
+                "acme/DATA-1",
                 "w1",
                 "Change API",
-                "herdr-linear-agent/data-1/w1-change-api",
+                "herdr-linear-agent/acme/data-1/w1-change-api",
             ),
             (
-                "DATA-12",
+                "beta/DATA-12",
                 "w3",
                 "Fix the $(login) bug!",
-                "herdr-linear-agent/data-12/w3-fix-the-login-bug",
+                "herdr-linear-agent/beta/data-12/w3-fix-the-login-bug",
             ),
-            ("DATA-1", "w2", "???", "herdr-linear-agent/data-1/w2"),
+            (
+                "acme/DATA-1",
+                "w2",
+                "???",
+                "herdr-linear-agent/acme/data-1/w2",
+            ),
         ];
         for (key, id, title, branch) in names {
             assert_eq!(branch_name(key, id, title), branch, "{title}");
         }
         for worktree in ["/wt/api", "/wt/api/", "/wt/api//"] {
             assert_eq!(
-                brief_dir(worktree, "DATA-1", "w1"),
-                "/wt/api/.herdr-linear-agent/DATA-1-w1"
+                brief_dir(worktree, "acme/DATA-1", "w1"),
+                "/wt/api/.herdr-linear-agent/acme-DATA-1-w1"
             );
         }
         assert_eq!(
-            launch_prompt("DATA-1", "w2"),
-            "Read .herdr-linear-agent/DATA-1-w2/brief.md and do what it says."
+            launch_prompt("acme/DATA-1", "w2"),
+            "Read .herdr-linear-agent/acme-DATA-1-w2/brief.md and do what it says."
         );
 
         let Op::Activity { activity } = start_action(&api_worker(AgentStatus::Open, "", true))
@@ -751,10 +766,10 @@ mod tests {
     fn a_brief_puts_heading_restart_note_rules_report_command_and_task_in_order() {
         let worker = Worker {
             repo: "api".into(),
-            branch: "herdr-linear-agent/data-1/w1-change-api".into(),
+            branch: "herdr-linear-agent/acme/data-1/w1-change-api".into(),
             base: "main".into(),
             worktree_path: WORKTREE.into(),
-            brief_dir: brief_dir(WORKTREE, "DATA-1", "w1"),
+            brief_dir: brief_dir(WORKTREE, "acme/DATA-1", "w1"),
             ..api_worker(AgentStatus::Open, "", true)
         };
         let brief = |restart| {
@@ -778,9 +793,9 @@ mod tests {
             "https://linear.app/acme/issue/DATA-1",
             "api",
             WORKTREE,
-            "herdr-linear-agent/data-1/w1-change-api",
+            "herdr-linear-agent/acme/data-1/w1-change-api",
             "main",
-            "/wt/api/.herdr-linear-agent/DATA-1-w1/report.md",
+            "/wt/api/.herdr-linear-agent/acme-DATA-1-w1/report.md",
             "previous attempt",
             rules,
             "/bin/hla report --percent N",
@@ -891,7 +906,7 @@ mod tests {
         assert_eq!(load(&run, "w2").unwrap().repo, "web");
         assert_eq!(
             load(&run, "w9").unwrap_err().to_string(),
-            "run DATA-1 has no worker w9"
+            "run acme/DATA-1 has no worker w9"
         );
         assert!(load(&run, "../w1").is_err());
     }
@@ -1015,7 +1030,7 @@ mod tests {
 title = "Change API"
 repo = "api"
 repo_path = "/src/api"
-branch = "herdr-linear-agent/data-1/w1-change-api"
+branch = "herdr-linear-agent/acme/data-1/w1-change-api"
 base = "main"
 worktree_path = "/wt/api"
 brief_dir = "/wt/api/.herdr-linear-agent/DATA-1-w1"
@@ -1029,14 +1044,17 @@ updated = "2026-05-01T09:30:00Z"
 status = "open"
 profile = "standard"
 kind = "claude"
-agent_name = "data-1-w1"
+agent_name = "acme-data-1-w1"
 pane_id = "w1:p1"
 cwd = "/wt/api"
 last_group = "waiting"
 "#;
         std::fs::write(run.dir.join("workers/w1.toml"), stored).unwrap();
         let worker = load(&run, "w1").unwrap();
-        assert_eq!(worker.branch, "herdr-linear-agent/data-1/w1-change-api");
+        assert_eq!(
+            worker.branch,
+            "herdr-linear-agent/acme/data-1/w1-change-api"
+        );
         assert_eq!(worker.restarts, 1);
         assert_eq!(worker.pr_url, "https://github.com/acme/api/pull/7");
         assert_eq!(worker.announced_report_hash, "");
@@ -1059,7 +1077,7 @@ last_group = "waiting"
                 "all agree",
                 herdr_sees(
                     "w1:p1",
-                    Some("data-1-w1"),
+                    Some("acme-data-1-w1"),
                     WORKTREE,
                     "claude",
                     HerdrStatus::Idle,
@@ -1080,7 +1098,7 @@ last_group = "waiting"
                 "another name",
                 herdr_sees(
                     "w1:p1",
-                    Some("data-1-w2"),
+                    Some("acme-data-1-w2"),
                     WORKTREE,
                     "claude",
                     HerdrStatus::Idle,
@@ -1091,7 +1109,7 @@ last_group = "waiting"
                 "another cwd",
                 herdr_sees(
                     "w1:p1",
-                    Some("data-1-w1"),
+                    Some("acme-data-1-w1"),
                     "/wt/web",
                     "claude",
                     HerdrStatus::Idle,
@@ -1102,7 +1120,7 @@ last_group = "waiting"
                 "another kind",
                 herdr_sees(
                     "w1:p1",
-                    Some("data-1-w1"),
+                    Some("acme-data-1-w1"),
                     WORKTREE,
                     "codex",
                     HerdrStatus::Idle,
@@ -1113,7 +1131,7 @@ last_group = "waiting"
                 "another pane",
                 herdr_sees(
                     "w4:p1",
-                    Some("data-1-w1"),
+                    Some("acme-data-1-w1"),
                     WORKTREE,
                     "claude",
                     HerdrStatus::Idle,
@@ -1182,7 +1200,7 @@ last_group = "waiting"
         assert_eq!(home.moved_to, None);
         assert_eq!(home.agent_state, Some(HerdrStatus::Blocked));
         assert_eq!(home.state_secs, 45);
-        assert_eq!(home.agent.unwrap().name.as_deref(), Some("data-1-w1"));
+        assert_eq!(home.agent.unwrap().name.as_deref(), Some("acme-data-1-w1"));
 
         let changed = read(session_with(
             &["w1:p1"],

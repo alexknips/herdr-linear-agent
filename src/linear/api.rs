@@ -742,6 +742,9 @@ pub mod fake {
         /// Session threads (root, activities, replies) do not show as issue
         /// comments and so do not move `updatedAt`, for tests that count reads.
         pub no_session_comments: bool,
+        /// The organization's URL key in issue URLs, `acme` when empty; set,
+        /// it also sets the issue ids apart from another fake's.
+        pub organization: String,
         clock: i64,
     }
 
@@ -760,12 +763,21 @@ pub mod fake {
 
         /// Adds an issue delegated to the app user in `team`.
         pub fn add_issue(&mut self, identifier: &str, team: &str, title: &str) -> String {
-            let id = format!("00000000-0000-4000-8000-{:012}", self.issues.len() + 1);
+            let n = self.issues.len() + 1;
+            let (id, organization) = if self.organization.is_empty() {
+                (format!("00000000-0000-4000-8000-{n:012}"), "acme")
+            } else {
+                (
+                    format!("{}-{n:012}", self.organization),
+                    self.organization.as_str(),
+                )
+            };
+            let url = format!("https://linear.app/{organization}/issue/{identifier}/x");
             self.issues.push(json!({
                 "id": id,
                 "identifier": identifier,
                 "title": title,
-                "url": format!("https://linear.app/acme/issue/{identifier}/x"),
+                "url": url,
                 "description": format!("Description of {identifier}"),
                 "updatedAt": "2026-09-25T00:00:00.000Z",
                 "estimate": null,

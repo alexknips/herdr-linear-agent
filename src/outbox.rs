@@ -347,6 +347,7 @@ mod tests {
         let run = Run::create(
             dir.path(),
             RunRecord {
+                workspace: "acme".into(),
                 identifier: "DATA-1".into(),
                 ..RunRecord::default()
             },

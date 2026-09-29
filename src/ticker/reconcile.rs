@@ -30,7 +30,7 @@ use super::Log;
 use crate::config::Config;
 use crate::herdr::{Herdr, HerdrError, Link, PaneId, Placed, Snapshot};
 use crate::linear::api::{Activity, Content};
-use crate::linear::task::{LinearEvent, LinearLevel, RunQuery};
+use crate::linear::task::{Levels, LinearEvent, RunQuery};
 use crate::outbox::{self, Op};
 use crate::paths::Ctx;
 use crate::run::{AgentRecord, AgentStatus, Run, RunLock, RunRecord, Status};
@@ -71,12 +71,13 @@ pub struct Inputs<'a, H> {
     pub log: Arc<Log>,
     /// Wakes on every Herdr event.
     pub link: watch::Receiver<Link>,
-    pub level: watch::Receiver<LinearLevel>,
+    pub level: watch::Receiver<Levels>,
     pub events: mpsc::Receiver<LinearEvent>,
     /// What the Linear task reads and flushes.
     pub queries: watch::Sender<Vec<RunQuery>>,
     /// `notify_one` after queuing outbox requests, so they go out at once.
-    pub linear_wake: Arc<Notify>,
+    /// Each workspace's Linear task.
+    pub linear_wake: Vec<Arc<Notify>>,
     /// Becomes `true` when the ticker should exit.
     pub shutdown: watch::Receiver<bool>,
     /// Notified when a subcommand wrote run files the ticker acts on.
@@ -195,7 +196,8 @@ pub struct Reconciler {
     /// Per issue, when its run last changed status, as the time of the fact
     /// that changed it. A read or a delegated list made earlier is stale.
     pub(super) changed_at: BTreeMap<String, Timestamp>,
-    pub(super) intake_read: Option<Timestamp>,
+    /// Per workspace, the read time of the delegated list intake last used.
+    pub(super) intake_read: BTreeMap<String, Timestamp>,
     /// Runs whose outbox is blocked, by issue id, and since when.
     pub(super) failing: BTreeMap<String, Timestamp>,
     pub(super) failure_notified: bool,
@@ -334,7 +336,7 @@ impl Reconciler {
             nudged: BTreeMap::new(),
             reported: BTreeMap::new(),
             changed_at: BTreeMap::new(),
-            intake_read: None,
+            intake_read: BTreeMap::new(),
             failing: BTreeMap::new(),
             failure_notified: false,
             heartbeats: BTreeMap::new(),
@@ -437,7 +439,7 @@ impl Reconciler {
     pub async fn pass<H: Herdr + Clone + 'static>(
         &mut self,
         d: &Deps<'_, H>,
-        level: &LinearLevel,
+        levels: &Levels,
         wake: Wake,
         now: Timestamp,
     ) {
@@ -462,9 +464,9 @@ impl Reconciler {
         self.trusted = snap.is_some_and(|s| s.skipped == 0);
         let whole = snap.filter(|s| s.skipped == 0);
         for event in wake.events {
-            self.apply_event(d, level, whole, event, now).await;
+            self.apply_event(d, levels, whole, event, now).await;
         }
-        self.intake(d, level, now).await;
+        self.intake(d, levels, now).await;
         if let Some(snapshot) = snap {
             self.deliver_interrupts(d, snapshot).await;
         }
@@ -536,7 +538,11 @@ impl Reconciler {
         self.not_sent.retain(|key, _| active.contains(&key.run));
         self.nudged.retain(|key, _| active.contains(key));
         self.heartbeats.retain(|key, _| active.contains(key));
-        let read = self.intake_read;
+        // Kept until every workspace read a delegated list after it: the
+        // oldest of their reads, none while a workspace has not read one.
+        let read = (self.intake_read.len() == d.config.workspaces.len())
+            .then(|| self.intake_read.values().min().copied())
+            .flatten();
         self.changed_at.retain(|issue_id, at| {
             issues.contains(issue_id) && read.is_none_or(|read| *at >= read)
         });
@@ -588,7 +594,14 @@ impl Reconciler {
                 let undecided = active
                     && record.coordinator.profile.is_empty()
                     && !self.routing.contains(&run.key);
+                // A team no longer in the config keeps the default review state.
+                let review_state = d
+                    .config
+                    .team(&record.workspace, &record.team_key)
+                    .map_or_else(|_| "In Review".to_string(), |t| t.review_state.clone());
                 Some(RunQuery {
+                    key: run.key.clone(),
+                    review_state,
                     issue_id: record.issue_id,
                     run_dir: run.dir.clone(),
                     session_id: Some(record.session_id).filter(|s| !s.is_empty()),
@@ -786,7 +799,7 @@ pub async fn run<H: Herdr + Clone + 'static>(mut inputs: Inputs<'_, H>) -> Resul
             inputs.queries.send_replace(reconciler.queries().to_vec());
         }
         if reconciler.take_queued() {
-            inputs.linear_wake.notify_one();
+            inputs.linear_wake.iter().for_each(|wake| wake.notify_one());
         }
         let wait = reconciler.next_deadline(&deps, now).duration_since(now);
         deadline =
@@ -799,7 +812,7 @@ mod tests {
     use super::*;
     use crate::herdr::FakeHerdr;
     use crate::linear::api::IssueRef;
-    use crate::linear::task::Delegated;
+    use crate::linear::task::{Delegated, LinearLevel};
     use crate::paths::Env;
     use crate::process::fake::FakeRunner;
 
@@ -809,22 +822,25 @@ mod tests {
         T0.parse().unwrap()
     }
 
-    fn delegated(key: &str) -> LinearLevel {
-        LinearLevel {
-            app_user: Some("app".into()),
-            delegated: Some(Delegated {
-                read_at: t0(),
-                issues: vec![IssueRef {
-                    id: format!("id-{key}"),
-                    identifier: key.into(),
-                    title: "Loop".into(),
-                    url: format!("https://linear.app/acme/issue/{key}"),
-                    updated_at: T0.into(),
-                    state: "unstarted".into(),
-                    team: "DATA".into(),
-                }],
-            }),
-        }
+    fn delegated(key: &str) -> Levels {
+        Levels::from([(
+            "acme".to_string(),
+            LinearLevel {
+                app_user: Some("app".into()),
+                delegated: Some(Delegated {
+                    read_at: t0(),
+                    issues: vec![IssueRef {
+                        id: format!("id-{key}"),
+                        identifier: key.into(),
+                        title: "Loop".into(),
+                        url: format!("https://linear.app/acme/issue/{key}"),
+                        updated_at: T0.into(),
+                        state: "unstarted".into(),
+                        team: "DATA".into(),
+                    }],
+                }),
+            },
+        )])
     }
 
     struct Rig {
@@ -867,7 +883,7 @@ mod tests {
             wakes: 0,
             last_error: None,
         });
-        let (level_tx, level) = watch::channel(LinearLevel::default());
+        let (level_tx, level) = watch::channel(Levels::new());
         let (events_tx, events) = mpsc::channel(8);
         let (queries, mut published) = watch::channel(Vec::new());
         let linear_wake = Arc::new(Notify::new());
@@ -883,7 +899,7 @@ mod tests {
             level,
             events,
             queries,
-            linear_wake: linear_wake.clone(),
+            linear_wake: vec![linear_wake.clone()],
             shutdown,
             poke: Arc::new(Notify::new()),
             clock: t0,
@@ -904,7 +920,7 @@ mod tests {
         };
         let (result, ()) = tokio::join!(reconciler, driver);
         result.unwrap();
-        let run = Run::load(&ctx.runs_dir(), "DATA-7").unwrap();
+        let run = Run::load(&ctx.runs_dir(), "acme/DATA-7").unwrap();
         assert_eq!(
             outbox::pending(&run).len(),
             2,
@@ -928,7 +944,7 @@ mod tests {
             wakes: 0,
             last_error: None,
         });
-        let (_level_tx, level) = watch::channel(LinearLevel::default());
+        let (_level_tx, level) = watch::channel(Levels::new());
         let (events_tx, events) = mpsc::channel(8);
         let (queries, _published) = watch::channel(Vec::new());
         let (shutdown_tx, shutdown) = watch::channel(false);
@@ -950,7 +966,7 @@ mod tests {
             level,
             events,
             queries,
-            linear_wake: Arc::new(Notify::new()),
+            linear_wake: vec![Arc::new(Notify::new())],
             shutdown,
             poke: poke.clone(),
             clock: t0,
@@ -988,7 +1004,7 @@ mod tests {
             wakes: 0,
             last_error: None,
         });
-        let (_level_tx, level) = watch::channel(LinearLevel::default());
+        let (_level_tx, level) = watch::channel(Levels::new());
         let (events_tx, events) = mpsc::channel(8);
         let (queries, _published) = watch::channel(Vec::new());
         let (_shutdown_tx, shutdown) = watch::channel(false);
@@ -1003,7 +1019,7 @@ mod tests {
             level,
             events,
             queries,
-            linear_wake: Arc::new(Notify::new()),
+            linear_wake: vec![Arc::new(Notify::new())],
             shutdown,
             poke: Arc::new(Notify::new()),
             clock: t0,

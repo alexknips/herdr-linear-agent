@@ -75,6 +75,9 @@ pub struct LinearLevel {
     pub delegated: Option<Delegated>,
 }
 
+/// Each workspace's level, by the config's name for the workspace.
+pub type Levels = BTreeMap<String, LinearLevel>;
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum LinearEvent {
     /// A run's issue state and new prompts, and the issue detail when the
@@ -102,6 +105,12 @@ pub enum LinearEvent {
 /// What the reconciler asks the Linear task to read and send for one run.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RunQuery {
+    /// The run's key, `<workspace>/<ISSUE-KEY>`: only that workspace's task
+    /// reads and flushes the run.
+    pub key: String,
+    /// The state `finish` moves the issue to: the review state of the run's
+    /// team.
+    pub review_state: String,
     pub issue_id: String,
     pub run_dir: PathBuf,
     pub session_id: Option<String>,
@@ -112,27 +121,19 @@ pub struct RunQuery {
     pub issue_updated_at: Option<String>,
 }
 
-impl RunQuery {
-    /// The run's issue key: the name of its folder.
-    fn key(&self) -> String {
-        self.run_dir
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_default()
-    }
-}
-
 /// The channels the task talks through.
 pub struct Links {
     pub queries: watch::Receiver<Vec<RunQuery>>,
-    pub level: watch::Sender<LinearLevel>,
+    /// Shared by every workspace's task; each one sets only its own entry.
+    pub level: Arc<watch::Sender<Levels>>,
     pub events: mpsc::Sender<LinearEvent>,
     pub wake: Arc<Notify>,
 }
 
 pub struct LinearTask {
+    /// The config's name for the workspace this task reads and writes.
+    workspace: String,
     teams: Vec<String>,
-    review_state: String,
     intake_interval: SignedDuration,
     run_read_interval: SignedDuration,
     /// The intervals in effect: the configured ones, stretched while the
@@ -172,12 +173,12 @@ fn due(last: Option<Timestamp>, interval: SignedDuration, now: Timestamp) -> boo
 }
 
 impl LinearTask {
-    pub fn new(linear: &config::Linear) -> Self {
-        let intake_interval = seconds(linear.intake_interval_seconds);
-        let run_read_interval = seconds(linear.run_read_interval_seconds);
+    pub fn new(name: &str, workspace: &config::Workspace) -> Self {
+        let intake_interval = seconds(workspace.intake_interval_seconds);
+        let run_read_interval = seconds(workspace.run_read_interval_seconds);
         LinearTask {
-            teams: linear.teams.clone(),
-            review_state: linear.review_state.clone(),
+            workspace: name.to_string(),
+            teams: workspace.teams.keys().cloned().collect(),
             intake_interval,
             run_read_interval,
             intake_every: intake_interval,
@@ -336,7 +337,8 @@ impl LinearTask {
             }
             Err(error) => {
                 if !self.hit(&error) {
-                    self.log.push(format!("intake: {error}"));
+                    self.log
+                        .push(format!("{}: intake: {error}", self.workspace));
                 }
             }
         }
@@ -363,7 +365,8 @@ impl LinearTask {
         };
         self.paused_until = Some(until);
         self.log.push(format!(
-            "Linear rate-limited the requests ({}): every read and write waits {:#}, until {:.0}",
+            "{}: Linear rate-limited the requests ({}): every read and write waits {:#}, until {:.0}",
+            self.workspace,
             self.budget.summary(),
             until.duration_since(now),
             until
@@ -416,7 +419,8 @@ impl LinearTask {
         if short != self.short {
             self.short = short;
             self.log.push(format!(
-                "Linear budget is {} ({}): the intake poll runs every {:#} and the run read every {:#}",
+                "{}: Linear budget is {} ({}): the intake poll runs every {:#} and the run read every {:#}",
+                self.workspace,
                 if short { "short" } else { "no longer short" },
                 self.budget.summary(),
                 self.intake_every,
@@ -442,7 +446,8 @@ impl LinearTask {
         }
         self.run_points = Some(points);
         self.log.push(format!(
-            "Linear run read costs {points} points per run; up to {} runs per query",
+            "{}: Linear run read costs {points} points per run; up to {} runs per query",
+            self.workspace,
             self.batch_size()
         ));
     }
@@ -501,7 +506,7 @@ impl LinearTask {
                 Ok(update) => update,
                 Err(ApiError::RateLimited) => continue,
                 Err(error) => {
-                    self.log.push(format!("{}: {error}", query.key()));
+                    self.log.push(format!("{}: {error}", query.key));
                     continue;
                 }
             };
@@ -568,7 +573,7 @@ impl LinearTask {
             Ok(detail) => Some(Box::new(detail)),
             Err(error) => {
                 if !self.hit(&error) {
-                    self.log.push(format!("{}: {error}", query.key()));
+                    self.log.push(format!("{}: {error}", query.key));
                 }
                 None
             }
@@ -588,7 +593,7 @@ impl LinearTask {
             if self.limited {
                 break;
             }
-            let key = query.key();
+            let key = &query.key;
             let run = Run {
                 dir: query.run_dir.clone(),
                 key: key.clone(),
@@ -598,7 +603,8 @@ impl LinearTask {
                 false
             } else if let Some(session) = self.session_for_flush(client, query, events).await {
                 let sent =
-                    outbox::send(&run, &session, &query.issue_id, &self.review_state, client).await;
+                    outbox::send(&run, &session, &query.issue_id, &query.review_state, client)
+                        .await;
                 if sent.activity_sent {
                     let _ = events
                         .send(LinearEvent::ActivitySent {
@@ -678,7 +684,7 @@ impl LinearTask {
                 if !self.hit(&error) {
                     self.log.push(format!(
                         "{}: could not create the session: {error}",
-                        query.key()
+                        query.key
                     ));
                 }
                 None
@@ -696,7 +702,13 @@ impl LinearTask {
         log: impl Fn(&str),
     ) {
         loop {
-            let queries = links.queries.borrow().clone();
+            let queries: Vec<RunQuery> = links
+                .queries
+                .borrow()
+                .iter()
+                .filter(|q| crate::run::split_key(&q.key).0 == self.workspace)
+                .cloned()
+                .collect();
             // Events go out as they happen and before the level, so a pass
             // woken by the level has already seen what led to it.
             self.step_into(client, &queries, clock(), &links.events)
@@ -710,7 +722,8 @@ impl LinearTask {
             // The latest level is always stored, but it wakes the
             // reconciler only when the app user or the delegated issues
             // changed: a new read time alone is no news.
-            links.level.send_if_modified(|level| {
+            links.level.send_if_modified(|levels| {
+                let level = levels.entry(self.workspace.clone()).or_default();
                 let issues = |l: &LinearLevel| l.delegated.as_ref().map(|d| d.issues.clone());
                 let news =
                     level.app_user != self.level.app_user || issues(level) != issues(&self.level);
@@ -782,7 +795,7 @@ mod tests {
 
     fn task() -> LinearTask {
         let config = config::tests::sample();
-        LinearTask::new(&config.linear)
+        LinearTask::new("acme", config.workspace("acme").unwrap())
     }
 
     fn thought(body: &str) -> Op {
@@ -812,6 +825,7 @@ mod tests {
                 fake.delegate_session(key);
             }
             let record = RunRecord {
+                workspace: "acme".into(),
                 identifier: key.to_string(),
                 ..RunRecord::default()
             };
@@ -828,6 +842,8 @@ mod tests {
     impl Setup {
         fn query(&self, n: usize, session: Option<&str>, updated_at: Option<&str>) -> RunQuery {
             RunQuery {
+                key: self.runs[n].key.clone(),
+                review_state: "In Review".into(),
                 issue_id: self.issues[n].clone(),
                 run_dir: self.runs[n].dir.clone(),
                 session_id: session.map(str::to_string),
@@ -954,7 +970,7 @@ mod tests {
         assert_eq!(
             task.take_log(),
             [format!(
-                "DATA-1: Linear refused request {refused}: Linear reported an error: Entity not found"
+                "acme/DATA-1: Linear refused request {refused}: Linear reported an error: Entity not found"
             )]
         );
 
@@ -975,8 +991,8 @@ mod tests {
         assert_eq!(
             task.take_log(),
             [
-                "DATA-1: Linear write failed, will retry: Linear rate-limited the request",
-                "Linear rate-limited the requests (the budget is unknown): every read and write waits 5s, until 2026-09-28T00:00:07Z"
+                "acme/DATA-1: Linear write failed, will retry: Linear rate-limited the request",
+                "acme: Linear rate-limited the requests (the budget is unknown): every read and write waits 5s, until 2026-09-28T00:00:07Z"
             ]
         );
         assert!(s.fake().sessions[0].sent("thought").is_empty());
@@ -1137,7 +1153,8 @@ mod tests {
         let s = Arc::new(setup(&["DATA-1"], true));
         let (_queries_tx, queries) =
             watch::channel(vec![s.query(0, Some("session-1"), Some(UPDATED))]);
-        let (level, mut level_rx) = watch::channel(LinearLevel::default());
+        let (level, mut level_rx) = watch::channel(Levels::new());
+        let level = Arc::new(level);
         let (events, mut events_rx) = mpsc::channel(16);
         let wake = Arc::new(Notify::new());
         let links = Links {
@@ -1160,8 +1177,7 @@ mod tests {
         });
         level_rx.changed().await.unwrap();
         assert_eq!(
-            level_rx
-                .borrow_and_update()
+            level_rx.borrow_and_update()["acme"]
                 .delegated
                 .as_ref()
                 .unwrap()
@@ -1176,7 +1192,11 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert!(!level_rx.has_changed().unwrap(), "only read_at changed");
         assert_eq!(
-            level_rx.borrow().delegated.as_ref().unwrap().read_at,
+            level_rx.borrow()["acme"]
+                .delegated
+                .as_ref()
+                .unwrap()
+                .read_at,
             at(10)
         );
 
@@ -1185,7 +1205,12 @@ mod tests {
         wake.notify_one();
         level_rx.changed().await.unwrap();
         assert_eq!(
-            level_rx.borrow().delegated.as_ref().unwrap().issues.len(),
+            level_rx.borrow()["acme"]
+                .delegated
+                .as_ref()
+                .unwrap()
+                .issues
+                .len(),
             2
         );
         drop(events_rx);
@@ -1198,7 +1223,8 @@ mod tests {
         let s = Arc::new(setup(&["DATA-1"], true));
         let (queries_tx, queries) =
             watch::channel(vec![s.query(0, Some("session-1"), Some(UPDATED))]);
-        let (level, mut level_rx) = watch::channel(LinearLevel::default());
+        let (level, mut level_rx) = watch::channel(Levels::new());
+        let level = Arc::new(level);
         let (events, mut events_rx) = mpsc::channel(16);
         let wake = Arc::new(Notify::new());
         let links = Links {
@@ -1214,7 +1240,10 @@ mod tests {
         });
 
         level_rx.changed().await.unwrap();
-        assert_eq!(level_rx.borrow().app_user.as_deref(), Some("app-user-1"));
+        assert_eq!(
+            level_rx.borrow()["acme"].app_user.as_deref(),
+            Some("app-user-1")
+        );
         assert!(matches!(
             events_rx.recv().await,
             Some(LinearEvent::RunRead { .. })
@@ -1257,7 +1286,7 @@ mod tests {
         assert_eq!(task.next_due(at(5)), at(10));
         assert_eq!(
             task.take_log(),
-            ["Linear run read costs 10 points per run; up to 499 runs per query"]
+            ["acme: Linear run read costs 10 points per run; up to 499 runs per query"]
         );
     }
 
@@ -1276,8 +1305,8 @@ mod tests {
         assert_eq!(
             task.take_log(),
             [
-                "Linear run read costs 1800 points per run; up to 2 runs per query",
-                "Linear budget is short (4000/5000 requests, 380000/2000000 points, resets 2026-09-28T00:30:00Z): the intake poll runs every 10s and the run read every 10s"
+                "acme: Linear run read costs 1800 points per run; up to 2 runs per query",
+                "acme: Linear budget is short (4000/5000 requests, 380000/2000000 points, resets 2026-09-28T00:30:00Z): the intake poll runs every 10s and the run read every 10s"
             ]
         );
         let calls = s.fake().calls.len();
@@ -1298,7 +1327,7 @@ mod tests {
         assert_eq!(
             task.take_log(),
             [
-                "Linear budget is no longer short (4000/5000 requests, 1900000/2000000 points, resets 2026-09-28T00:30:00Z): the intake poll runs every 5s and the run read every 5s"
+                "acme: Linear budget is no longer short (4000/5000 requests, 1900000/2000000 points, resets 2026-09-28T00:30:00Z): the intake poll runs every 5s and the run read every 5s"
             ]
         );
     }
@@ -1325,7 +1354,7 @@ mod tests {
         assert_eq!(
             task.take_log(),
             [
-                "Linear rate-limited the requests (4000/5000 requests, 1900000/2000000 points, resets 2026-09-28T00:01:00Z): every read and write waits 55s, until 2026-09-28T00:01:00Z"
+                "acme: Linear rate-limited the requests (4000/5000 requests, 1900000/2000000 points, resets 2026-09-28T00:01:00Z): every read and write waits 55s, until 2026-09-28T00:01:00Z"
             ]
         );
 
@@ -1364,7 +1393,7 @@ mod tests {
         }
         assert_eq!(
             task.take_log().last().unwrap(),
-            "Linear rate-limited the requests (the budget is unknown): every read and write waits 5m, until 2026-09-28T00:15:20Z"
+            "acme: Linear rate-limited the requests (the budget is unknown): every read and write waits 5m, until 2026-09-28T00:15:20Z"
         );
 
         let calls = s.fake().calls.len();
@@ -1397,7 +1426,7 @@ mod tests {
         assert_eq!(s.batches(), [10, 2], "10 runs before a measurement");
         assert_eq!(
             task.take_log(),
-            ["Linear run read costs 1200 points per run; up to 4 runs per query"]
+            ["acme: Linear run read costs 1200 points per run; up to 4 runs per query"]
         );
 
         let events = step(&mut task, &s.linear, &queries, at(5)).await;

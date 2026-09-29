@@ -24,7 +24,8 @@ pub const DEFAULT_CALLBACK_PORT: u16 = 43871;
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
-    pub linear: Linear,
+    /// The Linear workspaces, by the name runs use for them.
+    pub workspaces: BTreeMap<String, Workspace>,
     #[serde(default)]
     pub herdr: Herdr,
     #[serde(default)]
@@ -41,27 +42,33 @@ pub struct Config {
     pub routing: Routing,
 }
 
+/// One Linear workspace: its own OAuth application, token and app user.
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
-pub struct Linear {
+pub struct Workspace {
     /// The private OAuth application's client ID. Not a secret.
     pub client_id: String,
     #[serde(default = "default_callback_port")]
     pub callback_port: u16,
-    /// Keys of the teams whose delegated issues are picked up.
-    pub teams: Vec<String>,
-    /// Linear user IDs whose replies in an Agent Session reach the coordinator.
-    #[serde(default)]
-    pub allowed_user_ids: Vec<String>,
-    /// The workflow state an issue moves to on `finish`.
-    #[serde(default = "default_review_state")]
-    pub review_state: String,
     /// Seconds between two polls of the delegated issues.
     #[serde(default = "default_linear_interval")]
     pub intake_interval_seconds: u64,
     /// Seconds between two reads of the active runs.
     #[serde(default = "default_linear_interval")]
     pub run_read_interval_seconds: u64,
+    /// The teams whose delegated issues are picked up, by team key.
+    pub teams: BTreeMap<String, Team>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Team {
+    /// Linear user IDs whose replies in an Agent Session reach the coordinator.
+    #[serde(default)]
+    pub allowed_user_ids: Vec<String>,
+    /// The workflow state an issue moves to on `finish`.
+    #[serde(default = "default_review_state")]
+    pub review_state: String,
 }
 
 fn default_callback_port() -> u16 {
@@ -210,31 +217,46 @@ impl Config {
     }
 
     fn validate(&self) -> Result<()> {
-        let linear = &self.linear;
-        ensure!(
-            !linear.client_id.trim().is_empty(),
-            "linear.client_id is empty"
-        );
-        ensure!(
-            linear.callback_port != 0,
-            "linear.callback_port may not be 0"
-        );
-        ensure!(!linear.teams.is_empty(), "linear.teams lists no team");
-        ensure!(
-            !linear.review_state.trim().is_empty(),
-            "linear.review_state is empty"
-        );
-        for (key, seconds) in [
-            ("intake_interval_seconds", linear.intake_interval_seconds),
-            (
-                "run_read_interval_seconds",
-                linear.run_read_interval_seconds,
-            ),
-        ] {
+        ensure!(!self.workspaces.is_empty(), "no workspace is configured");
+        for (name, workspace) in &self.workspaces {
             ensure!(
-                (1..=MAX_LINEAR_INTERVAL).contains(&seconds),
-                "linear.{key} must be between 1 and {MAX_LINEAR_INTERVAL}"
+                crate::run::valid_workspace(name),
+                "workspace name `{name}` may use only lower-case letters, digits and `-`, start with a letter, and have at most 16 characters"
             );
+            ensure!(
+                !workspace.client_id.trim().is_empty(),
+                "workspaces.{name}.client_id is empty"
+            );
+            ensure!(
+                workspace.callback_port != 0,
+                "workspaces.{name}.callback_port may not be 0"
+            );
+            ensure!(
+                !workspace.teams.is_empty(),
+                "workspaces.{name}.teams lists no team"
+            );
+            for (key, team) in &workspace.teams {
+                ensure!(
+                    crate::run::valid_team_key(key),
+                    "workspaces.{name}.teams.{key}: `{key}` is not a Linear team key"
+                );
+                ensure!(
+                    !team.review_state.trim().is_empty(),
+                    "workspaces.{name}.teams.{key}.review_state is empty"
+                );
+            }
+            for (key, seconds) in [
+                ("intake_interval_seconds", workspace.intake_interval_seconds),
+                (
+                    "run_read_interval_seconds",
+                    workspace.run_read_interval_seconds,
+                ),
+            ] {
+                ensure!(
+                    (1..=MAX_LINEAR_INTERVAL).contains(&seconds),
+                    "workspaces.{name}.{key} must be between 1 and {MAX_LINEAR_INTERVAL}"
+                );
+            }
         }
         let limits = &self.limits;
         ensure!(
@@ -337,6 +359,22 @@ impl Config {
         self.profile(name)
     }
 
+    pub fn workspace(&self, name: &str) -> Result<&Workspace> {
+        self.workspaces
+            .get(name)
+            .with_context(|| format!("no workspace named `{name}` in the config"))
+    }
+
+    /// The team a run belongs to: its workspace's entry for the team key.
+    pub fn team(&self, workspace: &str, team_key: &str) -> Result<&Team> {
+        self.workspace(workspace)?
+            .teams
+            .get(team_key)
+            .with_context(|| {
+                format!("team `{team_key}` is not configured in workspace `{workspace}`")
+            })
+    }
+
     pub fn repository(&self, name: &str) -> Result<&Repository> {
         self.repositories.get(name).with_context(|| {
             let known: Vec<&str> = self.repositories.keys().map(String::as_str).collect();
@@ -421,9 +459,10 @@ pub mod tests {
     /// A config with every section, used across the test suite. Its profiles
     /// are [`SAMPLE_PROFILES`].
     pub const SAMPLE: &str = r#"
-[linear]
+[workspaces.acme]
 client_id = "client-123"
-teams = ["DATA"]
+
+[workspaces.acme.teams.DATA]
 allowed_user_ids = ["user-1"]
 
 [herdr]
@@ -508,8 +547,19 @@ workers = ["standard", "deep"]
     #[test]
     fn the_sample_parses_with_defaults() {
         let config = sample();
-        assert_eq!(config.linear.callback_port, DEFAULT_CALLBACK_PORT);
-        assert_eq!(config.linear.review_state, "In Review");
+        let acme = config.workspace("acme").unwrap();
+        assert_eq!(acme.callback_port, DEFAULT_CALLBACK_PORT);
+        assert_eq!(
+            config.team("acme", "DATA").unwrap().review_state,
+            "In Review"
+        );
+        assert!(
+            config
+                .team("acme", "WEB")
+                .unwrap_err()
+                .to_string()
+                .contains("team `WEB` is not configured in workspace `acme`")
+        );
         assert_eq!(config.limits, Limits::default());
         assert!(config.notifications.herdr);
         assert_eq!(
@@ -553,7 +603,16 @@ workers = ["standard", "deep"]
             assert_ne!(text, SAMPLE, "{from}");
             load_with(&text, &[]).unwrap_err()
         };
-        bad("teams = [\"DATA\"]", "teams = []");
+        bad(
+            "[workspaces.acme.teams.DATA]",
+            "[workspaces.acme.teams.data]",
+        );
+        bad("client_id = \"client-123\"", "client_id = \" \"");
+        bad("[workspaces.acme]", "[workspaces.Acme]");
+        bad(
+            "[workspaces.acme.teams.DATA]",
+            "[workspaces.acme.teams.DATA]\nreview_state = \"\"",
+        );
         bad("default = \"coordinator\"", "default = \"missing\"");
         bad(
             "workers = [\"standard\", \"deep\"]",
@@ -669,41 +728,75 @@ workers = ["standard", "deep"]
 
     #[test]
     fn linear_intervals_default_to_five_seconds_and_are_checked() {
-        let config = sample();
-        assert_eq!(
-            (
-                config.linear.intake_interval_seconds,
-                config.linear.run_read_interval_seconds
-            ),
-            (5, 5)
-        );
+        let intervals = |config: &Config| {
+            let acme = config.workspace("acme").unwrap();
+            (acme.intake_interval_seconds, acme.run_read_interval_seconds)
+        };
+        assert_eq!(intervals(&sample()), (5, 5));
         let set = |lines: &str| {
             load_with(
                 &SAMPLE.replacen(
-                    "teams = [\"DATA\"]",
-                    &format!("teams = [\"DATA\"]\n{lines}"),
+                    "client_id = \"client-123\"",
+                    &format!("client_id = \"client-123\"\n{lines}"),
                     1,
                 ),
                 &[],
             )
         };
         let config = set("intake_interval_seconds = 30\nrun_read_interval_seconds = 10").unwrap();
-        assert_eq!(
-            (
-                config.linear.intake_interval_seconds,
-                config.linear.run_read_interval_seconds
-            ),
-            (30, 10)
-        );
+        assert_eq!(intervals(&config), (30, 10));
         assert!(
             set("intake_interval_seconds = 0")
                 .unwrap_err()
-                .ends_with("linear.intake_interval_seconds must be between 1 and 3600")
+                .ends_with("workspaces.acme.intake_interval_seconds must be between 1 and 3600")
         );
         assert!(
             set("run_read_interval_seconds = 3601")
                 .unwrap_err()
-                .ends_with("linear.run_read_interval_seconds must be between 1 and 3600")
+                .ends_with("workspaces.acme.run_read_interval_seconds must be between 1 and 3600")
+        );
+    }
+
+    #[test]
+    fn workspaces_and_their_teams_have_their_own_settings() {
+        let text = SAMPLE.to_string()
+            + "\n[workspaces.beta]\nclient_id = \"client-456\"\ncallback_port = 43872\n\n[workspaces.beta.teams.DATA]\nallowed_user_ids = [\"user-2\"]\nreview_state = \"Review\"\n\n[workspaces.beta.teams.OPS]\n";
+        let config = load_with(&text, &[]).unwrap();
+        assert_eq!(
+            config.workspaces.keys().collect::<Vec<_>>(),
+            ["acme", "beta"]
+        );
+        assert_eq!(config.workspace("beta").unwrap().callback_port, 43872);
+        let beta = config.team("beta", "DATA").unwrap();
+        assert_eq!(
+            (beta.allowed_user_ids.as_slice(), beta.review_state.as_str()),
+            (&["user-2".to_string()][..], "Review")
+        );
+        assert_eq!(
+            config.team("acme", "DATA").unwrap().allowed_user_ids,
+            ["user-1"]
+        );
+        let ops = config.team("beta", "OPS").unwrap();
+        assert!(ops.allowed_user_ids.is_empty());
+        assert_eq!(ops.review_state, "In Review");
+
+        let no_teams =
+            SAMPLE.to_string() + "\n[workspaces.beta]\nclient_id = \"client-456\"\nteams = {}\n";
+        assert!(
+            load_with(&no_teams, &[])
+                .unwrap_err()
+                .ends_with("workspaces.beta.teams lists no team")
+        );
+        let none = SAMPLE
+            .replace(
+                "[workspaces.acme.teams.DATA]\nallowed_user_ids = [\"user-1\"]\n",
+                "",
+            )
+            .replace("[workspaces.acme]\nclient_id = \"client-123\"\n", "");
+        assert!(
+            load_with(&none, &[])
+                .unwrap_err()
+                .contains("missing field `workspaces`")
         );
     }
 
