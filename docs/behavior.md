@@ -581,7 +581,7 @@ For every active run with a session, per update, in this order. A read that star
 2. For each worker: copy its report home; when it is `open` and its pane exists, collect its workspace (the live one, or the recorded one); set it `stopped`.
 3. When the coordinator is `open` and its pane exists, collect its workspace.
 4. Close every collected workspace; log failures.
-5. Set the run `closed` and the coordinator `stopped`. Log the close line.
+5. Set the run `closed` and the coordinator `stopped` and, when the run has a session, queue the response ``The issue is <state name>; this run is closed.`` in the same critical section, since Linear shows a session as working until a response ends it (the flush covers closed runs). Log the close line.
 6. A closed run is left alone: nothing is started for it. Reopened and still delegated, it becomes active with the coordinator resumed from its session (`--resume sess-...`). `tests/scenarios:a_completed_issue_closes_the_run_and_a_removed_delegation_detaches_it` (two workspaces closed, worker `stopped`).
 
 `detach_run`: set the run `detached` with a pending interrupt (`interrupt = detach`, cleared when the run becomes active again), log; the first pass with a snapshot interrupts the agents and posts nothing. Workspaces stay. `tests/scenarios:a_detach_while_herdr_is_down_interrupts_once_herdr_is_back` Delegated again, the run is active again. `tests/scenarios:a_completed_issue_closes_the_run_and_a_removed_delegation_detaches_it`

@@ -387,9 +387,17 @@ impl Reconciler {
                 ));
             }
         }
-        update_run(run, |r| {
+        // Linear shows the session working until a response ends it.
+        let body = format!("The issue is {state}; this run is closed.");
+        self.update_and_push(run, move |r| {
             r.status = Status::Closed;
             r.coordinator.status = AgentStatus::Stopped;
+            if r.session_id.is_empty() {
+                return Vec::new();
+            }
+            vec![Op::Activity {
+                activity: Activity::new(Content::Response { body }),
+            }]
         })
         .await?;
         d.log

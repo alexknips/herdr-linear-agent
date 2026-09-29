@@ -644,6 +644,11 @@ async fn a_completed_issue_closes_its_run_and_a_reopened_one_resumes() {
     world.settle().await;
     assert_eq!(world.record(KEY).status, Status::Closed);
     assert_eq!(
+        world.bodies(KEY, "response").last().map(String::as_str),
+        Some("The issue is Done; this run is closed."),
+        "the session ends"
+    );
+    assert_eq!(
         world.herdr.closed().len(),
         2,
         "the worker's and the coordinator's"

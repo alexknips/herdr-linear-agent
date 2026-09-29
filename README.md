@@ -327,7 +327,7 @@ Other kinds are not registered.
 4. Workers write a report (`PR: <url>`, `## Report`, `## Next`). The ticker copies it into the run folder, posts pull requests to the session, and tells the coordinator through its inbox.
 5. Replies in the session from allowed users are appended to `conversation.md` and the coordinator is prompted with one fixed line. A stop signal interrupts the run's agents.
 6. `herdr-linear-agent finish` posts the summary and moves the issue to its team's review state once every worker has reported.
-7. When the issue is completed or canceled, the ticker stops the agents and closes their workspaces. Checkouts and branches are kept.
+7. When the issue is completed or canceled, the ticker stops the agents, closes their workspaces and ends the session with a short response. Checkouts and branches are kept.
 
 When a pane needs a person (a permission or trust dialog), the ticker says so in the session with the pane to go to, and shows a Herdr notification.
 
