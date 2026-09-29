@@ -101,3 +101,34 @@ In the scratch Linear team, with the routing candidates `coordinator-cursor` (`c
 
 Both issues were canceled afterwards and their runs closed.
 
+
+## Waiting for CI (2026-09-29)
+
+What Linear returns for the workers' pull requests (THLA-2 to THLA-11 of the scratch team, read with the Linear MCP):
+
+- The issue's attachments list each pull request with `id`, `title`, `subtitle` and `url` only. THLA-12 and THLA-14 were canceled before a worker opened one.
+- The Diffs view (`get_diff`, `list_diffs`) finds every pull request by its branch `herdr-linear-agent/<key>/<id>-<title>` and gives `status`, `mergeStatus`, `reviewers` and `viewerReviewState`, but no checks. Linear's documentation says the Diffs view shows the overall check status; the MCP does not return it.
+- `sourceType` and `metadata` of the attachments were not read: the MCP does not return them, and reading them with the plugin's own token was left to a person.
+- The scratch repository has no workflows, so no pull request had checks.
+
+The workers' Claude Code sessions (`~/.claude/projects/` for each worktree, Sonnet), from `gh pr create` to the end:
+
+| Issue | CI calls | Calls with `sleep` | Blocking calls | Input tokens of the CI turns |
+| --- | --- | --- | --- | --- |
+| THLA-2, 5, 6, 7, 9 | 1 each | 1 each (5 to 15 s) | 0 | about 60,000 to 70,000 each |
+| THLA-3, 4, 10, 11 | 2 each | 1 each (5 to 15 s) | 0 | about 120,000 to 126,000 each |
+
+Every check was `sleep <n> && gh pr checks <number>` or `gh pr view --json statusCheckRollup`, answered at once with no checks. The 13 CI turns read 805,735 input tokens, 800,488 of them from the prompt cache. No worker looped, because there was nothing to wait for; each check that comes back pending adds a turn of about the same size. The worker rules now say to wait with one blocking command such as `gh pr checks <number> --watch`.
+
+## Subagents in coordinators (2026-09-29)
+
+Each kind was asked to start a subagent that replies `pong`, in a temporary folder, with and without the switch the README lists:
+
+| Kind | Default | With the switch |
+| --- | --- | --- |
+| `claude` 2.1.280, print mode, the coordinator's `.claude/settings.local.json` | Started an Agent subagent with no permission denial, in the default and the `auto` permission mode | `--disallowed-tools=Agent`: `Task` gone from the tool list, answered that it had no such tool. The space-separated form swallowed the prompt |
+| `codex` 0.156.1, `exec --ephemeral` | `spawn_agent` ran, also with `--disable multi_agent` | `-c agents.enabled=false`: no `spawn_agent`. `codex debug prompt-input` at the top level, as an interactive start reads it, lists `spawn_agent` by default and with `--disable multi_agent`, and not with `-c agents.enabled=false` |
+| `cursor` 2026.09.26, print and interactive | `taskToolCall` ran, with a deny-all `.cursor/cli.json` too; `--exclude-tools task_tool_call,create_agent_tool_call` changed nothing | `--allowed-tools shell_tool_call,read_tool_call,ls_tool_call,glob_tool_call,grep_tool_call`: no subagent tool, and `echo` still ran |
+| `opencode` 2.0.15, `mini` in a Herdr pane | The `subagent` tool started `general` | `"permission": {"subagent": "deny"}`, globally or in an agent chosen with `--agent`: no subagent tool |
+
+Interactive Codex was not run past its first screen: it asks to trust every new folder, with `-a never`, with `--dangerously-bypass-approvals-and-sandbox`, and with a `-c projects."<folder>".trust_level="trusted"` override for the folder or its parent. No answer was given, so the Codex config was not changed.

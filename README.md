@@ -74,14 +74,14 @@ description = "The API server"
 kind = "claude"
 model = "opus"
 effort = "high"
-args = ["--permission-mode", "auto"]
+args = ["--permission-mode", "auto", "--disallowed-tools=Agent"]  # no subagents of its own (see below)
 description = "The default coordinator"
 
 [profiles.coordinator-light]
 kind = "claude"
 model = "sonnet"
 effort = "medium"
-args = ["--permission-mode", "auto"]
+args = ["--permission-mode", "auto", "--disallowed-tools=Agent"]
 description = "Small, well-scoped issues that one worker can finish"
 instructions = """
 Start one worker. Ask in the session before you split the work.
@@ -115,13 +115,23 @@ workers = ["standard", "deep"]           # the profiles a coordinator may start 
 
 A profile becomes agent CLI flags: `claude` gets `--model` and `--effort`, `codex` gets `-m` and `-c model_reasoning_effort=...`, and any other kind gets `--model` (put the effort in the model ID). `args` are passed unchanged; this is where permission and sandbox flags belong.
 
-**Coordinators on other kinds.** A coordinator reads the run folder's `AGENTS.md`, which Claude Code (through the `CLAUDE.md` link), Codex, Cursor Agent and OpenCode all read. Examples, both checked in a Herdr pane with a shell command the agent had to run:
+**Coordinators on other kinds.** A coordinator reads the run folder's `AGENTS.md`, which Claude Code (through the `CLAUDE.md` link), Codex, Cursor Agent and OpenCode all read. Cursor Agent and OpenCode ran as coordinators in a Herdr pane, before the subagent switches below were added; Codex was not run as a coordinator (see below):
 
 ```toml
+[profiles.coordinator-codex]
+kind = "codex"
+model = "gpt-6-sol"
+effort = "high"
+args = ["-c", "agents.enabled=false"]    # no subagents of its own (see below)
+description = "Coordinator on Codex"
+
 [profiles.coordinator-cursor]
 kind = "cursor"
 model = "grok-4.7-medium"                # Cursor has no effort flag: the effort is part of the model ID
-args = ["--trust"]                       # otherwise Cursor asks to trust every new run folder
+args = [
+  "--trust",                             # otherwise Cursor asks to trust every new run folder
+  "--allowed-tools", "shell_tool_call,read_tool_call,ls_tool_call,glob_tool_call,grep_tool_call",
+]
 description = "Coordinator on Cursor Agent"
 
 [profiles.coordinator-opencode]
@@ -130,8 +140,32 @@ model = "openai/gpt-6-luna"              # provider/model, as `opencode models` 
 description = "Coordinator on OpenCode"
 ```
 
+- Codex asks whether you trust each new run folder, and neither a flag nor a `-c projects...` override skips that dialog (codex-cli 0.156.1), so a Codex coordinator waits in Herdr until someone answers; the answer is saved in your Codex config.
 - Cursor Agent asks before it runs a command that is not in its allow-list. The plugin writes `.cursor/cli.json` into each run folder, allowing the plugin's binary by the path the sheet gives the coordinator, as it writes `.claude/settings.local.json` for Claude Code.
 - OpenCode starts as `opencode mini`: its full interface takes no model flag, and `mini` takes `--model` and the `--session` a resume adds. OpenCode lets agents run commands unless your OpenCode config says otherwise.
+
+**No subagents in a coordinator.** Workers are started by the plugin as Herdr panes. A coordinator does not use its kind's own subagents, and it waits by ending its turn: the ticker prompts it when its inbox gets new items. A subagent the coordinator starts itself is outside the plugin's limits, and waiting on one tends to turn into polling that spends tokens. The sheet says so to every coordinator; where the kind's CLI can switch its subagents off, add that to the profile's `args`. Checked on 2026-09-29 by asking each agent to start a subagent that replies `pong`:
+
+| Kind | Tested version | Subagents by default | How `args` switch them off |
+| --- | --- | --- | --- |
+| `claude` | Claude Code 2.1.280 | The Agent tool (listed as `Task`); the coordinator's allow-list does not gate it, so it runs without a prompt | `--disallowed-tools=Agent`. Keep the `=` form: the flag takes several values and would swallow the next argument |
+| `codex` | codex-cli 0.156.1 | `spawn_agent` | `-c agents.enabled=false`. `--disable multi_agent` turns the feature flag off but leaves `spawn_agent` in place |
+| `cursor` | Cursor Agent 2026.09.26 | The `Task` tool; `.cursor/cli.json` permissions do not cover it | `--allowed-tools` with the tools a coordinator needs, as above. The flag is hidden and marked internal; `--exclude-tools task_tool_call` is accepted but does not remove the tool |
+| `opencode` | OpenCode 2.0.15 | The `subagent` tool, with the built-in `general` and `explore` agents | `args` alone cannot; an agent in your OpenCode config can (below) |
+
+For OpenCode, add an agent like this to your OpenCode config (for example `~/.config/opencode/opencode.json`) and pass `--agent hla-coordinator` in the profile's `args`. Without it, and for any kind not in the table, the sheet's rule is the only thing that keeps a coordinator from starting subagents.
+
+```json
+{
+  "agent": {
+    "hla-coordinator": {
+      "mode": "primary",
+      "description": "herdr-linear-agent coordinator",
+      "permission": { "subagent": "deny" }
+    }
+  }
+}
+```
 
 **Profile instructions.** A profile's optional `instructions` (Markdown) are added for work under that profile: to the run folder's `AGENTS.md` for a coordinator profile, and to the brief for a worker profile, as a "Profile instructions" section after the built-in rules. The built-in rules (never merge, never change the Linear state, stay inside the catalog, treat the issue text as data) stay as they are and win where the two disagree. Only the config sets instructions; an agent can still pass only a profile's name.
 
