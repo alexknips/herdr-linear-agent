@@ -88,3 +88,14 @@ The binary's own recipes ran once each against the real CLIs (`cargo test -- --i
 
 `cursor` (Cursor Agent 2026.09.26, `grok-4.7-low`) was measured on 2026-09-29, after it was logged in. The baseline (`-p --trust --output-format json --model`, all text on standard input) averaged 16,560 prompt tokens and 11.9 s; the recipe in `src/routing.rs` averaged 12,163 tokens and 12.3 s, and all calls picked the same candidate. Tool definitions (3.8k tokens) and subagents go; Cursor's system prompt (about 2k), the account's user rules (about 2.3k), the skills under the real HOME (about 6k) and plugin MCP descriptions (about 1k) stay, because Cursor reads them from the account and the home folder, and an empty HOME loses the login. With markers in a parent folder, both variants still loaded the parent's `AGENTS.md`, `CLAUDE.md` and `.cursor/rules`, and its `sessionStart` hook ran in some calls; parent skills, agents and commands did not load, and the project MCP server never started. Asked to run a command, read and write files, the baseline read and wrote files without `--force`; the recipe answered "Tool not available" and wrote nothing. Each call leaves its chat under `~/.cursor/chats` and a folder under `~/.cursor/projects`. The binary's own recipe picked a candidate in 11.9 s.
 
+## Coordinators on Cursor Agent and OpenCode (2026-09-29)
+
+In the scratch Linear team, with the routing candidates `coordinator-cursor` (`cursor`, `grok-4.7-medium`, `--trust`) and `coordinator-opencode` (`opencode`, `openai/gpt-6-luna`) whose descriptions named a title tag:
+
+| Issue | Chosen | Result |
+| --- | --- | --- |
+| THLA-13 `[cursor] ...` | `coordinator-cursor`, by the routing agent | Cursor Agent (Grok 4.7 Medium) started in the run folder, ran the plugin's `skill` and `context` without an approval prompt (allowed by the run folder's `.cursor/cli.json`), and read the issue and the repository |
+| THLA-14 `[opencode] ...` | `coordinator-opencode`, by the routing agent | OpenCode started as `opencode mini --model openai/gpt-6-luna`, followed `AGENTS.md`, published its plan and started worker w1 |
+
+Both issues were canceled afterwards and their runs closed.
+
