@@ -5,6 +5,44 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-09-30
+
+
+### Bug Fixes
+
+- take the delegator from the latest delegation in the issue history (#73)
+- end the Linear session when a run closes (#68)
+
+
+### Documentation
+
+- record the live check of allowed delegators (#72)
+- record the live check of the closing response and manual reload (#70)
+- tell users to disable the webhook's delivery (#67)
+- record the live check of profile inheritance and config reload (#66)
+- record the live check with two Linear workspaces (#63)
+- record the live check of workspace-qualified runs (#62)
+- record that no Linear scope or mutation exposes a worker's checks (#59)
+- record that the app user cannot read a worker's checks from Linear (#58)
+- record which Linear fields carry pull request checks and reviews (#57)
+
+
+### Features
+
+- take only issues delegated by allowed users (#71)
+- reload the config on request and tell when it changed (#69)
+- reload the config without restarting the ticker (#65)
+- let a profile inherit from another profile (#64)
+- support several Linear workspaces and per-team settings (#61)
+- read each profile from a folder of its own (#60)
+- keep coordinators off their own subagents and workers off CI polling (#56)
+
+
+### Maintenance
+
+- update dependency jdx/mise to v2026.9.17 (#49)
+- update jdx/mise-action action to v5 (#50)
+
 ## [0.3.0] - 2026-09-29
 
 
