@@ -854,13 +854,17 @@ mod tests {
                         updated_at: T0.into(),
                         state: "unstarted".into(),
                         team: "DATA".into(),
-                        session: Some(crate::linear::api::SessionRef {
-                            id: format!("session-{key}"),
-                            status: "pending".into(),
-                            creator: Some(crate::linear::api::User {
+                        delegator: Some(crate::linear::api::Delegator {
+                            user: Some(crate::linear::api::User {
                                 id: "user-1".into(),
                                 name: "User One".into(),
                             }),
+                            at: T0.into(),
+                        }),
+                        session: Some(crate::linear::api::SessionRef {
+                            id: format!("session-{key}"),
+                            status: "pending".into(),
+                            responded_at: None,
                         }),
                     }],
                 }),

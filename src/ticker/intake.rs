@@ -23,30 +23,33 @@ fn after_cursor(created: &str, cursor: &str) -> bool {
     }
 }
 
-/// What intake does with an issue's delegation, as the app's newest session
-/// on it tells.
+/// What intake does with an issue's latest delegation.
 enum Delegation {
     /// Someone the team allows to delegate delegated it.
     Allowed,
-    /// Someone else, or no person, and the session is complete: it was
-    /// declined before, or it ended with its run.
+    /// Someone else, or no person, and the app's session was answered after
+    /// the delegation: it was declined already.
     Answered,
     /// Someone else, or no person (automation or an agent): the decline for
-    /// the session, or `None` when no session of the app tells.
+    /// the app's session, or `None` when there is no session to answer.
     Declined(Option<Decline>),
 }
 
 fn delegation(key: &str, issue: &IssueRef, delegators: &[String]) -> Delegation {
+    let delegator = issue.delegator.as_ref();
+    if delegator
+        .and_then(|d| d.user.as_ref())
+        .is_some_and(|user| delegators.contains(&user.id))
+    {
+        return Delegation::Allowed;
+    }
     let Some(session) = &issue.session else {
         return Delegation::Declined(None);
     };
-    if session
-        .creator
-        .as_ref()
-        .is_some_and(|creator| delegators.contains(&creator.id))
-    {
-        Delegation::Allowed
-    } else if session.status == "complete" {
+    let at = |text: &str| text.parse::<Timestamp>().ok();
+    let responded = session.responded_at.as_deref().and_then(at);
+    let delegated = delegator.and_then(|d| at(&d.at));
+    if responded.is_some() && responded >= delegated {
         Delegation::Answered
     } else {
         Delegation::Declined(Some(Decline {
@@ -68,11 +71,10 @@ fn open_session(issue: &IssueRef) -> Option<String> {
 /// Logs and notifies a delegation the ticker does not take, with the
 /// delegator's ID for the team's `allowed_delegator_ids`.
 async fn tell_declined<H: Herdr>(d: &Deps<'_, H>, key: &str, issue: &IssueRef) {
-    let creator = issue.session.as_ref().and_then(|s| s.creator.as_ref());
-    let why = match (&issue.session, creator) {
-        (None, _) => "no agent session of this app tells who delegated it".to_string(),
-        (Some(_), None) => "no person delegated it (automation or an agent did)".to_string(),
-        (Some(_), Some(user)) => format!(
+    let why = match issue.delegator.as_ref().map(|d| &d.user) {
+        None => "Linear does not tell who delegated it".to_string(),
+        Some(None) => "no person delegated it (automation or an agent did)".to_string(),
+        Some(Some(user)) => format!(
             "delegated by {} ({}), who is not in allowed_delegator_ids of team {}",
             user.name, user.id, issue.team
         ),
@@ -558,7 +560,7 @@ impl Reconciler {
                 }
             }
             if let Some(run) = run {
-                if let Err(error) = self.reactivate(&run, issue, delegated.read_at).await {
+                if let Err(error) = self.reactivate(&run, delegated.read_at).await {
                     d.fail(&run.key, &error);
                 }
                 continue;
@@ -589,9 +591,8 @@ impl Reconciler {
     }
 
     /// A detached or closed run whose issue is delegated again, in a list
-    /// read after the run stopped, becomes active again, in the session of
-    /// the new delegation.
-    async fn reactivate(&mut self, run: &Run, issue: &IssueRef, read_at: Timestamp) -> Result<()> {
+    /// read after the run stopped, becomes active again.
+    async fn reactivate(&mut self, run: &Run, read_at: Timestamp) -> Result<()> {
         let record = run.record()?;
         if record.status == Status::Active
             || self
@@ -602,15 +603,11 @@ impl Reconciler {
             return Ok(());
         }
         self.changed_at.insert(record.issue_id.clone(), read_at);
-        let session = open_session(issue);
         self.update_and_push(run, |r| {
             if r.status == Status::Active {
                 return Vec::new();
             }
             r.status = Status::Active;
-            if let Some(session) = session {
-                r.session_id = session;
-            }
             if r.interrupt == Some(Interrupt::Detach) {
                 r.interrupt = None;
             }

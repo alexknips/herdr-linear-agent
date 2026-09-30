@@ -31,7 +31,13 @@ const DELEGATED_QUERY: &str = r#"query HlaDelegatedIssues($teamKeys: [String!]!,
   ) {
     nodes {
       id identifier title url updatedAt state { type } team { key }
-      agentSessions(first: 10) { nodes { id status createdAt appUser { id } creator { id name } } }
+      agentSessions(first: 10) {
+        nodes {
+          id status createdAt appUser { id } creator { id name }
+          activities(first: 1) { nodes { createdAt content { __typename } } }
+        }
+      }
+      history(first: 20) { nodes { createdAt actor { id name } toDelegate { id } } }
     }
     pageInfo { hasNextPage endCursor }
   }
@@ -110,20 +116,32 @@ pub struct IssueRef {
     pub state: String,
     #[serde(deserialize_with = "team_key")]
     pub team: String,
+    /// Who delegated the issue to the app, and when.
+    #[serde(skip)]
+    pub delegator: Option<Delegator>,
     /// The app's newest session on the issue.
     #[serde(skip)]
     pub session: Option<SessionRef>,
 }
 
-/// An Agent Session of the app. Linear opens one for each delegation, with
-/// the person who delegated as its creator.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(rename_all = "camelCase")]
+/// Who delegated an issue to the app, and when: the actor of the newest
+/// history entry that delegated it, or, for an issue delegated as it was
+/// created (which leaves no entry), the creator of the app's first session.
+/// Delegating again adds an entry but no session: Linear keeps the one it has.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Delegator {
+    /// `None` when no person did: automation or an agent.
+    pub user: Option<User>,
+    pub at: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct SessionRef {
     pub id: String,
     pub status: String,
-    /// `None` when automation or an agent started the session.
-    pub creator: Option<User>,
+    /// When the session's latest activity is a response, when it was sent.
+    /// A session's `endedAt` and `updatedAt` stay at its first completion.
+    pub responded_at: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -357,12 +375,8 @@ pub trait LinearApi: Sync {
                 for node in nodes(page) {
                     let mut issue: IssueRef = serde_json::from_value(node.clone())
                         .map_err(|_| ApiError::ReadFieldsInvalid)?;
-                    issue.session = nodes(&node["agentSessions"])
-                        .filter(|s| s["appUser"]["id"] == viewer.as_str())
-                        .max_by(|a, b| a["createdAt"].as_str().cmp(&b["createdAt"].as_str()))
-                        .map(|s| serde_json::from_value(s.clone()))
-                        .transpose()
-                        .map_err(|_| ApiError::ReadFieldsInvalid)?;
+                    (issue.delegator, issue.session) =
+                        delegation(node, &viewer).map_err(|_| ApiError::ReadFieldsInvalid)?;
                     issues.push(issue);
                 }
                 let info = &page["pageInfo"];
@@ -622,6 +636,50 @@ fn text(value: &Value, name: &str) -> Result<String, ApiError> {
         .ok_or(ApiError::ReadFieldsInvalid)
 }
 
+/// An issue's delegator and the app's newest session on it, from a node of
+/// `HlaDelegatedIssues`.
+fn delegation(
+    issue: &Value,
+    viewer: &str,
+) -> serde_json::Result<(Option<Delegator>, Option<SessionRef>)> {
+    let created = |a: &&Value, b: &&Value| a["createdAt"].as_str().cmp(&b["createdAt"].as_str());
+    let sessions: Vec<&Value> = nodes(&issue["agentSessions"])
+        .filter(|s| s["appUser"]["id"] == viewer)
+        .collect();
+    let delegated = nodes(&issue["history"])
+        .filter(|h| h["toDelegate"]["id"] == viewer)
+        .max_by(created)
+        .map(|h| (&h["actor"], &h["createdAt"]))
+        .or_else(|| {
+            let first = sessions.iter().copied().min_by(created)?;
+            Some((&first["creator"], &first["createdAt"]))
+        });
+    let delegator = delegated
+        .map(|(user, at)| {
+            Ok::<_, serde_json::Error>(Delegator {
+                user: serde_json::from_value(user.clone())?,
+                at: serde_json::from_value(at.clone())?,
+            })
+        })
+        .transpose()?;
+    let session = sessions
+        .into_iter()
+        .max_by(created)
+        .map(|s| {
+            let latest = nodes(&s["activities"]).next();
+            Ok::<_, serde_json::Error>(SessionRef {
+                id: serde_json::from_value(s["id"].clone())?,
+                status: serde_json::from_value(s["status"].clone())?,
+                responded_at: latest
+                    .filter(|a| a["content"]["__typename"] == "AgentActivityResponseContent")
+                    .and_then(|a| a["createdAt"].as_str())
+                    .map(str::to_string),
+            })
+        })
+        .transpose()?;
+    Ok((delegator, session))
+}
+
 fn nodes(value: &Value) -> impl Iterator<Item = &Value> {
     value["nodes"].as_array().into_iter().flatten()
 }
@@ -833,7 +891,8 @@ pub mod fake {
                     ] }
                 },
                 "labels": { "nodes": [] },
-                "comments": { "nodes": [] }
+                "comments": { "nodes": [] },
+                "history": { "nodes": [] }
             }));
             id
         }
@@ -956,6 +1015,18 @@ pub mod fake {
             self.new_session(issue_id)
         }
 
+        /// `user` delegates the issue again: Linear records it in the history
+        /// and keeps the session it has.
+        pub fn redelegate_by(&mut self, identifier: &str, user: &str) {
+            let at = self.tick_clock();
+            let issue = self.issue_mut(identifier);
+            issue["delegate"] = json!({ "id": APP_USER });
+            issue["history"]["nodes"].as_array_mut().unwrap().insert(
+                0,
+                json!({ "createdAt": at, "actor": { "id": user, "name": name_of(user) }, "toDelegate": { "id": APP_USER } }),
+            );
+        }
+
         /// The session Linear opens when `user` delegates the issue.
         pub fn delegate_by(&mut self, identifier: &str, user: &str) -> String {
             let id = self.delegate_session(identifier);
@@ -1027,8 +1098,13 @@ pub mod fake {
                                 "id": i["id"], "identifier": i["identifier"], "title": i["title"], "url": i["url"],
                                 "updatedAt": i["updatedAt"], "state": { "type": i["state"]["type"] }, "team": { "key": i["team"]["key"] },
                                 "agentSessions": { "nodes": self.sessions.iter().filter(|s| s.issue_id == i["id"]).map(|s| json!({
-                                    "id": s.id, "status": s.status, "createdAt": s.created_at, "appUser": { "id": APP_USER }, "creator": s.creator
-                                })).collect::<Vec<_>>() }
+                                    "id": s.id, "status": s.status, "createdAt": s.created_at, "appUser": { "id": APP_USER }, "creator": s.creator,
+                                    "activities": { "nodes": s.activities.last().map(|a| json!({
+                                        "createdAt": a["createdAt"],
+                                        "content": { "__typename": if a["type"] == "response" { "AgentActivityResponseContent" } else { "AgentActivityThoughtContent" } }
+                                    })).into_iter().collect::<Vec<_>>() }
+                                })).collect::<Vec<_>>() },
+                                "history": i["history"]
                             })
                         })
                         .collect();

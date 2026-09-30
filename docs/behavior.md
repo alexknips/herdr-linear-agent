@@ -463,7 +463,7 @@ The kept modules `src/linear/*` define the operations; the rewrite may make them
 | Operation | Name | Behavior |
 | --- | --- | --- |
 | `viewer` | `HlaViewer` | `{id, name}` |
-| `delegated_issues(teams)` | `HlaDelegatedIssues` | issues with `delegate.isMe`, team key in the list, state type not `completed`/`canceled`; 50 per page, at most 4 pages. Each issue carries the newest (by `createdAt`) of its first 10 `agentSessions` whose `appUser` is the viewer: `id`, `status` and `creator { id name }`. `Issue.agentSessions` is marked internal in Linear's schema; the workspace-wide `agentSessions` list holds other apps' sessions too, so the app's own may be missing from its first page |
+| `delegated_issues(teams)` | `HlaDelegatedIssues` | issues with `delegate.isMe`, team key in the list, state type not `completed`/`canceled`; 50 per page, at most 4 pages. Each issue also brings its first 10 `agentSessions` (`id`, `status`, `createdAt`, `appUser`, `creator { id name }`, and the latest activity's `createdAt` and content type) and its first 20 `history` entries (`createdAt`, `actor { id name }`, `toDelegate { id }`), from which the client keeps the delegator and the app's newest session (see [Who delegated](#who-delegated)). `Issue.agentSessions` is marked internal in Linear's schema; the workspace-wide `agentSessions` list holds other apps' sessions too, so the app's own may be missing from its first page |
 | `issue(id)` | `HlaIssue` | `IssueDetail`: team states, estimation type (default `notUsed`), labels with parent group name, first 50 comments (author default `(unknown)`) |
 | `open_session(issue)` | `HlaSessions`, then `HlaSessionCreate` | the newest (by `createdAt`) session of this app user on the issue whose status is not `complete`; otherwise creates one with `agentSessionCreateOnIssue` |
 | `create_activity(session, id, activity)` | `HlaActivityCreate` | input `agentSessionId`, `id` (the caller's UUID), `content`, `ephemeral`, and `signal`/`signalMetadata` when set |
@@ -525,7 +525,7 @@ Before anything else, an issue without an active run must pass [Who delegated](#
 
 1. A run exists for the key:
    - Active, with no coordinator profile decided and no routing job (a claim cut short, or an older build): read the issue and run `finish_claim`. Log errors as `<KEY>: <error>`.
-   - Not active (detached or closed), in a delegated list read after the detach or close: set it active, and when the issue's session is not `complete` and is not the run's, make it the run's session. A list read at or before that moment does not count, so a list and a run read of one round cannot flip the run back and forth. When the coordinator is `stopped` (a closed run), set it `pending` with `resume = agent_session non-empty` and `launch_attempts = 0`. Queue the thought `The issue was delegated again; the run continues.` and write an inbox item (kind `issue`, subject `issue`): `The issue was delegated to this agent again; the run is active again.`
+   - Not active (detached or closed), in a delegated list read after the detach or close: set it active, in its session. A list read at or before that moment does not count, so a list and a run read of one round cannot flip the run back and forth. When the coordinator is `stopped` (a closed run), set it `pending` with `resume = agent_session non-empty` and `launch_attempts = 0`. Queue the thought `The issue was delegated again; the run continues.` and write an inbox item (kind `issue`, subject `issue`): `The issue was delegated to this agent again; the run is active again.`
    - Otherwise nothing. The issue is never claimed twice. `tests/scenarios:a_delegated_issue_becomes_a_run_whose_coordinator_is_started_and_primed`
 2. No run: skip while `<state_dir>/paused` exists. `tests/scenarios:max_runs_limits_intake_and_pause_stops_it`
 3. Stop the whole intake (not only this issue) when active runs are at `max_runs`, or when the agent count plus one would exceed `max_agents`. `tests/scenarios:max_runs_limits_intake_and_pause_stops_it`
@@ -557,16 +557,18 @@ Rules pinned:
 
 ### Who delegated
 
-Linear opens an Agent Session for each delegation, with the person who delegated as its `creator`. The issue's newest session of the app decides, with the team's delegators: `allowed_delegator_ids`, or `allowed_user_ids` when the key is absent (none when the team is no longer configured):
+The delegator of an issue is the `actor` of the newest of its first 20 `history` entries whose `toDelegate` is the app user. An issue delegated as it was created has no such entry; then it is the `creator` of the app's first session on it, which Linear opened with the issue. Delegating an issue again, open or not, adds a history entry and opens no session: Linear keeps the one it has. For an issue made through Linear's Slack integration, the session's creator is the person who asked in Slack (its `sourceMetadata` has `subType: "slack"`).
 
-| Newest session | Result |
+The delegator and the app's newest session decide, with the team's delegators: `allowed_delegator_ids`, or `allowed_user_ids` when the key is absent (none when the team is no longer configured):
+
+| Delegator and session | Result |
 | --- | --- |
-| creator in the delegators | taken: claimed, or a stopped run is set active |
-| status `complete`, creator not in the delegators or none | skipped silently: declined before, or ended with its run |
-| creator not in the delegators, or none (automation or an agent), status not `complete` | declined: no run, no routing agent; the session is answered once |
-| no session of the app | declined: nothing to answer |
+| delegator in the delegators | taken: claimed, or a stopped run is set active |
+| otherwise, the session's latest activity a response sent at or after the delegation | skipped silently: declined already |
+| otherwise, with a session | declined: no run, no routing agent; the session is answered once |
+| otherwise, no session of the app | declined: nothing to answer |
 
-The assignee and the issue history do not count: anyone can change the assignee before delegating, and the history shows no delegation that happened with the issue's creation.
+"Otherwise" covers another person, no person (automation or an agent, including this app), and an issue whose delegator Linear does not tell. The assignee does not count: anyone can change it before delegating.
 
 A decline is told once per delegation, in the log and a Herdr notification titled `<KEY> not picked up`:
 
@@ -574,9 +576,9 @@ A decline is told once per delegation, in the log and a Herdr notification title
 | --- | --- |
 | another person | `delegated by <name> (<id>), who is not in allowed_delegator_ids of team <TEAM>` |
 | no person | `no person delegated it (automation or an agent did)` |
-| no session | `no agent session of this app tells who delegated it` |
+| not told | `Linear does not tell who delegated it` |
 
-The reconciler hands the declines with a session to the Linear task, which sends the response `This agent does not take issues delegated by this user. Ask someone allowed to delegate it.` once per session; the response ends the session, so later polls skip it, across restarts too. `src/ticker/scenarios.rs:an_issue_delegated_by_someone_not_allowed_is_declined_once`, `src/ticker/scenarios.rs:an_issue_no_person_is_known_to_have_delegated_is_not_picked_up`, `src/ticker/scenarios.rs:a_closed_run_delegated_again_by_someone_not_allowed_stays_closed`, `src/ticker/scenarios.rs:a_closed_run_delegated_again_continues_in_the_new_session`
+The reconciler hands the declines with a session to the Linear task, which sends the response `This agent does not take issues delegated by this user. Ask someone allowed to delegate it.` once per session and delegation. The response ends the session and becomes its latest activity, so later polls, across restarts too, see it answered. A session's `endedAt` and `updatedAt` stay at its first completion, so they cannot tell. `src/ticker/scenarios.rs:an_issue_delegated_by_someone_not_allowed_is_declined_once`, `src/ticker/scenarios.rs:an_issue_no_person_is_known_to_have_delegated_is_not_picked_up`, `src/ticker/scenarios.rs:a_closed_run_delegated_again_by_someone_not_allowed_stays_closed`, `src/ticker/scenarios.rs:a_closed_run_delegated_again_by_someone_allowed_continues`, `src/ticker/scenarios.rs:the_latest_delegation_decides_who_delegated`
 
 A run that is active is not checked: its issue keeps going whoever opens another session on it, for example by mentioning the agent.
 
@@ -862,7 +864,7 @@ After the runs, the task answers each decline it has not answered yet with a `re
 | --- | --- |
 | claim | session (when none), thought `Picked up <ISSUE>.`, issue state `started` |
 | coordinator decided | thought with the profile and the reason |
-| delegated again | thought `The issue was delegated again; the run continues.`, in the new delegation's session |
+| delegated again | thought `The issue was delegated again; the run continues.` |
 | declined delegation | response `This agent does not take issues delegated by this user. Ask someone allowed to delegate it.`, in the delegation's session; no run |
 | `plan set` | plan |
 | `say` | thought |
