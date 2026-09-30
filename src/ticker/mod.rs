@@ -476,6 +476,7 @@ async fn serve(
         log.clone(),
     ));
     let (queries_tx, queries_rx) = watch::channel(Vec::new());
+    let (declines_tx, declines_rx) = watch::channel(Vec::new());
     let (level_tx, level_rx) = watch::channel(Levels::new());
     let level_tx = Arc::new(level_tx);
     let (events_tx, events_rx) = mpsc::channel(EVENT_QUEUE);
@@ -489,6 +490,7 @@ async fn serve(
         linear_wake.push(wake.clone());
         let links = Links {
             queries: queries_rx.clone(),
+            declines: declines_rx.clone(),
             level: level_tx.clone(),
             events: events_tx.clone(),
             wake,
@@ -506,7 +508,7 @@ async fn serve(
             let _ = ended_tx.send(()).await;
         }));
     }
-    drop((queries_rx, level_tx, events_tx, ended_tx));
+    drop((queries_rx, declines_rx, level_tx, events_tx, ended_tx));
     let linear = async move {
         ended.recv().await;
     };
@@ -520,6 +522,7 @@ async fn serve(
         level: level_rx,
         events: events_rx,
         queries: queries_tx,
+        declines: declines_tx,
         linear_wake,
         shutdown: shutdown_rx,
         poke: listen(state_dir, log),

@@ -38,7 +38,7 @@ For each issue, the plugin starts one coordinator agent. The coordinator reads t
 3. **Write the config** at `$XDG_CONFIG_HOME/herdr-linear-agent/config.toml` (default `~/.config/herdr-linear-agent/config.toml`), and one folder per agent profile under `profiles/` next to it. See [Configuration](#configuration) and [Profiles](#profiles).
 4. **Log in:** run the Herdr action **herdr-linear-agent: log in to Linear**. For each workspace without a stored token, it opens the browser, stores the token in the macOS Keychain or, on Linux, the Secret Service (service `dev.herdr-linear-agent.linear.oauth.v1`, one account per workspace named after it), and checks that it acts as the app user; when every workspace has a token, it logs in to all of them again. `herdr-linear-agent action login --workspace <name>` logs in to one workspace again. The browser must run on the same machine: Linear redirects to `127.0.0.1`.
 5. **Check the setup:** run **herdr-linear-agent: check setup**.
-6. **Delegate an issue** in one of the configured teams to the app user.
+6. **Delegate an issue** in one of the configured teams to the app user, as a person in the team's `allowed_delegator_ids`.
 
 ## Configuration
 
@@ -51,6 +51,7 @@ client_id = "your-oauth-client-id"       # the OAuth application of this workspa
 
 [workspaces.acme.teams.DATA]             # a team to pick issues from, by team key
 allowed_user_ids = ["linear-user-uuid"]  # whose replies reach the coordinator
+# allowed_delegator_ids = ["linear-user-uuid"]  # whose delegations are taken (default: allowed_user_ids)
 review_state = "In Review"               # where `finish` moves the issue (default)
 
 [workspaces.acme.teams.OPS]              # each team has its own allowed users and review state
@@ -97,7 +98,17 @@ workers = ["standard", "deep"]           # the profiles a coordinator may start 
 - Removing a profile that a running run uses is not refused; restarting or resuming with it fails then with the usual unknown-profile error.
 - Lowering a limit below the current count leaves running runs alone; new ones wait until there is room.
 
-**Workspaces and teams.** Each workspace polls Linear with its own OAuth application, token and app user. Runs are named `<workspace>/<ISSUE-KEY>`, for example `acme/DATA-1`, so the same issue key in two workspaces makes two runs; the name is what agents pass to `herdr-linear-agent` commands, and the workspace is part of agent names (`acme-data-1-coordinator`), branches (`herdr-linear-agent/acme/data-1/w1-...`) and brief folders. A team's `allowed_user_ids` and `review_state` apply to that team's issues only. A run whose team was removed from the config keeps running, relays nobody's replies and moves to `In Review` on `finish`.
+**Workspaces and teams.** Each workspace polls Linear with its own OAuth application, token and app user. Runs are named `<workspace>/<ISSUE-KEY>`, for example `acme/DATA-1`, so the same issue key in two workspaces makes two runs; the name is what agents pass to `herdr-linear-agent` commands, and the workspace is part of agent names (`acme-data-1-coordinator`), branches (`herdr-linear-agent/acme/data-1/w1-...`) and brief folders. A team's `allowed_user_ids`, `allowed_delegator_ids` and `review_state` apply to that team's issues only. A run whose team was removed from the config keeps running, relays nobody's replies and moves to `In Review` on `finish`.
+
+**Who may delegate.** The ticker takes an issue only when a person in the team's `allowed_delegator_ids` delegated it; see [Security notes](#security-notes), and [Finding user IDs](#finding-user-ids) for the IDs. Without the key, the team's `allowed_user_ids` may delegate. Set it apart when someone should start runs without their replies counting as instructions, or the other way round.
+
+### Finding user IDs
+
+`allowed_user_ids` and `allowed_delegator_ids` take Linear user IDs (UUIDs), not names or emails. Three ways to find one:
+
+- **From the ticker.** When the ticker declines a delegation or ignores a reply, it writes the person's name and ID to `ticker.log` and shows them in a Herdr notification, for example `acme/DATA-1: not picked up: delegated by Jane Doe (6b7b1cde-...), who is not in allowed_delegator_ids of team DATA` or `acme/DATA-1: ignored a reply from Jane Doe (6b7b1cde-...); add the id to allowed_user_ids of team DATA to let it through`. Copy the ID into the config and run **herdr-linear-agent: reload the config**.
+- **From an ignored reply.** A run's `.state/ignored-prompts.md` lists each ignored reply with its sender's ID.
+- **From the Linear API.** With a personal API key, post to `https://api.linear.app/graphql`: the query `{ viewer { id name } }` gives your own ID, and `{ users(filter: { email: { eq: "jane@example.com" } }) { nodes { id name } } }` another person's.
 
 ### Profiles
 
@@ -322,12 +333,13 @@ Other kinds are not registered.
 ## How a run works
 
 1. The ticker (a background process the startup hook starts) polls each workspace every 5 seconds (`intake_interval_seconds`) for issues delegated to its app user in the configured teams that are neither completed nor canceled.
-2. For a new issue it creates a run folder, creates an Agent Session, posts a first thought, moves the issue to the team's first started state, picks the coordinator profile, and opens a Herdr workspace with the coordinator in the run folder.
-3. The coordinator runs `herdr-linear-agent context` every turn, publishes a plan, asks questions, and starts workers with `herdr-linear-agent worker start`. Each worker gets a worktree created by `herdr worktree create` on a branch `herdr-linear-agent/<workspace>/<issue-key>/<id>-<title>`.
-4. Workers write a report (`PR: <url>`, `## Report`, `## Next`). The ticker copies it into the run folder, posts pull requests to the session, and tells the coordinator through its inbox.
-5. Replies in the session from allowed users are appended to `conversation.md` and the coordinator is prompted with one fixed line. A stop signal interrupts the run's agents.
-6. `herdr-linear-agent finish` posts the summary and moves the issue to its team's review state once every worker has reported.
-7. When the issue is completed or canceled, the ticker stops the agents, closes their workspaces and ends the session with a short response. Checkouts and branches are kept.
+2. It checks who delegated each new issue. An issue that someone outside the team's `allowed_delegator_ids` delegated gets no run: the ticker answers its session once, logs the delegator's name and ID and shows a Herdr notification.
+3. For a new issue it creates a run folder, creates an Agent Session, posts a first thought, moves the issue to the team's first started state, picks the coordinator profile, and opens a Herdr workspace with the coordinator in the run folder.
+4. The coordinator runs `herdr-linear-agent context` every turn, publishes a plan, asks questions, and starts workers with `herdr-linear-agent worker start`. Each worker gets a worktree created by `herdr worktree create` on a branch `herdr-linear-agent/<workspace>/<issue-key>/<id>-<title>`.
+5. Workers write a report (`PR: <url>`, `## Report`, `## Next`). The ticker copies it into the run folder, posts pull requests to the session, and tells the coordinator through its inbox.
+6. Replies in the session from allowed users are appended to `conversation.md` and the coordinator is prompted with one fixed line. A stop signal interrupts the run's agents.
+7. `herdr-linear-agent finish` posts the summary and moves the issue to its team's review state once every worker has reported.
+8. When the issue is completed or canceled, the ticker stops the agents, closes their workspaces and ends the session with a short response. Checkouts and branches are kept.
 
 When a pane needs a person (a permission or trust dialog), the ticker says so in the session with the pane to go to, and shows a Herdr notification.
 
@@ -363,10 +375,11 @@ A worker's brief and report live inside its worktree because the worker runs the
 
 ## Security notes
 
+- Anyone who can delegate an issue in a configured team could otherwise start agents on your machine, so the ticker takes only issues that a person in the team's `allowed_delegator_ids` (default: `allowed_user_ids`) delegated. It reads the delegator from the Agent Session Linear opens for the delegation: the session's creator. The assignee does not count, since anyone can change it before delegating. An issue whose session has no creator (automation or another agent delegated it), or that has no session, is not taken either. A run that was closed or detached starts again only when an allowed person delegates its issue again. The session of a declined delegation gets one response, `This agent does not take issues delegated by this user. Ask someone allowed to delegate it.`, which ends it.
 - Agents run as your user. The allow-list the plugin writes for Claude Code and the rules in the coordinator sheet are guidance, not a sandbox: an agent can run any command your shell can.
 - `claude.auto_accept_trust_dialog` makes the plugin accept Claude Code's trust dialog for you in its run folders and in worktrees of your catalog repositories. Turn it on only for repositories you already trust.
 - The plugin has no subcommand that prints the token. The macOS Keychain may ask for confirmation when a rebuilt binary reads it; a locked Secret Service collection asks to be unlocked.
-- The issue text, reports and comments are treated as data. Only replies from the `allowed_user_ids` of the issue's team reach the coordinator as instructions.
+- The issue text, reports and comments are treated as data. Only replies from the `allowed_user_ids` of the issue's team reach the coordinator as instructions; others are recorded in the run's `.state/ignored-prompts.md` and told in the log and a notification.
 
 ## Status
 

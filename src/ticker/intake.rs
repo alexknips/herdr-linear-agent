@@ -9,7 +9,7 @@ use super::reconcile::{
 };
 use crate::herdr::{Herdr, Snapshot, WorkspaceId};
 use crate::linear::api::{Activity, Content, IssueDetail, IssueRef, Prompt, RunUpdate};
-use crate::linear::task::{Levels, LinearEvent, LinearLevel};
+use crate::linear::task::{Decline, Levels, LinearEvent, LinearLevel};
 use crate::outbox::{self, Op, StateTarget};
 use crate::run::{AgentRecord, AgentStatus, Interrupt, Run, RunRecord, Status};
 use crate::{coordinator, files, routing, worker};
@@ -21,6 +21,65 @@ fn after_cursor(created: &str, cursor: &str) -> bool {
         (Ok(created), Ok(cursor)) => created > cursor,
         _ => cursor.is_empty() || created > cursor,
     }
+}
+
+/// What intake does with an issue's delegation, as the app's newest session
+/// on it tells.
+enum Delegation {
+    /// Someone the team allows to delegate delegated it.
+    Allowed,
+    /// Someone else, or no person, and the session is complete: it was
+    /// declined before, or it ended with its run.
+    Answered,
+    /// Someone else, or no person (automation or an agent): the decline for
+    /// the session, or `None` when no session of the app tells.
+    Declined(Option<Decline>),
+}
+
+fn delegation(key: &str, issue: &IssueRef, delegators: &[String]) -> Delegation {
+    let Some(session) = &issue.session else {
+        return Delegation::Declined(None);
+    };
+    if session
+        .creator
+        .as_ref()
+        .is_some_and(|creator| delegators.contains(&creator.id))
+    {
+        Delegation::Allowed
+    } else if session.status == "complete" {
+        Delegation::Answered
+    } else {
+        Delegation::Declined(Some(Decline {
+            key: key.to_string(),
+            session_id: session.id.clone(),
+        }))
+    }
+}
+
+/// The session of the issue's delegation, unless it has ended.
+fn open_session(issue: &IssueRef) -> Option<String> {
+    issue
+        .session
+        .as_ref()
+        .filter(|session| session.status != "complete")
+        .map(|session| session.id.clone())
+}
+
+/// Logs and notifies a delegation the ticker does not take, with the
+/// delegator's ID for the team's `allowed_delegator_ids`.
+async fn tell_declined<H: Herdr>(d: &Deps<'_, H>, key: &str, issue: &IssueRef) {
+    let creator = issue.session.as_ref().and_then(|s| s.creator.as_ref());
+    let why = match (&issue.session, creator) {
+        (None, _) => "no agent session of this app tells who delegated it".to_string(),
+        (Some(_), None) => "no person delegated it (automation or an agent did)".to_string(),
+        (Some(_), Some(user)) => format!(
+            "delegated by {} ({}), who is not in allowed_delegator_ids of team {}",
+            user.name, user.id, issue.team
+        ),
+    };
+    d.log.line(&format!("{key}: not picked up: {why}"));
+    d.notify(&format!("{key} not picked up"), &format!("{why}."))
+        .await;
 }
 
 fn run_of<H>(d: &Deps<'_, H>, issue_id: &str) -> Option<(Run, RunRecord)> {
@@ -201,9 +260,10 @@ impl Reconciler {
         // The run's team decides whose replies count; a team no longer in the
         // config lets nobody's through.
         let record = run.record()?;
+        let team = record.team_key.clone();
         let allowed = d
             .config
-            .team(&record.workspace, &record.team_key)
+            .team(&record.workspace, &team)
             .map(|team| team.allowed_user_ids.clone())
             .unwrap_or_default();
         for prompt in prompts {
@@ -216,14 +276,31 @@ impl Reconciler {
                 continue;
             }
             if !allowed.contains(&prompt.user_id) {
-                self.guarded(run, move |run, lock| {
-                    if after_cursor(&created, &run.record()?.prompt_cursor) {
-                        run.record_ignored_prompt_held(lock, &created, &user, &body)?;
-                        run.update_held(lock, |r| r.prompt_cursor = created)?;
-                    }
-                    Ok(((), Vec::new()))
-                })
-                .await?;
+                let recorded = self
+                    .guarded(run, move |run, lock| {
+                        let new = after_cursor(&created, &run.record()?.prompt_cursor);
+                        if new {
+                            run.record_ignored_prompt_held(lock, &created, &user, &body)?;
+                            run.update_held(lock, |r| r.prompt_cursor = created)?;
+                        }
+                        Ok((new, Vec::new()))
+                    })
+                    .await?;
+                if recorded {
+                    let from = match prompt.user_name.as_str() {
+                        "" => prompt.user_id.clone(),
+                        name => format!("{name} ({})", prompt.user_id),
+                    };
+                    let hint =
+                        format!("add the id to allowed_user_ids of team {team} to let it through");
+                    d.log
+                        .line(&format!("{}: ignored a reply from {from}; {hint}", run.key));
+                    d.notify(
+                        &format!("{} ignored a reply", run.key),
+                        &format!("From {from}; {hint}."),
+                    )
+                    .await;
+                }
                 continue;
             }
             if prompt.signal.as_deref() == Some("stop") {
@@ -452,10 +529,36 @@ impl Reconciler {
             .insert(workspace.to_string(), delegated.read_at);
         let runs_dir = d.ctx.runs_dir();
         let paused = d.ctx.state_dir().join("paused").exists();
+        let mut declined = std::collections::BTreeMap::new();
         for issue in &delegated.issues {
             let key = crate::run::run_key(workspace, &issue.identifier);
-            if let Ok(run) = Run::load(&runs_dir, &key) {
-                if let Err(error) = self.reactivate(&run, delegated.read_at).await {
+            let run = Run::load(&runs_dir, &key).ok();
+            let active = run
+                .as_ref()
+                .and_then(|run| run.record().ok())
+                .is_some_and(|record| record.status == Status::Active);
+            // Only a claim or a restart takes a delegation: a running run
+            // keeps going whoever opens another session on its issue.
+            if !active {
+                let delegators = d
+                    .config
+                    .team(workspace, &issue.team)
+                    .map(|team| team.delegators().to_vec())
+                    .unwrap_or_default();
+                match delegation(&key, issue, &delegators) {
+                    Delegation::Allowed => {}
+                    Delegation::Answered => continue,
+                    Delegation::Declined(decline) => {
+                        if self.declined.get(&key) != Some(&decline) {
+                            tell_declined(d, &key, issue).await;
+                        }
+                        declined.insert(key, decline);
+                        continue;
+                    }
+                }
+            }
+            if let Some(run) = run {
+                if let Err(error) = self.reactivate(&run, issue, delegated.read_at).await {
                     d.fail(&run.key, &error);
                 }
                 continue;
@@ -480,11 +583,15 @@ impl Reconciler {
                 d.log.line(&format!("{key}: could not pick up: {error:#}"));
             }
         }
+        self.declined
+            .retain(|key, _| crate::run::split_key(key).0 != workspace);
+        self.declined.extend(declined);
     }
 
     /// A detached or closed run whose issue is delegated again, in a list
-    /// read after the run stopped, becomes active again.
-    async fn reactivate(&mut self, run: &Run, read_at: Timestamp) -> Result<()> {
+    /// read after the run stopped, becomes active again, in the session of
+    /// the new delegation.
+    async fn reactivate(&mut self, run: &Run, issue: &IssueRef, read_at: Timestamp) -> Result<()> {
         let record = run.record()?;
         if record.status == Status::Active
             || self
@@ -495,11 +602,15 @@ impl Reconciler {
             return Ok(());
         }
         self.changed_at.insert(record.issue_id.clone(), read_at);
+        let session = open_session(issue);
         self.update_and_push(run, |r| {
             if r.status == Status::Active {
                 return Vec::new();
             }
             r.status = Status::Active;
+            if let Some(session) = session {
+                r.session_id = session;
+            }
             if r.interrupt == Some(Interrupt::Detach) {
                 r.interrupt = None;
             }
@@ -541,6 +652,7 @@ impl Reconciler {
             title: issue.title.clone(),
             url: issue.url.clone(),
             team_key: issue.team.clone(),
+            session_id: open_session(issue).unwrap_or_default(),
             created: now.clone(),
             prompt_cursor: now.clone(),
             last_activity: now.clone(),

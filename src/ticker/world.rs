@@ -18,7 +18,7 @@ use crate::commands::{self, Session, WorkerStart};
 use crate::config::Config;
 use crate::herdr::FakeHerdr;
 use crate::linear::api::fake::FakeLinear;
-use crate::linear::task::{LinearEvent, LinearLevel, LinearTask, RunQuery};
+use crate::linear::task::{Decline, LinearEvent, LinearLevel, LinearTask, RunQuery};
 use crate::paths::{Ctx, Env};
 use crate::process::fake::{FakeRunner, fail, ok};
 use crate::run::{Run, RunRecord};
@@ -342,6 +342,7 @@ impl World {
         let queries = self.queries_for_step();
         let mut events = std::mem::take(&mut self.injected);
         events.append(&mut self.held);
+        let declines = self.reconciler.declines();
         let (sender, mut sent) = mpsc::channel(1024);
         let of = |workspace: &str| -> Vec<RunQuery> {
             queries
@@ -350,15 +351,34 @@ impl World {
                 .cloned()
                 .collect()
         };
+        let declines_of = |workspace: &str| -> Vec<Decline> {
+            declines
+                .iter()
+                .filter(|d| crate::run::split_key(&d.key).0 == workspace)
+                .cloned()
+                .collect()
+        };
         self.task
-            .step_into(&self.linear, &of("acme"), self.now, &sender)
+            .step_into(
+                &self.linear,
+                &of("acme"),
+                &declines_of("acme"),
+                self.now,
+                &sender,
+            )
             .await;
         for (name, remote) in &mut self.others {
             remote.task.force_due();
             remote.linear.lock().unwrap().present = Some(self.now);
             remote
                 .task
-                .step_into(&remote.linear, &of(name), self.now, &sender)
+                .step_into(
+                    &remote.linear,
+                    &of(name),
+                    &declines_of(name),
+                    self.now,
+                    &sender,
+                )
                 .await;
             for line in remote.task.take_log() {
                 self.log.line(&line);
@@ -592,11 +612,23 @@ impl World {
         crate::worker::load(&self.run(key), id).unwrap()
     }
 
-    /// An issue of the DATA team delegated to the app user.
+    /// An issue of the DATA team delegated to the app user by the first user
+    /// the team allows to delegate.
     pub fn delegate(&self, key: &str, title: &str, estimate: Option<f64>) -> String {
+        let workspace = match crate::run::split_key(key).0 {
+            "" => "acme",
+            other => other,
+        };
+        let delegator = self.config.team(workspace, "DATA").unwrap().delegators()[0].clone();
+        self.delegate_by(key, &delegator, title, estimate)
+    }
+
+    /// An issue of the DATA team delegated to the app user by `user`.
+    pub fn delegate_by(&self, key: &str, user: &str, title: &str, estimate: Option<f64>) -> String {
         let mut fake = self.fake_for(key);
         let id = fake.add_issue(issue_key(key), "DATA", title);
         fake.issue_mut(issue_key(key))["estimate"] = json!(estimate);
+        fake.delegate_by(issue_key(key), user);
         id
     }
 

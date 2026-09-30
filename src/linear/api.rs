@@ -29,7 +29,10 @@ const DELEGATED_QUERY: &str = r#"query HlaDelegatedIssues($teamKeys: [String!]!,
       state: { type: { nin: ["completed", "canceled"] } }
     }
   ) {
-    nodes { id identifier title url updatedAt state { type } team { key } }
+    nodes {
+      id identifier title url updatedAt state { type } team { key }
+      agentSessions(first: 10) { nodes { id status createdAt appUser { id } creator { id name } } }
+    }
     pageInfo { hasNextPage endCursor }
   }
 }"#;
@@ -82,7 +85,7 @@ const ISSUE_STATE_UPDATE: &str = r#"mutation HlaIssueState($id: String!, $stateI
 const RUN_PART: &str = r#"  i@: issue(id: $i@) { updatedAt state { type name } delegate { id } }
   s@: agentSession(id: $s@) {
     activities(first: 50, filter: { type: { eq: "prompt" }, createdAt: { gt: $c@ } }) {
-      nodes { id createdAt signal user { id } content { ... on AgentActivityPromptContent { body } } }
+      nodes { id createdAt signal user { id name } content { ... on AgentActivityPromptContent { body } } }
     }
   }
 "#;
@@ -107,6 +110,27 @@ pub struct IssueRef {
     pub state: String,
     #[serde(deserialize_with = "team_key")]
     pub team: String,
+    /// The app's newest session on the issue.
+    #[serde(skip)]
+    pub session: Option<SessionRef>,
+}
+
+/// An Agent Session of the app. Linear opens one for each delegation, with
+/// the person who delegated as its creator.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionRef {
+    pub id: String,
+    pub status: String,
+    /// `None` when automation or an agent started the session.
+    pub creator: Option<User>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct User {
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
 }
 
 fn state_type<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
@@ -257,6 +281,7 @@ pub struct Prompt {
     pub created_at: String,
     pub signal: Option<String>,
     pub user_id: String,
+    pub user_name: String,
     pub body: String,
 }
 
@@ -327,12 +352,18 @@ pub trait LinearApi: Sync {
                 let data = self
                     .execute("HlaDelegatedIssues", DELEGATED_QUERY, variables, false)
                     .await?;
+                let viewer = text(field(&data, "viewer")?, "id")?;
                 let page = field(&data, "issues")?;
                 for node in nodes(page) {
-                    issues.push(
-                        serde_json::from_value(node.clone())
-                            .map_err(|_| ApiError::ReadFieldsInvalid)?,
-                    );
+                    let mut issue: IssueRef = serde_json::from_value(node.clone())
+                        .map_err(|_| ApiError::ReadFieldsInvalid)?;
+                    issue.session = nodes(&node["agentSessions"])
+                        .filter(|s| s["appUser"]["id"] == viewer.as_str())
+                        .max_by(|a, b| a["createdAt"].as_str().cmp(&b["createdAt"].as_str()))
+                        .map(|s| serde_json::from_value(s.clone()))
+                        .transpose()
+                        .map_err(|_| ApiError::ReadFieldsInvalid)?;
+                    issues.push(issue);
                 }
                 let info = &page["pageInfo"];
                 if info["hasNextPage"].as_bool() != Some(true) {
@@ -528,6 +559,7 @@ pub trait LinearApi: Sync {
                                 created_at: text(a, "createdAt")?,
                                 signal: a["signal"].as_str().map(str::to_string),
                                 user_id: a["user"]["id"].as_str().unwrap_or("").to_string(),
+                                user_name: a["user"]["name"].as_str().unwrap_or("").to_string(),
                                 body: a["content"]["body"].as_str().unwrap_or("").to_string(),
                             })
                         })
@@ -693,6 +725,8 @@ pub mod fake {
         /// `pending` when created; tests set other states.
         pub status: String,
         pub created_at: String,
+        /// `{ id, name }` of the person who delegated, or null.
+        pub creator: Value,
         /// Activity records in the shape the API returns, oldest first.
         pub activities: Vec<Value>,
         pub plan: Option<Value>,
@@ -746,6 +780,11 @@ pub mod fake {
         /// it also sets the issue ids apart from another fake's.
         pub organization: String,
         clock: i64,
+    }
+
+    /// The name the fake gives a user ID.
+    pub fn name_of(user: &str) -> String {
+        format!("Person {user}")
     }
 
     fn viewer() -> Value {
@@ -827,11 +866,12 @@ pub mod fake {
             issue["updatedAt"] = json!("2026-09-26T00:00:00.000Z");
         }
 
-        /// The session created on an issue.
+        /// The newest session on an issue.
         pub fn session(&self, identifier: &str) -> &FakeSession {
             let id = self.issue(identifier)["id"].clone();
             self.sessions
                 .iter()
+                .rev()
                 .find(|s| s.issue_id == id)
                 .expect("fake session")
         }
@@ -909,10 +949,18 @@ pub mod fake {
             );
         }
 
-        /// The session Linear creates by itself when the issue is delegated.
+        /// The session Linear creates by itself when the issue is delegated,
+        /// with no person as its creator.
         pub fn delegate_session(&mut self, identifier: &str) -> String {
             let issue_id = self.issue(identifier)["id"].as_str().unwrap().to_string();
             self.new_session(issue_id)
+        }
+
+        /// The session Linear opens when `user` delegates the issue.
+        pub fn delegate_by(&mut self, identifier: &str, user: &str) -> String {
+            let id = self.delegate_session(identifier);
+            self.session_mut(&id).unwrap().creator = json!({ "id": user, "name": name_of(user) });
+            id
         }
 
         /// A person's message in the issue's session.
@@ -933,11 +981,12 @@ pub mod fake {
             let session = self
                 .sessions
                 .iter_mut()
+                .rev()
                 .find(|s| s.issue_id == id)
                 .expect("fake session");
             session.activities.push(json!({
                 "id": format!("prompt-{n}"), "type": "prompt", "createdAt": created, "signal": signal,
-                "user": { "id": user_id }, "content": { "type": "prompt", "body": body }
+                "user": { "id": user_id, "name": name_of(user_id) }, "content": { "type": "prompt", "body": body }
             }));
             let session_id = session.id.clone();
             self.session_comment(&session_id, user_id, false, body);
@@ -976,7 +1025,10 @@ pub mod fake {
                         .map(|i| {
                             json!({
                                 "id": i["id"], "identifier": i["identifier"], "title": i["title"], "url": i["url"],
-                                "updatedAt": i["updatedAt"], "state": { "type": i["state"]["type"] }, "team": { "key": i["team"]["key"] }
+                                "updatedAt": i["updatedAt"], "state": { "type": i["state"]["type"] }, "team": { "key": i["team"]["key"] },
+                                "agentSessions": { "nodes": self.sessions.iter().filter(|s| s.issue_id == i["id"]).map(|s| json!({
+                                    "id": s.id, "status": s.status, "createdAt": s.created_at, "appUser": { "id": APP_USER }, "creator": s.creator
+                                })).collect::<Vec<_>>() }
                             })
                         })
                         .collect();
@@ -1031,6 +1083,10 @@ pub mod fake {
                     });
                     if activity["signal"].is_null() {
                         activity["signal"] = Value::Null;
+                    }
+                    // A response ends the session, as in Linear.
+                    if activity["type"] == "response" {
+                        session.status = "complete".into();
                     }
                     session.activities.push(activity);
                     if input["ephemeral"] != true {

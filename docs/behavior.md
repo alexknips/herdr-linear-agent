@@ -87,6 +87,7 @@ File: `<config_dir>/config.toml`. Unknown keys are refused in every table. The k
 | `workspaces.<name>.run_read_interval_seconds` | u64 | `5` | 1 to 3600, likewise |
 | `workspaces.<name>.teams` | table of teams by team key | required | non-empty: `workspaces.<name>.teams lists no team`; a key is a Linear team key: ``workspaces.<name>.teams.<key>: `<key>` is not a Linear team key`` |
 | `workspaces.<name>.teams.<key>.allowed_user_ids` | list | `[]` | whose replies in that team's sessions reach the coordinator |
+| `workspaces.<name>.teams.<key>.allowed_delegator_ids` | list | `allowed_user_ids` | whose delegations of that team's issues the ticker takes (see [Intake and claim](#intake-and-claim)) |
 | `workspaces.<name>.teams.<key>.review_state` | string | `In Review` | not blank: `workspaces.<name>.teams.<key>.review_state is empty`; where `finish` moves that team's issues |
 | `herdr.session` | string | unset: Herdr's default session | |
 | `limits.max_runs` | u32 | `2` | the three limits must satisfy `max_runs >= 1`, `max_workers_per_run >= 1`, `max_agents >= 2`: `limits must allow one run with one worker` |
@@ -431,6 +432,9 @@ Once per pass the reconciler drops what its in-memory maps (launched starts, Not
 | `<workspace>: Linear is not available: <error>; run the login action` | the workspace's credential cannot be used; logged once |
 | `intake: <error>` | the delegated-issue poll failed |
 | `<KEY>: picked up` | a claim |
+| `<KEY>: not picked up: <why>` | a delegation the ticker does not take, once per delegation (see [Who delegated](#who-delegated)) |
+| `<KEY>: could not answer the declined session: <error>` | the decline's response failed; retried on the next flush |
+| `<KEY>: ignored a reply from <name> (<id>); add the id to allowed_user_ids of team <TEAM> to let it through` | a reply from a user not allowed; `<id>` alone when Linear gives no name |
 | `<KEY>: could not pick up: <error>` | a claim failed |
 | `<KEY>: could not open the session yet: <error>` | not written by the rewrite: the claim leaves the session to the flush, which logs the next line |
 | `<KEY>: could not create the session: <error>` | flush without a session |
@@ -459,7 +463,7 @@ The kept modules `src/linear/*` define the operations; the rewrite may make them
 | Operation | Name | Behavior |
 | --- | --- | --- |
 | `viewer` | `HlaViewer` | `{id, name}` |
-| `delegated_issues(teams)` | `HlaDelegatedIssues` | issues with `delegate.isMe`, team key in the list, state type not `completed`/`canceled`; 50 per page, at most 4 pages |
+| `delegated_issues(teams)` | `HlaDelegatedIssues` | issues with `delegate.isMe`, team key in the list, state type not `completed`/`canceled`; 50 per page, at most 4 pages. Each issue carries the newest (by `createdAt`) of its first 10 `agentSessions` whose `appUser` is the viewer: `id`, `status` and `creator { id name }`. `Issue.agentSessions` is marked internal in Linear's schema; the workspace-wide `agentSessions` list holds other apps' sessions too, so the app's own may be missing from its first page |
 | `issue(id)` | `HlaIssue` | `IssueDetail`: team states, estimation type (default `notUsed`), labels with parent group name, first 50 comments (author default `(unknown)`) |
 | `open_session(issue)` | `HlaSessions`, then `HlaSessionCreate` | the newest (by `createdAt`) session of this app user on the issue whose status is not `complete`; otherwise creates one with `agentSessionCreateOnIssue` |
 | `create_activity(session, id, activity)` | `HlaActivityCreate` | input `agentSessionId`, `id` (the caller's UUID), `content`, `ephemeral`, and `signal`/`signalMetadata` when set |
@@ -517,9 +521,11 @@ Rules:
 
 Per workspace, from a delegated list of that workspace the reconciler has not used yet (the read time of the last one used is kept per workspace), for each delegated issue in the order returned; its key is `<workspace>/<ISSUE>`:
 
+Before anything else, an issue without an active run must pass [Who delegated](#who-delegated). A declined one is skipped here, before the pause and the limits.
+
 1. A run exists for the key:
    - Active, with no coordinator profile decided and no routing job (a claim cut short, or an older build): read the issue and run `finish_claim`. Log errors as `<KEY>: <error>`.
-   - Not active (detached or closed), in a delegated list read after the detach or close: set it active. A list read at or before that moment does not count, so a list and a run read of one round cannot flip the run back and forth. When the coordinator is `stopped` (a closed run), set it `pending` with `resume = agent_session non-empty` and `launch_attempts = 0`. Queue the thought `The issue was delegated again; the run continues.` and write an inbox item (kind `issue`, subject `issue`): `The issue was delegated to this agent again; the run is active again.`
+   - Not active (detached or closed), in a delegated list read after the detach or close: set it active, and when the issue's session is not `complete` and is not the run's, make it the run's session. A list read at or before that moment does not count, so a list and a run read of one round cannot flip the run back and forth. When the coordinator is `stopped` (a closed run), set it `pending` with `resume = agent_session non-empty` and `launch_attempts = 0`. Queue the thought `The issue was delegated again; the run continues.` and write an inbox item (kind `issue`, subject `issue`): `The issue was delegated to this agent again; the run is active again.`
    - Otherwise nothing. The issue is never claimed twice. `tests/scenarios:a_delegated_issue_becomes_a_run_whose_coordinator_is_started_and_primed`
 2. No run: skip while `<state_dir>/paused` exists. `tests/scenarios:max_runs_limits_intake_and_pause_stops_it`
 3. Stop the whole intake (not only this issue) when active runs are at `max_runs`, or when the agent count plus one would exceed `max_agents`. `tests/scenarios:max_runs_limits_intake_and_pause_stops_it`
@@ -530,10 +536,10 @@ Agent count: over active runs, one for a coordinator that is `pending` or `open`
 ### `claim(issue)`
 
 1. Validate the issue key; read the issue detail.
-2. Create the state and runs directories. Create the run with `workspace`, `issue_id`, `identifier`, `title`, `url`, `team_key`, `labels`, `created = now`, `issue_updated_at`, `issue_hash`, `prompt_cursor = last_activity = timeout_since = now` and `announce_pending = true`.
+2. Create the state and runs directories. Create the run with `workspace`, `issue_id`, `session_id` (the delegation's session unless it is `complete`), `identifier`, `title`, `url`, `team_key`, `labels`, `created = now`, `issue_updated_at`, `issue_hash`, `prompt_cursor = last_activity = timeout_since = now` and `announce_pending = true`.
 3. Log `<KEY>: picked up`.
 4. Queue the thought `Picked up <ISSUE>.` and the issue-state request with target `started`, clearing `announce_pending` in the same critical section.
-5. The run's query has no `issue_updated_at`, so the next run read brings the issue detail; that writes `issue.md` (the first write is not an edit) and runs `finish_claim`. The session is opened by the flush (Linear's auto-created one, or a new one).
+5. The run's query has no `issue_updated_at`, so the next run read brings the issue detail; that writes `issue.md` (the first write is not an edit) and runs `finish_claim`. A run without a session gets one from the flush (Linear's auto-created one, or a new one).
 
 ### `finish_claim(run, detail)`
 
@@ -545,9 +551,34 @@ Agent count: over active runs, one for a coordinator that is `pending` or `open`
 Rules pinned:
 
 - In the claim pass the session gets the thoughts `Picked up DATA-1.` then ``The coordinator uses the `coordinator` profile (chosen by the routing agent).``, the issue moves to `In Progress`, and the coordinator is placed (status `open`) with the pane's cwd equal to `canonical_dir`. `tests/scenarios:a_delegated_issue_becomes_a_run_whose_coordinator_is_started_and_primed`
-- The session Linear created on delegation is used; no second session is made. `tests/scenarios:the_session_linear_created_on_delegation_is_used`
-- A claim without a session still decides the coordinator (`coordinator`, since the size is unknown and no routing agent is configured). A later poll finishes an active run whose coordinator is undecided: session opened, one session only, `Picked up DATA-1.` sent, issue `In Progress`. `tests/scenarios:a_claim_without_a_session_still_decides_its_coordinator`
+- The session Linear created on delegation is the run's; no session is looked up or made. `src/ticker/scenarios.rs:the_session_linear_opened_on_delegation_is_the_runs_session`
+- A later poll finishes an active run whose coordinator is undecided: one session only, `Picked up DATA-1.` sent once, issue `In Progress`. `src/ticker/scenarios.rs:a_lost_decision_is_made_again`
 - Linear shows an agent as unresponsive when a session gets no activity within 10 s of its creation. With a 5 s poll the first thought goes out within one interval of the delegation.
+
+### Who delegated
+
+Linear opens an Agent Session for each delegation, with the person who delegated as its `creator`. The issue's newest session of the app decides, with the team's delegators: `allowed_delegator_ids`, or `allowed_user_ids` when the key is absent (none when the team is no longer configured):
+
+| Newest session | Result |
+| --- | --- |
+| creator in the delegators | taken: claimed, or a stopped run is set active |
+| status `complete`, creator not in the delegators or none | skipped silently: declined before, or ended with its run |
+| creator not in the delegators, or none (automation or an agent), status not `complete` | declined: no run, no routing agent; the session is answered once |
+| no session of the app | declined: nothing to answer |
+
+The assignee and the issue history do not count: anyone can change the assignee before delegating, and the history shows no delegation that happened with the issue's creation.
+
+A decline is told once per delegation, in the log and a Herdr notification titled `<KEY> not picked up`:
+
+| Case | Log line and notification text |
+| --- | --- |
+| another person | `delegated by <name> (<id>), who is not in allowed_delegator_ids of team <TEAM>` |
+| no person | `no person delegated it (automation or an agent did)` |
+| no session | `no agent session of this app tells who delegated it` |
+
+The reconciler hands the declines with a session to the Linear task, which sends the response `This agent does not take issues delegated by this user. Ask someone allowed to delegate it.` once per session; the response ends the session, so later polls skip it, across restarts too. `src/ticker/scenarios.rs:an_issue_delegated_by_someone_not_allowed_is_declined_once`, `src/ticker/scenarios.rs:an_issue_no_person_is_known_to_have_delegated_is_not_picked_up`, `src/ticker/scenarios.rs:a_closed_run_delegated_again_by_someone_not_allowed_stays_closed`, `src/ticker/scenarios.rs:a_closed_run_delegated_again_continues_in_the_new_session`
+
+A run that is active is not checked: its issue keeps going whoever opens another session on it, for example by mentioning the agent.
 
 ## Routing
 
@@ -594,7 +625,7 @@ Checkouts and branches are never removed.
 
 `relay(run, prompts)`, prompts oldest first. Nothing happens for an empty list. For each prompt:
 
-- A user not in the `allowed_user_ids` of the run's team (`workspaces.<workspace>.teams.<team_key>`; nobody when that team is no longer configured): append to `.state/ignored-prompts.md`; nothing else. Stop signals from such users are ignored too.
+- A user not in the `allowed_user_ids` of the run's team (`workspaces.<workspace>.teams.<team_key>`; nobody when that team is no longer configured): append to `.state/ignored-prompts.md`, log `<KEY>: ignored a reply from <name> (<id>); add the id to allowed_user_ids of team <TEAM> to let it through` and show a Herdr notification `<KEY> ignored a reply` / `From <name> (<id>); add the id to allowed_user_ids of team <TEAM> to let it through.`; nothing else. Stop signals from such users are ignored too. `allowed_delegator_ids` plays no part here. `src/ticker/scenarios.rs:someone_allowed_only_to_delegate_starts_a_run_but_is_not_listened_to`
 - Signal `stop` from an allowed user: set `stopped = true` and a pending interrupt (`interrupt = stop`). The first pass with a snapshot, which may be this one, interrupts the agents, clears it and queues the response `Stopped <n> agent(s) as asked. Their worktrees are kept; reply here to continue.` with the true count. `tests/scenarios:a_stop_while_herdr_is_down_interrupts_once_herdr_is_back`
 - Any other allowed prompt:
   1. Append it to `conversation.md`.
@@ -821,7 +852,9 @@ For every run with queued requests, including detached and closed runs:
 2. Send. When an activity went out, set `last_activity = now`. Log refusals and a blocked queue.
 3. When any run was blocked, remember since when. The reconciler forgets a blocked run that is no longer active. `tests/scenarios:a_failing_outbox_of_a_run_that_ended_raises_no_notice` When Linear has accepted no write for 10 minutes, show once the notification `herdr-linear-agent` / `Linear has not accepted writes for 10 minutes. They are kept and retried; see the ticker log.` A flush without a block resets the timer and the notice.
 
-Requests queued before the session existed wait and go out once it exists. `tests/scenarios:a_claim_without_a_session_still_decides_its_coordinator`
+Requests queued before the session existed wait and go out once it exists.
+
+After the runs, the task answers each decline it has not answered yet with a `response` activity (see [Who delegated](#who-delegated)).
 
 ### Linear writes by event
 
@@ -829,7 +862,8 @@ Requests queued before the session existed wait and go out once it exists. `test
 | --- | --- |
 | claim | session (when none), thought `Picked up <ISSUE>.`, issue state `started` |
 | coordinator decided | thought with the profile and the reason |
-| delegated again | thought `The issue was delegated again; the run continues.` |
+| delegated again | thought `The issue was delegated again; the run continues.`, in the new delegation's session |
+| declined delegation | response `This agent does not take issues delegated by this user. Ask someone allowed to delegate it.`, in the delegation's session; no run |
 | `plan set` | plan |
 | `say` | thought |
 | `ask` | elicitation, with `select` options when given |

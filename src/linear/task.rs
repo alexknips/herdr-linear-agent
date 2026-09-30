@@ -7,7 +7,7 @@
 //! an activity was sent, writes started or stopped failing) is a
 //! [`LinearEvent`], reported once.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -15,7 +15,7 @@ use jiff::{SignedDuration, Timestamp};
 use tokio::sync::{Notify, mpsc, watch};
 
 use super::ApiError;
-use super::api::{self, IssueDetail, IssueRef, IssueStatus, RunUpdate};
+use super::api::{self, Activity, Content, IssueDetail, IssueRef, IssueStatus, RunUpdate};
 use super::client::LinearApi;
 use super::transport::RateHeaders;
 use crate::config;
@@ -121,9 +121,23 @@ pub struct RunQuery {
     pub issue_updated_at: Option<String>,
 }
 
+/// The response a declined delegation's session gets; it ends the session.
+pub const DECLINED: &str =
+    "This agent does not take issues delegated by this user. Ask someone allowed to delegate it.";
+
+/// A delegation the reconciler turned down; the Linear task answers its
+/// session once.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Decline {
+    /// `<workspace>/<ISSUE-KEY>`: only that workspace's task answers it.
+    pub key: String,
+    pub session_id: String,
+}
+
 /// The channels the task talks through.
 pub struct Links {
     pub queries: watch::Receiver<Vec<RunQuery>>,
+    pub declines: watch::Receiver<Vec<Decline>>,
     /// Shared by every workspace's task; each one sets only its own entry.
     pub level: Arc<watch::Sender<Levels>>,
     pub events: mpsc::Sender<LinearEvent>,
@@ -161,6 +175,8 @@ pub struct LinearTask {
     sessions: BTreeMap<String, String>,
     /// Runs whose outbox is blocked, and since when.
     failing: BTreeMap<String, Timestamp>,
+    /// Sessions of the declines this task answered.
+    answered: BTreeSet<String>,
     log: Vec<String>,
 }
 
@@ -196,6 +212,7 @@ impl LinearTask {
             last_read: None,
             sessions: BTreeMap::new(),
             failing: BTreeMap::new(),
+            answered: BTreeSet::new(),
             log: Vec::new(),
         }
     }
@@ -241,9 +258,12 @@ impl LinearTask {
         &mut self,
         client: &impl LinearApi,
         queries: &[RunQuery],
+        declines: &[Decline],
         now: Timestamp,
         events: &mpsc::Sender<LinearEvent>,
     ) {
+        self.answered
+            .retain(|session| declines.iter().any(|d| &d.session_id == session));
         self.sessions.retain(|issue_id, _| {
             queries
                 .iter()
@@ -294,7 +314,10 @@ impl LinearTask {
                     self.last_read = Some(now);
                     self.read_runs(client, queries, now, events).await;
                 }
-                Did::Flush => self.flush(client, queries, now, events).await,
+                Did::Flush => {
+                    self.flush(client, queries, now, events).await;
+                    self.answer(client, declines).await;
+                }
                 _ => {}
             }
         }
@@ -654,6 +677,35 @@ impl LinearTask {
         }
     }
 
+    /// Answers each decline once.
+    async fn answer(&mut self, client: &impl LinearApi, declines: &[Decline]) {
+        for decline in declines {
+            if self.limited || self.answered.contains(&decline.session_id) {
+                continue;
+            }
+            let activity = Activity::new(Content::Response {
+                body: DECLINED.into(),
+            });
+            let id = uuid::Uuid::new_v4().to_string();
+            match client
+                .create_activity(&decline.session_id, &id, &activity)
+                .await
+            {
+                Ok(()) => {
+                    self.answered.insert(decline.session_id.clone());
+                }
+                Err(error) => {
+                    if !self.hit(&error) {
+                        self.log.push(format!(
+                            "{}: could not answer the declined session: {error}",
+                            decline.key
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
     async fn session_for_flush(
         &mut self,
         client: &impl LinearApi,
@@ -709,9 +761,16 @@ impl LinearTask {
                 .filter(|q| crate::run::split_key(&q.key).0 == self.workspace)
                 .cloned()
                 .collect();
+            let declines: Vec<Decline> = links
+                .declines
+                .borrow()
+                .iter()
+                .filter(|d| crate::run::split_key(&d.key).0 == self.workspace)
+                .cloned()
+                .collect();
             // Events go out as they happen and before the level, so a pass
             // woken by the level has already seen what led to it.
-            self.step_into(client, &queries, clock(), &links.events)
+            self.step_into(client, &queries, &declines, clock(), &links.events)
                 .await;
             for line in self.take_log() {
                 log(&line);
@@ -766,7 +825,7 @@ mod tests {
         now: Timestamp,
     ) -> Vec<LinearEvent> {
         let (events, mut sent) = mpsc::channel(64);
-        task.step_into(linear, queries, now, &events).await;
+        task.step_into(linear, queries, &[], now, &events).await;
         std::iter::from_fn(|| sent.try_recv().ok()).collect()
     }
 
@@ -1159,6 +1218,7 @@ mod tests {
         let wake = Arc::new(Notify::new());
         let links = Links {
             queries,
+            declines: watch::channel(Vec::new()).1,
             level,
             events,
             wake: wake.clone(),
@@ -1229,6 +1289,7 @@ mod tests {
         let wake = Arc::new(Notify::new());
         let links = Links {
             queries,
+            declines: watch::channel(Vec::new()).1,
             level,
             events,
             wake: wake.clone(),

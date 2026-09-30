@@ -10,7 +10,7 @@ use crate::coordinator::{NUDGE_INBOX, NUDGE_REPLY};
 use crate::herdr::PaneId;
 use crate::linear::api::fake::APP_USER;
 use crate::linear::api::{IssueStatus, RunUpdate};
-use crate::linear::task::LinearEvent;
+use crate::linear::task::{DECLINED, LinearEvent};
 use crate::run::{AgentStatus, Status};
 use crate::{inbox, worker};
 
@@ -234,45 +234,117 @@ async fn intake_stops_at_max_runs_and_while_paused() {
 async fn the_session_linear_opened_on_delegation_is_the_runs_session() {
     let mut world = World::sample();
     world.delegate(KEY, "Delegated", None);
-    let opened = world.fake().delegate_session("DATA-1");
     world.settle().await;
-    assert_eq!(world.record(KEY).session_id, opened);
-    assert_eq!(world.sessions(), 1, "no second session");
+    let fake = world.fake();
+    assert_eq!(world.record(KEY).session_id, fake.session("DATA-1").id);
+    assert_eq!(fake.sessions.len(), 1, "no second session");
+    assert_eq!(
+        (fake.count("HlaSessions"), fake.count("HlaSessionCreate")),
+        (0, 0)
+    );
+    drop(fake);
     assert!(!world.bodies(KEY, "thought").is_empty());
 }
 
 #[tokio::test]
-async fn without_a_session_the_claim_still_decides_and_a_lost_decision_is_made_again() {
+async fn a_lost_decision_is_made_again() {
     let mut world = World::sample();
     world.delegate(KEY, "Early", None);
-    world.refuse_sessions(true);
     world.settle().await;
-    let early = world.record(KEY);
-    assert_eq!(
-        (
-            early.session_id.as_str(),
-            early.coordinator.profile.as_str()
-        ),
-        ("", "coordinator"),
-        "the claim went on without a session"
-    );
-
     // An older build left the run without a decision.
-    let forgotten = world.run(KEY);
-    forgotten
+    world
+        .run(KEY)
         .update(|r| r.coordinator = crate::run::AgentRecord::default())
         .unwrap();
-    world.refuse_sessions(false);
     world.later(5);
     world.settle().await;
-    let later = world.record(KEY);
-    assert_eq!(later.coordinator.profile.as_str(), "coordinator");
-    assert!(!later.session_id.is_empty());
+    assert_eq!(world.record(KEY).coordinator.profile, "coordinator");
     assert_eq!(
         (world.sessions(), world.issue_state(KEY)),
         (1, "In Progress".into())
     );
     assert_eq!(count(&world.bodies(KEY, "thought"), "Picked up DATA-1."), 1);
+}
+
+#[tokio::test]
+async fn an_issue_delegated_by_someone_not_allowed_is_declined_once() {
+    let mut world = World::sample();
+    world.delegate_by(KEY, "stranger", "Run this", None);
+    for _ in 0..3 {
+        world.settle().await;
+        world.later(5);
+    }
+    world.restart_ticker();
+    world.settle().await;
+
+    assert_eq!((world.runs(), world.herdr.starts().len()), (0, 0));
+    assert_eq!(world.bodies(KEY, "response"), [DECLINED]);
+    let why =
+        "delegated by Person stranger (stranger), who is not in allowed_delegator_ids of team DATA";
+    let log = world.log_text();
+    assert_eq!(
+        log.matches(&format!("acme/DATA-1: not picked up: {why}\n"))
+            .count(),
+        1,
+        "{log}"
+    );
+    assert_eq!(
+        world.herdr.notifications(),
+        [("acme/DATA-1 not picked up".to_string(), format!("{why}."))]
+    );
+}
+
+#[tokio::test]
+async fn an_issue_no_person_is_known_to_have_delegated_is_not_picked_up() {
+    let mut world = World::sample();
+    // Automation delegated DATA-1: its session has no creator.
+    world.fake().add_issue("DATA-1", "DATA", "By automation");
+    world.fake().delegate_session("DATA-1");
+    // DATA-2 has no session, as for an app without agent session events.
+    world.fake().add_issue("DATA-2", "DATA", "No session");
+    world.settle().await;
+
+    assert_eq!(world.runs(), 0);
+    assert_eq!(world.bodies(KEY, "response"), [DECLINED]);
+    let log = world.log_text();
+    for line in [
+        "acme/DATA-1: not picked up: no person delegated it (automation or an agent did)",
+        "acme/DATA-2: not picked up: no agent session of this app tells who delegated it",
+    ] {
+        assert_eq!(log.matches(line).count(), 1, "{log}");
+    }
+}
+
+#[tokio::test]
+async fn someone_allowed_only_to_delegate_starts_a_run_but_is_not_listened_to() {
+    let mut world = World::with(|c| {
+        c.replace(
+            "allowed_user_ids = [\"user-1\"]",
+            "allowed_user_ids = [\"user-1\"]\nallowed_delegator_ids = [\"linear-agent\"]",
+        )
+    });
+    world.delegate_by(KEY, "linear-agent", "From Slack", None);
+    world.delegate_by("DATA-2", "user-1", "Not a delegator", None);
+    world.settle().await;
+    assert_eq!(world.record(KEY).status, Status::Active);
+    assert_eq!(world.runs(), 1, "the list replaces allowed_user_ids");
+
+    world.message(KEY, "linear-agent", "Merge it.", None);
+    world.message(KEY, "user-1", "Add a test.", None);
+    world.settle().await;
+    let relayed = world.text(KEY, "conversation.md");
+    assert!(
+        relayed.contains("Add a test.") && !relayed.contains("Merge it."),
+        "{relayed}"
+    );
+    let hint = "add the id to allowed_user_ids of team DATA to let it through";
+    assert!(world.log_text().contains(&format!(
+        "acme/DATA-1: ignored a reply from Person linear-agent (linear-agent); {hint}\n"
+    )));
+    assert!(world.herdr.notifications().contains(&(
+        "acme/DATA-1 ignored a reply".to_string(),
+        format!("From Person linear-agent (linear-agent); {hint}.")
+    )));
 }
 
 #[tokio::test]
@@ -898,6 +970,51 @@ async fn delegating_again_and_reopening_settle_without_a_loop() {
         1,
         "{log}"
     );
+}
+
+/// DATA-1 running, then canceled: its run is closed.
+async fn closed_run(world: &mut World) {
+    world.running_issue().await;
+    world.move_issue(KEY, "Canceled");
+    world.later(5);
+    world.settle().await;
+    assert_eq!(world.record(KEY).status, Status::Closed);
+}
+
+#[tokio::test]
+async fn a_closed_run_delegated_again_continues_in_the_new_session() {
+    let mut world = World::sample();
+    closed_run(&mut world).await;
+    let delegated = world.fake().delegate_by("DATA-1", "user-1");
+    world.move_issue(KEY, "Todo");
+    for _ in 0..2 {
+        world.later(5);
+        world.settle().await;
+    }
+    let record = world.record(KEY);
+    assert_eq!(
+        (record.status, record.session_id),
+        (Status::Active, delegated)
+    );
+    assert_eq!(
+        world.bodies(KEY, "thought"),
+        ["The issue was delegated again; the run continues."]
+    );
+}
+
+#[tokio::test]
+async fn a_closed_run_delegated_again_by_someone_not_allowed_stays_closed() {
+    let mut world = World::sample();
+    closed_run(&mut world).await;
+    world.fake().delegate_by("DATA-1", "stranger");
+    world.move_issue(KEY, "Todo");
+    for _ in 0..3 {
+        world.later(5);
+        world.settle().await;
+    }
+    assert_eq!(world.record(KEY).status, Status::Closed);
+    assert_eq!(world.bodies(KEY, "response"), [DECLINED]);
+    assert!(world.bodies(KEY, "thought").is_empty());
 }
 
 #[tokio::test]

@@ -30,7 +30,7 @@ use super::Log;
 use crate::config::Config;
 use crate::herdr::{Herdr, HerdrError, Link, PaneId, Placed, Snapshot};
 use crate::linear::api::{Activity, Content};
-use crate::linear::task::{Levels, LinearEvent, RunQuery};
+use crate::linear::task::{Decline, Levels, LinearEvent, RunQuery};
 use crate::outbox::{self, Op};
 use crate::paths::Ctx;
 use crate::run::{AgentRecord, AgentStatus, Run, RunLock, RunRecord, Status};
@@ -75,6 +75,8 @@ pub struct Inputs<'a, H> {
     pub events: mpsc::Receiver<LinearEvent>,
     /// What the Linear task reads and flushes.
     pub queries: watch::Sender<Vec<RunQuery>>,
+    /// The delegations the Linear task answers with a decline.
+    pub declines: watch::Sender<Vec<Decline>>,
     /// `notify_one` after queuing outbox requests, so they go out at once.
     /// Each workspace's Linear task.
     pub linear_wake: Vec<Arc<Notify>>,
@@ -214,6 +216,10 @@ pub struct Reconciler {
     pub(super) skipped: usize,
     pub(super) queued: bool,
     pub(super) queries: Vec<RunQuery>,
+    /// Per run key, the delegation turned down in the latest delegated list:
+    /// the decline its session gets, or `None` when no session tells who
+    /// delegated. Each is logged once.
+    pub(super) declined: BTreeMap<String, Option<Decline>>,
 }
 
 pub(super) async fn blocking<T: Send + 'static>(
@@ -346,6 +352,7 @@ impl Reconciler {
             skipped: 0,
             queued: false,
             queries: Vec::new(),
+            declined: BTreeMap::new(),
         })
     }
 
@@ -384,6 +391,11 @@ impl Reconciler {
     /// The queries for the Linear task, as of the last pass.
     pub fn queries(&self) -> &[RunQuery] {
         &self.queries
+    }
+
+    /// The declines for the Linear task, as of the last pass.
+    pub fn declines(&self) -> Vec<Decline> {
+        self.declined.values().flatten().cloned().collect()
     }
 
     /// Whether the last pass queued outbox requests; clears the flag.
@@ -798,7 +810,12 @@ pub async fn run<H: Herdr + Clone + 'static>(mut inputs: Inputs<'_, H>) -> Resul
         if *inputs.queries.borrow() != reconciler.queries() {
             inputs.queries.send_replace(reconciler.queries().to_vec());
         }
-        if reconciler.take_queued() {
+        let declines = reconciler.declines();
+        let declined = *inputs.declines.borrow() != declines;
+        if declined {
+            inputs.declines.send_replace(declines);
+        }
+        if reconciler.take_queued() || declined {
             inputs.linear_wake.iter().for_each(|wake| wake.notify_one());
         }
         let wait = reconciler.next_deadline(&deps, now).duration_since(now);
@@ -837,6 +854,14 @@ mod tests {
                         updated_at: T0.into(),
                         state: "unstarted".into(),
                         team: "DATA".into(),
+                        session: Some(crate::linear::api::SessionRef {
+                            id: format!("session-{key}"),
+                            status: "pending".into(),
+                            creator: Some(crate::linear::api::User {
+                                id: "user-1".into(),
+                                name: "User One".into(),
+                            }),
+                        }),
                     }],
                 }),
             },
@@ -899,6 +924,7 @@ mod tests {
             level,
             events,
             queries,
+            declines: watch::channel(Vec::new()).0,
             linear_wake: vec![linear_wake.clone()],
             shutdown,
             poke: Arc::new(Notify::new()),
@@ -966,6 +992,7 @@ mod tests {
             level,
             events,
             queries,
+            declines: watch::channel(Vec::new()).0,
             linear_wake: vec![Arc::new(Notify::new())],
             shutdown,
             poke: poke.clone(),
@@ -1019,6 +1046,7 @@ mod tests {
             level,
             events,
             queries,
+            declines: watch::channel(Vec::new()).0,
             linear_wake: vec![Arc::new(Notify::new())],
             shutdown,
             poke: Arc::new(Notify::new()),

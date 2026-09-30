@@ -67,9 +67,22 @@ pub struct Team {
     /// Linear user IDs whose replies in an Agent Session reach the coordinator.
     #[serde(default)]
     pub allowed_user_ids: Vec<String>,
+    /// Linear user IDs whose delegations the ticker takes; `allowed_user_ids`
+    /// when unset.
+    #[serde(default)]
+    pub allowed_delegator_ids: Option<Vec<String>>,
     /// The workflow state an issue moves to on `finish`.
     #[serde(default = "default_review_state")]
     pub review_state: String,
+}
+
+impl Team {
+    /// Whose delegations the ticker takes.
+    pub fn delegators(&self) -> &[String] {
+        self.allowed_delegator_ids
+            .as_deref()
+            .unwrap_or(&self.allowed_user_ids)
+    }
 }
 
 fn default_callback_port() -> u16 {
@@ -1026,6 +1039,23 @@ workers = ["standard", "deep"]
                 .unwrap_err()
                 .ends_with("workspaces.acme.run_read_interval_seconds must be between 1 and 3600")
         );
+    }
+
+    #[test]
+    fn delegators_default_to_the_users_whose_replies_count() {
+        let config = load_with(SAMPLE, &[]).unwrap();
+        assert_eq!(
+            config.team("acme", "DATA").unwrap().delegators(),
+            ["user-1"]
+        );
+        let text = SAMPLE.replace(
+            "allowed_user_ids = [\"user-1\"]",
+            "allowed_user_ids = [\"user-1\"]\nallowed_delegator_ids = [\"user-1\", \"linear-agent\"]",
+        );
+        let config = load_with(&text, &[]).unwrap();
+        let team = config.team("acme", "DATA").unwrap();
+        assert_eq!(team.delegators(), ["user-1", "linear-agent"]);
+        assert_eq!(team.allowed_user_ids, ["user-1"]);
     }
 
     #[test]
