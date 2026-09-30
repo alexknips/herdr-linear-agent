@@ -14,18 +14,34 @@ use crate::herdr::{Herdr, HerdrError, PaneId, Placed, Snapshot};
 use crate::run::{AgentRecord, AgentStatus, Run, RunRecord, Status};
 use crate::{agents, claude_trust, coordinator, worker};
 
-/// The agent CLI's arguments: the profile's flags and, for a resume, the
-/// session. Codex takes its `resume <id>` words first.
-fn start_args(config: &Config, record: &AgentRecord) -> Result<Vec<String>> {
+/// The session a start begins: the recorded one for a resume, a new id the
+/// plugin picks for Claude, and else none yet (the kind picks its own, found
+/// later from `started_at`).
+fn start_session(record: &AgentRecord) -> String {
+    let resumes =
+        record.resume && agents::resume_args(&record.kind, &record.agent_session).is_some();
+    match (resumes, record.kind.as_str()) {
+        (true, _) => record.agent_session.clone(),
+        (false, "claude") => uuid::Uuid::new_v4().to_string(),
+        _ => String::new(),
+    }
+}
+
+/// The agent CLI's arguments for a start in `session`: the profile's flags
+/// and, for a resume, the session; a new Claude session gets its id. Codex
+/// takes its `resume <id>` words first.
+fn start_args(config: &Config, record: &AgentRecord, session: &str) -> Result<Vec<String>> {
     let mut args = agents::profile_args(config.profile(&record.profile)?);
-    if record.resume
-        && let Some(resume) = agents::resume_args(&record.kind, &record.agent_session)
-    {
-        if record.kind == "codex" {
+    let resume = agents::resume_args(&record.kind, session).filter(|_| record.resume);
+    match resume {
+        Some(resume) if record.kind == "codex" => {
             args.splice(0..0, resume);
-        } else {
-            args.extend(resume);
         }
+        Some(resume) => args.extend(resume),
+        None if record.kind == "claude" && !session.is_empty() => {
+            args.extend(["--session-id".to_string(), session.to_string()]);
+        }
+        None => {}
     }
     Ok(args)
 }
@@ -405,7 +421,20 @@ impl Reconciler {
         {
             return Ok(false);
         }
-        let args = start_args(d.config, agent)?;
+        // Recorded before the start goes out, so a session begun by a start
+        // whose answer is lost is still known.
+        let session = start_session(agent);
+        let args = start_args(d.config, agent, &session)?;
+        let run = Run::load(&d.ctx.runs_dir(), &key.run)?;
+        let at = now.to_string();
+        let set = |a: &mut AgentRecord| {
+            a.agent_session = session.clone();
+            a.started_at = at.clone();
+        };
+        match &key.worker {
+            None => run.update(|r| set(&mut r.coordinator)).map(|_| ())?,
+            Some(id) => worker::update(&run, id, |w| set(&mut w.agent)).map(|_| ())?,
+        }
         if d.config.claude.auto_accept_trust_dialog && agent.kind == "claude" {
             let dirs: Vec<&str> = trusted.iter().map(String::as_str).collect();
             if let Err(error) = claude_trust::trust(d.ctx.env, &dirs) {

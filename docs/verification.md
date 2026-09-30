@@ -257,3 +257,31 @@ With a build of the branch in the default Herdr session:
 | Worker transcript | THLA-17's `w1` showed the worker reading its brief; `r resume` was offered, since the worker is stopped and its worktree is there (not pressed: it would start the agent) |
 | Gone | THLA-16 showed `coordinator  claude  no transcript` and `w1  claude  no transcript`, with `No transcript is left in …` and the run folder's records |
 | Quit | `q` closed the pane |
+
+## Recorded agent sessions and kept transcripts (2026-09-30)
+
+Why THLA-15's transcripts were gone, read-only:
+
+- `~/.claude/settings.json` sets no `cleanupPeriodDays`, so Claude Code's default of 30 days applies; `~/.claude/.last-cleanup` says a cleanup ran at 2026-09-30T13:41:31Z.
+- THLA-15, THLA-16 and the second workspace's THLA-1 and THLA-2 (runs of 13:55Z to 15:09Z on 2026-09-29) have a project folder with only `memory/`, and their session folders under `~/.claude/session-env/` (for example `0f77631b-…` and `08ab2ce8-…`, made at THLA-15's start) are still there; THLA-17 (14:52Z), THLA-18 and THLA-19 kept their `.jsonl` files. So the files did not go by age, and none is in the Trash.
+- The cause is not found. Whatever it is, the agent CLIs' own files cannot be relied on, which is why the run folder now keeps a copy.
+
+The CLIs, in scratch folders with harmless prompts:
+
+| Kind | Finding |
+| --- | --- |
+| `claude` 2.1.280 | `claude -p --session-id <uuid> …` wrote `~/.claude/projects/<folder>/<uuid>.jsonl`; `claude -p --resume <uuid> …` answered from the first turn and wrote to the same file. The folder name comes from the physical path (`/private/tmp/…` for `/tmp/…`) |
+| `codex` 0.156.1 | no option to choose the session id. After `codex exec …`, the rollout whose `session_meta.payload.cwd` was the folder and that was written after the start gave `payload.id`; `codex exec resume <id> …` answered from the first turn in the same rollout |
+| `opencode` 2.0.15 | `opencode session list --format json`, run in the folder, gives `[{id, created, updated, projectId, directory}]`, newest first, `created` in milliseconds. `opencode session export <id>` gives `{info, messages}`: `user` messages with `text`, `assistant` messages with `content` parts of type `text` and `tool` (`name`, `state` with `status`, `input` and `content`), and `idle` entries |
+| `cursor-agent` | `create-chat` returns a new chat id, and `--resume <id>` runs in it; its transcript is `~/.cursor/projects/<folder>/agent-transcripts/<id>/<id>.jsonl`. So a session can also be found after the start by the folder made then; `--resume <id>` is its resume form |
+
+With a build of the branch in the default Herdr session, THLA-21 (a coordinator and a worker, both `claude`; Herdr reports no session ids):
+
+| Step | Result |
+| --- | --- |
+| Recorded sessions | the coordinator started with `--session-id fc0cd56e-…` and worker `w1` with `--session-id 62e463e4-…`; both ids were in the records, with `started_at`, and Claude wrote `fc0cd56e-….jsonl` in the run folder's project folder and `62e463e4-….jsonl` in the worktree's |
+| Resume | closing the coordinator's workspace made the ticker ask ``The coordinator's pane for civitaspo/THLA-21 is gone. Reply `resume` to start it again with its previous session.``; after the reply `resume` it ran `claude --model sonnet --effort medium --permission-mode auto --resume fc0cd56e-…`, `agent_session` stayed the same, and the same transcript file grew from 48 to 56 lines with no new file |
+| Kept transcripts | the worker opened civitaspo/testing-herdr-linear-agent#13; when the issue was canceled, the run closed and `.state/transcripts/coordinator/fc0cd56e-….jsonl` (82 lines) and `.state/transcripts/w1/62e463e4-….jsonl` (110 lines) appeared, as long as the originals |
+| History | the browser listed `coordinator  claude  … fc0cd56e  copy` and `w1  claude  … 62e463e4  copy`, one line each, and showed `The run folder's copy, <path>` above each transcript |
+
+No Codex or OpenCode profile was set up for a run; their session lookup and the OpenCode export were checked with the CLIs above and with fixtures in the tests.

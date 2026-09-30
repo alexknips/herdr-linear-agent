@@ -18,6 +18,7 @@ mod progress;
 mod routing;
 mod run;
 mod ticker;
+mod transcript;
 mod worker;
 
 use std::ffi::{OsStr, OsString};

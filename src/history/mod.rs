@@ -1,7 +1,6 @@
 //! `history`: past runs, newest first, filtered as you type, with a preview
 //! of each run's files and its agents' transcripts.
 
-pub mod transcript;
 mod tui;
 
 use std::path::{Path, PathBuf};

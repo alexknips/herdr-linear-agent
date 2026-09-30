@@ -46,6 +46,15 @@ fn last_args(world: &World) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// A start's arguments without the `--session-id <id>` a new Claude
+/// session gets.
+fn flags(args: &[String]) -> Vec<String> {
+    match args {
+        [rest @ .., flag, _] if flag == "--session-id" => rest.to_vec(),
+        other => other.to_vec(),
+    }
+}
+
 fn ends_with(args: &[String], tail: &[&str]) -> bool {
     args.len() >= tail.len() && args[args.len() - tail.len()..].iter().eq(tail)
 }
@@ -99,6 +108,10 @@ async fn a_delegated_issue_is_claimed_placed_started_and_prompted_once() {
     assert_eq!(order, ["workspace.create", "agent.start", "agent.prompt"]);
     let start = &world.herdr.starts()[0];
     assert_eq!(start.name, "acme-data-1-coordinator");
+    // Herdr's report of the session replaces the id afterwards, so the one
+    // given to Claude is read from the arguments.
+    let session = start.args.last().map_or("", String::as_str);
+    assert!(uuid::Uuid::parse_str(session).is_ok(), "{session}");
     assert!(
         ends_with(
             &start.args,
@@ -108,12 +121,15 @@ async fn a_delegated_issue_is_claimed_placed_started_and_prompted_once() {
                 "--effort",
                 "high",
                 "--permission-mode",
-                "auto"
+                "auto",
+                "--session-id",
+                session
             ]
         ),
         "{:?}",
         start.args
     );
+    assert!(!c.coordinator.started_at.is_empty());
     assert_eq!(to(&world, &c.coordinator.pane_id), [LAUNCH]);
 
     world.later(5);
@@ -207,7 +223,7 @@ async fn after_a_config_reload_the_next_worker_starts_with_the_new_profile() {
     assert_eq!(start.name, "acme-data-1-w1");
     assert!(
         ends_with(
-            &start.args,
+            &flags(&start.args),
             &["--model", "sonnet", "--permission-mode", "plan"]
         ),
         "{:?}",
@@ -456,7 +472,7 @@ async fn a_worker_report_with_a_pr_reaches_the_inbox_and_linear() {
         "--permission-mode",
         "auto",
     ];
-    assert!(ends_with(&last_args(&world), &flags));
+    assert!(ends_with(&self::flags(&last_args(&world)), &flags));
     assert_eq!(
         to(&world, &w.agent.pane_id),
         ["Read .herdr-linear-agent/acme-DATA-1-w1/brief.md and do what it says."]
@@ -823,6 +839,132 @@ async fn a_dialog_is_reported_once_and_a_gone_coordinator_resumes_on_request() {
     );
     let pane = world.record(KEY).coordinator.pane_id;
     assert!(to(&world, &pane)[0].contains("You were restarted"));
+}
+
+/// Writes `lines` records of a Claude transcript for session `id` of an
+/// agent that ran in `cwd`, where Claude keeps it.
+fn claude_transcript(world: &World, cwd: &str, id: &str, lines: usize) -> std::path::PathBuf {
+    let folder: String = cwd
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let path = world
+        .home_file(".claude/projects")
+        .join(folder)
+        .join(format!("{id}.jsonl"));
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let text: String = (1..=lines)
+        .map(|n| {
+            format!(
+                "{}\n",
+                json!({"type": "user", "message": {"content": format!("line {n}")}})
+            )
+        })
+        .collect();
+    std::fs::write(&path, text).unwrap();
+    path
+}
+
+fn lines_of(path: &std::path::Path) -> usize {
+    std::fs::read_to_string(path).map_or(0, |t| t.lines().count())
+}
+
+#[tokio::test]
+async fn without_herdr_reports_the_plugin_names_the_claude_session_and_resumes_it() {
+    let mut world = World::sample();
+    world.herdr.report_no_sessions();
+    world.running_issue().await;
+    let args = world.herdr.starts()[0].args.clone();
+    let id = args.last().unwrap().clone();
+    assert_eq!(args[args.len() - 2], "--session-id");
+    assert_eq!(world.record(KEY).coordinator.agent_session, id);
+
+    let workspace = world.record(KEY).coordinator.workspace_id;
+    world.herdr.remove_workspace(&workspace);
+    world.settle().await;
+    let asked = world.bodies(KEY, "elicitation");
+    assert!(
+        asked.last().unwrap().contains("with its previous session"),
+        "{asked:?}"
+    );
+    world.message(KEY, "user-1", "resume", None);
+    world.settle().await;
+    let resumed = last_args(&world);
+    assert!(ends_with(&resumed, &["--resume", &id]), "{resumed:?}");
+    assert!(!resumed.contains(&"--session-id".to_string()));
+    assert_eq!(world.record(KEY).coordinator.agent_session, id);
+}
+
+#[tokio::test]
+async fn a_closed_runs_transcripts_are_kept_and_outlive_their_originals() {
+    let mut world = World::sample();
+    world.herdr.report_no_sessions();
+    world.running_issue().await;
+    let c = world.record(KEY).coordinator;
+    let original = claude_transcript(&world, &c.cwd, &c.agent_session, 1);
+    let copy = world
+        .run(KEY)
+        .transcripts_dir("coordinator")
+        .join(format!("{}.jsonl", c.agent_session));
+    let close_and_reopen = async |world: &mut World| {
+        world.move_issue(KEY, "Canceled");
+        world.later(5);
+        world.settle().await;
+        assert_eq!(world.record(KEY).status, Status::Closed);
+        world.move_issue(KEY, "Todo");
+        for _ in 0..2 {
+            world.later(5);
+            world.settle().await;
+        }
+    };
+    close_and_reopen(&mut world).await;
+    assert_eq!(lines_of(&copy), 1, "kept when the run closed");
+    claude_transcript(&world, &c.cwd, &c.agent_session, 3);
+    close_and_reopen(&mut world).await;
+    assert_eq!(lines_of(&copy), 3, "the grown original replaced it");
+    std::fs::remove_file(&original).unwrap();
+    close_and_reopen(&mut world).await;
+    assert_eq!(lines_of(&copy), 3, "left when the original is gone");
+    assert_eq!(
+        world.record(KEY).coordinator.agent_session,
+        c.agent_session,
+        "the run resumed its session each time"
+    );
+}
+
+#[tokio::test]
+async fn a_detached_run_and_a_restarted_worker_keep_their_transcripts() {
+    let mut world = World::sample();
+    world.herdr.report_no_sessions();
+    world.running_issue().await;
+    world.start_worker("api").await;
+    world.settle().await;
+    let w = world.worker(KEY, "w1").agent;
+    claude_transcript(&world, &w.cwd, &w.agent_session, 2);
+    commands::worker_restart(&world.ctx(), &world.session(), KEY, "w1", None)
+        .await
+        .unwrap();
+    let kept = world.run(KEY).transcripts_dir("w1");
+    assert_eq!(
+        lines_of(&kept.join(format!("{}.jsonl", w.agent_session))),
+        2
+    );
+    world.settle().await;
+    let restarted = world.worker(KEY, "w1").agent;
+    assert_ne!(restarted.agent_session, w.agent_session, "a new session");
+    assert!(uuid::Uuid::parse_str(&restarted.agent_session).is_ok());
+
+    let c = world.record(KEY).coordinator;
+    claude_transcript(&world, &c.cwd, &c.agent_session, 1);
+    world.set_delegate(KEY, json!(null));
+    world.later(5);
+    world.settle().await;
+    assert_eq!(world.record(KEY).status, Status::Detached);
+    let copy = world
+        .run(KEY)
+        .transcripts_dir("coordinator")
+        .join(format!("{}.jsonl", c.agent_session));
+    assert_eq!(lines_of(&copy), 1);
 }
 
 #[tokio::test]

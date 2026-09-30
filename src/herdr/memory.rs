@@ -56,6 +56,8 @@ struct Model {
     start_error: Option<String>,
     /// Snapshots a started agent stays hidden for.
     detection_lag: u32,
+    /// Agents report no session, as without Herdr's agent integrations.
+    no_sessions: bool,
     /// Snapshots a new pane stays hidden for.
     pane_lag: u32,
     /// Panes that are not in snapshots yet, with the snapshots left.
@@ -271,6 +273,12 @@ impl FakeHerdr {
         self.model().start_error = Some(code.into());
     }
 
+    /// Started agents report no session id, as without Herdr's agent
+    /// integrations.
+    pub fn report_no_sessions(&self) {
+        self.model().no_sessions = true;
+    }
+
     pub fn delay_detection(&self, snapshots: u32) {
         self.model().detection_lag = snapshots;
     }
@@ -450,7 +458,7 @@ impl Herdr for FakeHerdr {
             kind: Some(kind.into()),
             name: Some(name.into()),
             status: AgentStatus::Idle,
-            session: Some(format!("sess-{name}")),
+            session: (!model.no_sessions).then(|| format!("sess-{name}")),
             cwd: found.cwd.clone(),
             foreground_cwd: found.cwd.clone(),
             terminal: found.terminal.clone(),

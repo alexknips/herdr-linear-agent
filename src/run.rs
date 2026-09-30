@@ -142,8 +142,12 @@ pub struct AgentRecord {
     pub prompted_at: String,
     pub prompted_seq: u64,
     pub launch_attempts: u32,
-    /// The agent's native session, for a resume.
+    /// The agent's native session, for a resume: the id the plugin gave a
+    /// Claude start, or the one found for the other kinds.
     pub agent_session: String,
+    /// When the agent was last started: its session is the first one begun
+    /// after this.
+    pub started_at: String,
     /// The next launch resumes `agent_session`.
     pub resume: bool,
     pub last_state: String,
@@ -325,6 +329,12 @@ impl Run {
 
     pub fn workers_dir(&self) -> PathBuf {
         self.dir.join("workers")
+    }
+
+    /// Where the plugin keeps copies of an agent's transcripts: the
+    /// coordinator's under `coordinator`, a worker's under its id.
+    pub fn transcripts_dir(&self, agent: &str) -> PathBuf {
+        self.state_dir().join("transcripts").join(agent)
     }
 
     /// The run folder with symbolic links resolved: Herdr reports a pane's

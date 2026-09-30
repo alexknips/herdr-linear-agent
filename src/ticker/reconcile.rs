@@ -35,7 +35,7 @@ use crate::outbox::{self, Op};
 use crate::paths::Ctx;
 use crate::run::{AgentRecord, AgentStatus, Run, RunLock, RunRecord, Status};
 use crate::worker::{self, Live, Worker};
-use crate::{coordinator, inbox, progress};
+use crate::{coordinator, inbox, progress, transcript};
 
 /// A blocked agent is asked about after this long (`worker::BLOCKED_SECS`).
 const BLOCKED: SignedDuration = SignedDuration::from_secs(worker::BLOCKED_SECS);
@@ -220,6 +220,8 @@ pub struct Reconciler {
     /// the decline its session gets, or `None` when no session tells who
     /// delegated. Each is logged once.
     pub(super) declined: BTreeMap<String, Option<Decline>>,
+    /// Transcript copies still running, each giving its failures to log.
+    pub(super) keeping: Vec<tokio::task::JoinHandle<Vec<String>>>,
 }
 
 pub(super) async fn blocking<T: Send + 'static>(
@@ -353,13 +355,22 @@ impl Reconciler {
             queued: false,
             queries: Vec::new(),
             declined: BTreeMap::new(),
+            keeping: Vec::new(),
         })
     }
 
     /// Whether an effect task or a routing agent is still running.
     #[cfg(test)]
     pub fn busy(&self) -> bool {
-        !self.in_flight.is_empty() || !self.routing.is_empty()
+        !self.in_flight.is_empty() || !self.routing.is_empty() || !self.keeping.is_empty()
+    }
+
+    /// Waits for the transcript copies still running.
+    #[cfg(test)]
+    pub async fn copies_done(&self) {
+        while self.keeping.iter().any(|h| !h.is_finished()) {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
     }
 
     /// Entries per in-memory map.
@@ -391,6 +402,28 @@ impl Reconciler {
     /// The queries for the Linear task, as of the last pass.
     pub fn queries(&self) -> &[RunQuery] {
         &self.queries
+    }
+
+    /// Copies the transcripts of the run's agents into its folder, off the
+    /// pass (see [`transcript::keep_agents`]).
+    pub(super) fn keep_transcripts<H>(&mut self, d: &Deps<'_, H>, run: &Run) {
+        let (roots, run) = (transcript::Roots::from_env(d.ctx.env), run.clone());
+        self.keeping.push(tokio::task::spawn_blocking(move || {
+            transcript::keep_agents(&roots, &run, None)
+        }));
+    }
+
+    /// Logs the failures of the copies that finished.
+    async fn log_kept<H>(&mut self, d: &Deps<'_, H>) {
+        let (done, running) = std::mem::take(&mut self.keeping)
+            .into_iter()
+            .partition::<Vec<_>, _>(|h| h.is_finished());
+        self.keeping = running;
+        for handle in done {
+            for line in handle.await.unwrap_or_default() {
+                d.log.line(&line);
+            }
+        }
     }
 
     /// The declines for the Linear task, as of the last pass.
@@ -455,6 +488,7 @@ impl Reconciler {
         wake: Wake,
         now: Timestamp,
     ) {
+        self.log_kept(d).await;
         let snapshot = d.herdr.snapshot().await.ok();
         let snap = snapshot.as_ref();
         if let Some(snapshot) = snap {

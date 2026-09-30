@@ -74,6 +74,7 @@ pub fn resume_args(kind: &str, session: &str) -> Option<Vec<String>> {
         "claude" => vec!["--resume".into(), s],
         "codex" => vec!["resume".into(), s],
         "opencode" => vec!["--session".into(), s],
+        "cursor" => vec!["--resume".into(), s],
         "copilot" => vec![format!("--resume={s}")],
         _ => return None,
     })

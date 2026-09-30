@@ -481,6 +481,7 @@ impl Reconciler {
         .await?;
         d.log
             .line(&format!("{}: closed (the issue is {state})", run.key));
+        self.keep_transcripts(d, run);
         Ok(())
     }
 
@@ -494,6 +495,7 @@ impl Reconciler {
         .await?;
         d.log
             .line(&format!("{}: detached (no longer delegated)", run.key));
+        self.keep_transcripts(d, run);
         Ok(())
     }
 

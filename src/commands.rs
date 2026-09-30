@@ -597,6 +597,19 @@ pub async fn worker_restart<H: Herdr>(
     if !w.counts() {
         check_agents(ctx, config.limits)?;
     }
+    // The old session's transcript is kept before a new session begins.
+    let (roots, kept_run, kept_id) = (
+        crate::transcript::Roots::from_env(ctx.env),
+        run.clone(),
+        id.to_string(),
+    );
+    let failures = tokio::task::spawn_blocking(move || {
+        crate::transcript::keep_agents(&roots, &kept_run, Some(&kept_id))
+    })
+    .await?;
+    for line in failures {
+        eprintln!("{line}");
+    }
     // Before the old workspace closes, so a pass woken by the close finds
     // a worker the watcher leaves alone rather than one whose pane is gone.
     worker::update(&run, id, |w| {
@@ -635,6 +648,7 @@ pub async fn worker_restart<H: Herdr>(
         w.agent.last_state_seq = 0;
         w.agent.blocked_reported = false;
         w.agent.resume = false;
+        w.agent.agent_session.clear();
     })?;
     let task = std::fs::read_to_string(worker::task_path(&run, id)).unwrap_or_default();
     let instructions = profile.instructions.as_slice();

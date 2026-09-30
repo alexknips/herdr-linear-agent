@@ -337,6 +337,7 @@ impl World {
     /// One Linear step, then the results of effect tasks and routing agents
     /// that are still out.
     async fn round(&mut self) -> Wake {
+        self.reconciler.copies_done().await;
         self.task.force_due();
         self.fake().present = Some(self.now);
         let queries = self.queries_for_step();

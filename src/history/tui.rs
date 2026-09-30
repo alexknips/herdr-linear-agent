@@ -11,11 +11,11 @@ use ratatui::style::{Style, Stylize};
 use ratatui::text::Line;
 use ratatui::widgets::{Block, List, ListState, Paragraph, Wrap};
 
-use super::transcript::{self, Roots, Session, Sessions};
 use super::{Entry, entries, filter, minute};
 use crate::herdr::{Client, Herdr};
 use crate::paths::Env;
 use crate::run::AgentStatus;
+use crate::transcript::{self, Roots, Session, Sessions};
 
 const PAGE: u16 = 10;
 
@@ -33,11 +33,12 @@ impl Row {
     fn line(&self) -> String {
         match &self.found {
             Ok(s) => format!(
-                "{}  {}  {}  {}",
+                "{}  {}  {}  {}  {}",
                 self.agent,
                 self.kind,
-                minute(s.modified),
-                s.id.chars().take(8).collect::<String>()
+                minute(s.at),
+                s.id.chars().take(8).collect::<String>(),
+                if s.kept { "copy" } else { "original" }
             ),
             Err(_) => format!("{}  {}  no transcript", self.agent, self.kind),
         }
@@ -103,17 +104,32 @@ fn rows(entry: &Entry, roots: &Roots) -> Vec<Row> {
             open: record.status == AgentStatus::Open,
             found,
         };
-        match transcript::sessions(roots, &record.kind, &record.cwd) {
-            Sessions::Found { sessions, searched } if sessions.is_empty() => rows.push(row(Err(
-                format!("No transcript is left in {}.", searched.display()),
-            ))),
-            Sessions::Found { sessions, .. } => {
-                rows.extend(sessions.into_iter().map(|s| row(Ok(s))))
-            }
-            Sessions::Unreadable(why) => {
-                rows.push(row(Err(format!("Cannot read this transcript: {why}."))))
-            }
+        // The run folder's copies first; then the agent's own files of the
+        // recorded session, or of the folder when none is recorded.
+        let mut found = transcript::kept(&entry.run.transcripts_dir(&agent.label));
+        let originals = match transcript::sessions(roots, &record.kind, &record.cwd) {
+            Sessions::Found { sessions, searched } => Ok((sessions, searched)),
+            Sessions::Unreadable(why) => Err(why),
+        };
+        if let Ok((sessions, _)) = &originals {
+            let wanted =
+                |s: &&Session| record.agent_session.is_empty() || s.id == record.agent_session;
+            let new: Vec<Session> = sessions
+                .iter()
+                .filter(wanted)
+                .filter(|s| !found.iter().any(|k| k.id == s.id))
+                .cloned()
+                .collect();
+            found.extend(new);
         }
+        if !found.is_empty() {
+            rows.extend(found.into_iter().map(|s| row(Ok(s))));
+            continue;
+        }
+        rows.push(row(Err(match originals {
+            Ok((_, searched)) => format!("No transcript is left in {searched}."),
+            Err(why) => format!("Cannot read this transcript: {why}."),
+        })));
     }
     rows
 }
@@ -233,10 +249,23 @@ impl App {
                 let at = (self.shown.get(self.selected).copied(), *selected);
                 let fresh = self.text.as_ref().is_none_or(|(was, _)| *was != at);
                 let text = fresh.then(|| match rows.get(*selected).map(|r| (&r.kind, &r.found)) {
-                    Some((kind, Ok(session))) => transcript::render(kind, &session.path)
-                        .unwrap_or_else(|e| {
-                            format!("Cannot read {}: {e}.", session.path.display())
-                        }),
+                    Some((kind, Ok(session))) => {
+                        let from = match (&session.source, session.kept) {
+                            (transcript::Source::File(path), true) => {
+                                format!("The run folder's copy, {}", path.display())
+                            }
+                            (transcript::Source::File(path), false) => {
+                                format!("The agent's own file, {}", path.display())
+                            }
+                            (transcript::Source::Export { cwd }, _) => {
+                                format!("`opencode session export {}` in {cwd}", session.id)
+                            }
+                        };
+                        match transcript::render(&self.roots, kind, session) {
+                            Ok(text) => format!("{from}\n\n{text}"),
+                            Err(e) => format!("Cannot read {from}: {e}."),
+                        }
+                    }
                     Some((_, Err(why))) => format!(
                         "{why}\n\nThe run folder's records:\n\n{}",
                         self.entry().map(Entry::preview).unwrap_or_default()
@@ -432,6 +461,66 @@ mod tests {
     }
 
     #[test]
+    fn the_run_folders_copy_comes_first_and_the_recorded_session_is_the_one_shown() {
+        let home = tempfile::tempdir().unwrap();
+        let runs = home.path().join("runs");
+        let mut record = RunRecord {
+            workspace: "acme".into(),
+            identifier: "DATA-1".into(),
+            title: "Fix the login".into(),
+            created: "2026-09-01T00:00:00Z".into(),
+            ..RunRecord::default()
+        };
+        record.coordinator.kind = "claude".into();
+        record.coordinator.cwd = "/work/run".into();
+        record.coordinator.agent_session = "s-2".into();
+        let run = Run::create(&runs, record).unwrap();
+        let line = |text: &str| {
+            format!(
+                "{}\n",
+                serde_json::json!({"type": "user", "message": {"content": text}})
+            )
+        };
+        let kept = run.transcripts_dir("coordinator");
+        std::fs::create_dir_all(&kept).unwrap();
+        std::fs::write(kept.join("s-1.jsonl"), line("from the copy")).unwrap();
+        let own = home.path().join(".claude/projects/-work-run");
+        std::fs::create_dir_all(&own).unwrap();
+        for id in ["s-1", "s-2", "s-3"] {
+            std::fs::write(
+                own.join(format!("{id}.jsonl")),
+                line(&format!("original {id}")),
+            )
+            .unwrap();
+        }
+        let roots = Roots::from_env(&Env::for_test(home.path(), &[]));
+        let entries = entries(&runs);
+        let rows = rows(&entries[0], &roots);
+        let shown: Vec<(String, bool)> = rows
+            .iter()
+            .map(|r| {
+                let s = r.found.as_ref().unwrap();
+                (s.id.clone(), s.kept)
+            })
+            .collect();
+        assert_eq!(
+            shown,
+            [("s-1".to_string(), true), ("s-2".to_string(), false)],
+            "the copy, then the recorded session's own file; s-3 is not the agent's"
+        );
+        assert!(rows[0].line().ends_with("s-1  copy"), "{}", rows[0].line());
+        let mut app = App::new(entries, roots);
+        press(&mut app, KeyCode::Enter);
+        let first = screen(&mut app);
+        assert!(first.contains("The run folder's copy"), "{first}");
+        assert!(first.contains("from the copy"), "{first}");
+        press(&mut app, KeyCode::Down);
+        let second = screen(&mut app);
+        assert!(second.contains("The agent's own file"), "{second}");
+        assert!(second.contains("original s-2"), "{second}");
+    }
+
+    #[test]
     fn a_stopped_claude_session_in_a_folder_still_there_can_be_resumed() {
         let cwd = tempfile::tempdir().unwrap();
         let row = |open| Row {
@@ -442,8 +531,9 @@ mod tests {
             open,
             found: Ok(Session {
                 id: "393e265d".into(),
-                path: PathBuf::from("/x.jsonl"),
-                modified: None,
+                source: transcript::Source::File(PathBuf::from("/x.jsonl")),
+                at: None,
+                kept: false,
             }),
         };
         assert_eq!(
@@ -456,10 +546,10 @@ mod tests {
             })
         );
         assert_eq!(row(true).resume(), None, "not while it is open");
-        let cursor = Row {
-            kind: "cursor".into(),
+        let gemini = Row {
+            kind: "gemini".into(),
             ..row(false)
         };
-        assert_eq!(cursor.resume(), None, "resume_args has no cursor form");
+        assert_eq!(gemini.resume(), None, "resume_args has no gemini form");
     }
 }

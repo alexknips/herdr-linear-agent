@@ -224,7 +224,8 @@ Agent record (coordinator and every worker's `agent`):
 | `workspace_id`, `tab_id`, `pane_id`, `cwd` | where it runs |
 | `prompt_pending` | the launch prompt is not delivered yet |
 | `launch_attempts` | |
-| `agent_session` | the agent's native session id, for a resume |
+| `agent_session` | the agent's native session id, for a resume: set at each start (see [Agent sessions](#agent-sessions)) and replaced by one Herdr reports |
+| `started_at` | when the agent was last started; its session is the first one begun at or after it |
 | `resume` | the next start resumes `agent_session` |
 | `last_state`, `last_state_change` | the last Herdr status seen and when its episode began |
 | `last_state_seq` | Herdr's `state_change_seq` when `last_state` was seen |
@@ -293,6 +294,7 @@ A profile with no model, effort or args gives no arguments. `tests/agents:profil
 | `codex` | `resume <s>` |
 | `opencode` | `--session <s>` |
 | `copilot` | `--resume=<s>` |
+| `cursor` | `--resume <s>` |
 | any other | none |
 
 An empty session id, or one starting with `-`, gives none. `tests/agents:resume_arguments_follow_herdrs_table`
@@ -768,7 +770,8 @@ For each `open` agent of the run with `prompt_pending` (coordinator first, then 
 
 - Start only when the pane exists and no agent is in it (the pane is at its shell prompt). An agent already in the pane (for example one left `blocked` by `agent_not_ready`) is never started again.
 - At most one start per run per pass. **Timing change:** in the rewrite a run has at most one start in flight, and the next start waits until the previous one's outcome is known. `agent.start` runs as an effect task; after it answers (or its answer is lost) the agent is not started again in that pane for 60 s while Herdr has not detected it. When the 60 s end and the pane is still empty, that counts as an unsuccessful attempt with the error `Herdr did not detect the agent within 60 s`, so a start that never shows ends after three. `tests/scenarios:a_start_herdr_never_detects_counts_as_an_attempt`
-- Arguments: `profile_args(profile)`, then `resume_args(kind, agent_session)` when `resume` is set and the arguments exist. Examples: a `coordinator` start ends `--model opus --effort high --permission-mode auto`; a resumed coordinator ends `--resume sess-data-1-coordinator`; a `standard` worker ends `--model sonnet --effort high --permission-mode auto`; a `deep` worker includes `model_reasoning_effort=xhigh`. `tests/scenarios:a_delegated_issue_becomes_a_run_whose_coordinator_is_started_and_primed`, `tests/scenarios:a_worker_runs_in_a_worktree_and_its_report_and_pr_reach_linear`, `tests/scenarios:restarts_switch_profiles_and_are_limited`
+- Session, recorded with `started_at = now` before the start goes out (see [Agent sessions](#agent-sessions)): the recorded `agent_session` when `resume` is set and `resume_args` gives arguments; else, for `claude`, a new UUID the plugin picks; else empty.
+- Arguments: `profile_args(profile)`, then `resume_args(kind, agent_session)` when `resume` is set and the arguments exist, or `--session-id <uuid>` for a new Claude session. `src/ticker/scenarios.rs:without_herdr_reports_the_plugin_names_the_claude_session_and_resumes_it` Examples: a `coordinator` start ends `--model opus --effort high --permission-mode auto`; a resumed coordinator ends `--resume sess-data-1-coordinator`; a `standard` worker ends `--model sonnet --effort high --permission-mode auto`; a `deep` worker includes `model_reasoning_effort=xhigh`. `tests/scenarios:a_delegated_issue_becomes_a_run_whose_coordinator_is_started_and_primed`, `tests/scenarios:a_worker_runs_in_a_worktree_and_its_report_and_pr_reach_linear`, `tests/scenarios:restarts_switch_profiles_and_are_limited`
 - Trust dialog: when `claude.auto_accept_trust_dialog` is true and the kind is `claude`, right before the start, trust the coordinator's `canonical_dir`, or the worker's worktree (its `cwd`) and its repository's main checkout (`repo_path`). Nothing is trusted when the option is off. `tests/scenarios:the_trust_dialog_is_accepted_only_when_enabled`
 - `claude_trust.trust(env, dirs)`: the config is `$CLAUDE_CONFIG_DIR/.claude.json` when set, else `~/.claude.json`. A missing file is left missing; a file whose top level is not an object is left alone. For each non-empty folder, set `projects.<folder>.hasTrustDialogAccepted = true` when it is not already true, keeping every other key, the key order and the file mode (0600 when unknown). Write through `.claude.json.hla.<pid>.tmp` and a rename. Returns whether the file changed. `src/claude_trust.rs:trust_is_added_once_and_everything_else_is_kept`, `src/claude_trust.rs:a_missing_or_unexpected_config_is_left_alone`
 - Outcome:
@@ -1064,22 +1067,44 @@ The list:
 - The query matches that line with `nucleo-matcher` (smart case, smart normalization, words in any order); the best match comes first, and a blank query keeps the order.
 - The preview: the key and title, state and update time, the issue URL, each PR, then `issue.md`, `conversation.md` under `# Conversation` when it has text, and each worker's `workers/<id>.md` under `# Worker <id>: <title>` (`(no report)` without one). `src/history/mod.rs:the_preview_shows_the_issue_the_conversation_the_reports_and_the_prs`
 
+### Agent sessions
+
+Herdr reports an agent's session id only with its agent integrations, which write to the agents' own config, so the plugin records the session itself:
+
+| Kind | Session id |
+| --- | --- |
+| `claude` | picked by the plugin: a new UUID passed as `--session-id <uuid>`, recorded before the start; a resume passes `--resume <uuid>` and keeps it |
+| `codex` | the `payload.id` of the first rollout under `<CODEX_HOME or ~/.codex>/sessions` whose first line is `session_meta` with `payload.cwd` equal to the agent's folder and `payload.timestamp` at or after `started_at` |
+| `opencode` | the `id` of the first entry of `opencode session list --format json`, run in the agent's folder, whose `directory` is that folder and `created` (milliseconds) is at or after `started_at` |
+| `cursor` | the name of the first folder under `~/.cursor/projects/<cwd's alphanumeric runs joined by ->/agent-transcripts/` made at or after `started_at` |
+| others | none |
+
+The id of the last three kinds is looked up when it is first needed, and recorded: when the coordinator's pane is gone (so the question offers to resume `with its previous session`), and when its transcript is kept. A start that does not resume records an empty id for them. `worker restart` starts a new session (`resume = false`), clearing the id, after its transcript is kept. A non-empty session id Herdr reports replaces the recorded one. `src/transcript.rs:a_codex_session_is_the_first_one_begun_in_the_folder_after_the_start`, `src/transcript.rs:opencode_sessions_come_from_its_list_and_their_export_is_shown`
+
+### Kept transcripts
+
+When a run closes or is detached, the ticker copies the transcripts of its coordinator and workers off the pass (a blocking task; each failure is one log line `<KEY>: could not keep the <agent> transcript <id>: <error>`); `worker restart` copies the worker's before it restarts. For each agent with a folder and a session (the recorded one, or one looked up as above):
+
+- The copy is `<run>/.state/transcripts/<agent>/<session>.jsonl`, `<agent>` being `coordinator` or the worker id. Claude, Codex and Cursor transcripts are copied as they are; OpenCode's is the output of `opencode session export <id>`, run in the folder, saved as `<session>.json`.
+- It is written when there is no copy yet or the original is larger than the copy, through a `.partial` file and a rename; otherwise nothing changes. A copy whose original is gone stays. So the same moment happening again gives the same result. `src/transcript.rs:a_copy_is_written_again_only_when_the_original_grew_and_outlives_it`, `src/ticker/scenarios.rs:a_closed_runs_transcripts_are_kept_and_outlive_their_originals`, `src/ticker/scenarios.rs:a_detached_run_and_a_restarted_worker_keep_their_transcripts`
+- The agent CLIs' own files and config are only read.
+
 The transcripts (Enter):
 
-- One line per transcript file of the coordinator, then of each worker, oldest first: `<agent>  <kind>  <file modified>  <first 8 characters of the session id>`, or `<agent>  <kind>  no transcript`. The agent's folder is its recorded `cwd`, else the run folder (coordinator) or the worktree path (worker). Herdr reports no agent session id unless its agent integration is installed, and none was recorded in practice, so the folder is the link.
+- One line per session of the coordinator, then of each worker, oldest first: `<agent>  <kind>  <time>  <first 8 characters of the session id>  <copy | original>`, or `<agent>  <kind>  no transcript`. The run folder's copies come first; then the agent's own transcripts that have no copy: only the recorded `agent_session`'s when one is recorded, else every session found in the agent's folder (its recorded `cwd`, else the run folder or the worktree path). `src/history/tui.rs:the_run_folders_copy_comes_first_and_the_recorded_session_is_the_one_shown`
 
-| Kind | Where | Session id |
-| --- | --- | --- |
-| `claude` | `<CLAUDE_CONFIG_DIR or ~/.claude>/projects/<cwd with each non-alphanumeric byte as ->/*.jsonl` | the file name |
-| `codex` | `<CODEX_HOME or ~/.codex>/sessions/**/*.jsonl` whose first line is `session_meta` with `payload.cwd` equal to the folder | `payload.id` |
-| `cursor` | `~/.cursor/projects/<cwd's alphanumeric runs joined by ->/agent-transcripts/<id>/*.jsonl` | the file name |
-| `opencode` | not read: its sessions are in a SQLite database (`~/.local/share/opencode/opencode.db`) | |
-| others | not read | |
+| Kind | Where the agent keeps it |
+| --- | --- |
+| `claude` | `<CLAUDE_CONFIG_DIR or ~/.claude>/projects/<cwd with each non-alphanumeric byte as ->/<id>.jsonl` |
+| `codex` | `<CODEX_HOME or ~/.codex>/sessions/**/*.jsonl` whose first line is `session_meta` with `payload.cwd` equal to the folder |
+| `cursor` | `~/.cursor/projects/<cwd's alphanumeric runs joined by ->/agent-transcripts/<id>/<id>.jsonl` |
+| `opencode` | `opencode session export <id>` in the folder |
+| others | not read |
 
-- A transcript shows, in order: `── user` or `── assistant` and the text; `→ <tool> <input on one line, at most 200 characters>` for each call; `← result:` or `← error:` with its first 5 lines (each at most 200 characters) and `… <n> more lines`, or `(empty)`. Tabs become four spaces. Claude records of other types, `isMeta` user records and thinking are left out; Codex `developer` messages, reasoning and other items are left out; Cursor records have no results. `src/history/transcript.rs:a_claude_transcript_is_found_by_its_folder_and_shown_as_steps`, `src/history/transcript.rs:a_codex_transcript_is_found_by_the_folder_in_its_first_line`, `src/history/transcript.rs:a_cursor_transcript_has_no_results_and_opencode_is_not_read`
-- No file left: `No transcript is left in <folder searched>.` A kind that is not read: `Cannot read this transcript: <why>.` Both are followed by `The run folder's records:` and the run's preview. `src/history/tui.rs:typing_filters_enter_lists_the_agents_and_a_missing_transcript_is_said`
+- The view begins with where the text comes from: `The run folder's copy, <path>`, `The agent's own file, <path>`, or ``opencode session export <id>` in <folder>``. Then, in order: `── user` or `── assistant` and the text; `→ <tool> <input on one line, at most 200 characters>` for each call; `← result:` or `← error:` with its first 5 lines (each at most 200 characters) and `… <n> more lines`, or `(empty)`. Tabs become four spaces. Claude records of other types, `isMeta` user records and thinking are left out; Codex `developer` messages, reasoning and other items are left out; Cursor records have no results; OpenCode's `user` messages give their `text`, and its `assistant` messages their `text` parts and `tool` parts (`name`, `state.input`, `state.content`, an error when `state.status` is `error`). `src/transcript.rs:a_claude_transcript_is_found_by_its_folder_and_shown_as_steps`, `src/transcript.rs:a_cursor_transcript_has_no_results_and_an_unknown_kind_is_not_read`
+- No transcript: `No transcript is left in <where it was searched>.` A kind that is not read: `Cannot read this transcript: <why>.` Both are followed by `The run folder's records:` and the run's preview. `src/history/tui.rs:typing_filters_enter_lists_the_agents_and_a_missing_transcript_is_said`
 
-Resume (`r` on a transcript line): offered when `resume_args(kind, session id)` gives arguments (`claude`, `codex`, `opencode`, `copilot`; only the first two have readable transcripts), the agent's status is not `open`, and its folder exists. It creates a workspace in the folder labeled `<KEY> (resumed)`, starts the kind there as `<agent name>-resumed` with those arguments, and focuses it; the footer says `Resumed in the workspace <label>` or `Could not resume: <error>`. `src/history/tui.rs:a_stopped_claude_session_in_a_folder_still_there_can_be_resumed`
+Resume (`r` on a transcript line): offered when `resume_args(kind, session id)` gives arguments (`claude`, `codex`, `opencode`, `copilot`, `cursor`), the agent's status is not `open`, and its folder exists. It creates a workspace in the folder labeled `<KEY> (resumed)`, starts the kind there as `<agent name>-resumed` with those arguments, and focuses it; the footer says `Resumed in the workspace <label>` or `Could not resume: <error>`. `src/history/tui.rs:a_stopped_claude_session_in_a_folder_still_there_can_be_resumed`
 
 Keys: printable characters and Backspace edit the query; ↑↓ or Ctrl-p/Ctrl-n move; PgUp/PgDn or Ctrl-u/Ctrl-d scroll the right side by 10 lines; Enter opens the transcripts; there ↑↓ or `k`/`j` move, `r` resumes, and Esc, ← or Backspace go back; Esc on the list, `q` on the transcripts and Ctrl-c quit.
 

@@ -15,7 +15,7 @@ use crate::linear::api::{Activity, Content, ExternalUrl};
 use crate::outbox::{self, Op};
 use crate::run::{AgentRecord, AgentStatus, Run};
 use crate::worker::{self, Group, Live, Worker};
-use crate::{coordinator, files, inbox};
+use crate::{coordinator, files, inbox, transcript};
 
 /// Why a worker waits on a person, for its inbox item.
 fn waiting_reason(w: &Worker, live: &Live) -> String {
@@ -121,6 +121,22 @@ impl Reconciler {
                 next.blocked_reported = true;
             }
             let lost = !live.pane_exists && !record.coordinator_lost;
+            // A kind that picks its own session id is looked up once it is
+            // needed: when the pane is gone, a resume can continue it.
+            if lost
+                && next.agent_session.is_empty()
+                && let Ok(since) = next.started_at.parse::<Timestamp>()
+            {
+                let roots = transcript::Roots::from_env(d.ctx.env);
+                let (kind, cwd) = (next.kind.clone(), next.cwd.clone());
+                let found = tokio::task::spawn_blocking(move || {
+                    transcript::session_since(&roots, &kind, &cwd, since)
+                })
+                .await;
+                if let Ok(Some(found)) = found {
+                    next.agent_session = found;
+                }
+            }
             if lost {
                 let resumable = !next.agent_session.is_empty()
                     && agents::resume_args(&next.kind, &next.agent_session).is_some();
