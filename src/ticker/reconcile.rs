@@ -222,6 +222,14 @@ pub struct Reconciler {
     pub(super) declined: BTreeMap<String, Option<Decline>>,
     /// Transcript copies still running, each giving its failures to log.
     pub(super) keeping: Vec<tokio::task::JoinHandle<Vec<String>>>,
+    /// Postmortems being written, by run key.
+    pub(super) writing: BTreeMap<
+        String,
+        (
+            crate::postmortem::Stage,
+            tokio::task::JoinHandle<super::postmortems::Written>,
+        ),
+    >,
 }
 
 pub(super) async fn blocking<T: Send + 'static>(
@@ -356,19 +364,25 @@ impl Reconciler {
             queries: Vec::new(),
             declined: BTreeMap::new(),
             keeping: Vec::new(),
+            writing: BTreeMap::new(),
         })
     }
 
     /// Whether an effect task or a routing agent is still running.
     #[cfg(test)]
     pub fn busy(&self) -> bool {
-        !self.in_flight.is_empty() || !self.routing.is_empty() || !self.keeping.is_empty()
+        !self.in_flight.is_empty()
+            || !self.routing.is_empty()
+            || !self.keeping.is_empty()
+            || !self.writing.is_empty()
     }
 
-    /// Waits for the transcript copies still running.
+    /// Waits for the transcript copies and postmortems still running.
     #[cfg(test)]
     pub async fn copies_done(&self) {
-        while self.keeping.iter().any(|h| !h.is_finished()) {
+        while self.keeping.iter().any(|h| !h.is_finished())
+            || self.writing.values().any(|(_, h)| !h.is_finished())
+        {
             tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         }
     }
@@ -489,6 +503,7 @@ impl Reconciler {
         now: Timestamp,
     ) {
         self.log_kept(d).await;
+        self.postmortems(d, now).await;
         let snapshot = d.herdr.snapshot().await.ok();
         let snap = snapshot.as_ref();
         if let Some(snapshot) = snap {
@@ -663,6 +678,10 @@ impl Reconciler {
     /// but held by another condition waits for the next wake.
     pub fn next_deadline<H>(&self, d: &Deps<'_, H>, now: Timestamp) -> Timestamp {
         let mut times: Vec<Timestamp> = Vec::new();
+        // A postmortem's answer wakes nothing: it is looked for every 5 s.
+        if !self.writing.is_empty() {
+            times.push(now + SignedDuration::from_secs(5));
+        }
         let hours = i64::try_from(d.config.limits.run_timeout_hours).unwrap_or(i64::MAX / 7200);
         let timeout = SignedDuration::from_hours(hours);
         for run in Run::list(&d.ctx.runs_dir()) {

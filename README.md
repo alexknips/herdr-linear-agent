@@ -53,6 +53,7 @@ client_id = "your-oauth-client-id"       # the OAuth application of this workspa
 allowed_user_ids = ["linear-user-uuid"]  # whose replies reach the coordinator
 # allowed_delegator_ids = ["linear-user-uuid"]  # whose delegations are taken (default: allowed_user_ids)
 review_state = "In Review"               # where `finish` moves the issue (default)
+# postmortem = "review"                  # the postmortem method of this team's runs (see Postmortems)
 
 [workspaces.acme.teams.OPS]              # each team has its own allowed users and review state
 allowed_user_ids = ["another-user-uuid"]
@@ -101,6 +102,28 @@ workers = ["standard", "deep"]           # the profiles a coordinator may start 
 **Workspaces and teams.** Each workspace polls Linear with its own OAuth application, token and app user. Runs are named `<workspace>/<ISSUE-KEY>`, for example `acme/DATA-1`, so the same issue key in two workspaces makes two runs; the name is what agents pass to `herdr-linear-agent` commands, and the workspace is part of agent names (`acme-data-1-coordinator`), branches (`herdr-linear-agent/acme/data-1/w1-...`) and brief folders. A team's `allowed_user_ids`, `allowed_delegator_ids` and `review_state` apply to that team's issues only. A run whose team was removed from the config keeps running, relays nobody's replies and moves to `In Review` on `finish`.
 
 **Who may delegate.** The ticker takes an issue only when a person in the team's `allowed_delegator_ids` delegated it; see [Security notes](#security-notes), and [Finding user IDs](#finding-user-ids) for the IDs. Without the key, the team's `allowed_user_ids` may delegate. Set it apart when someone should start runs without their replies counting as instructions, or the other way round.
+
+### Postmortems
+
+To improve how the agents work run after run, a team can have a postmortem: when the coordinator calls `finish` (an interim one) and when the issue is completed or canceled (a final one), an agent reads the run and the plugin posts its summary as a comment on the issue, with labels from a list you allow. The method lives in a folder next to `config.toml`, so you can change it as often as you like; each comment names the method and its version.
+
+```toml
+# postmortems/review/config.toml
+profile = "router"                       # the agent that writes it: a kind that can be a routing agent
+labels = ["Improvement", "Process/Rework"]  # labels it may add, `Label` or `Group/Label`; they must exist in Linear
+# timeout_seconds = 300
+```
+
+`postmortems/review/instructions.md` holds the method, for example:
+
+```markdown
+- What was asked, and what was delivered.
+- What was smooth, and where time went (retries, failed commands, waiting for people).
+- What to change next time, concretely.
+Add `Improvement` only when there is something concrete to change in how the agents work.
+```
+
+Then set `postmortem = "review"` on a team. The agent runs headless the way the routing agent does, with no tools: the plugin gives it the run's records on standard input (the issue, `conversation.md`, the workers' reports, and the agents' transcripts, long ones shortened in the middle), and it answers with the summary and the labels. The plugin keeps each answer in the run folder (`.state/postmortems/`) and posts it; labels outside the list are dropped. A comment reads `**Postmortem (interim)**, method `review` version `<12 hex digits>``, then the summary. Changing either file of the method changes the version, and offers a reload like any config change.
 
 ### Finding user IDs
 

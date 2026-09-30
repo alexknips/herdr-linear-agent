@@ -19,6 +19,7 @@ use crate::{agents, routing};
 
 pub const FILE_NAME: &str = "config.toml";
 const PROFILES_DIR: &str = "profiles";
+const POSTMORTEMS_DIR: &str = "postmortems";
 const INSTRUCTIONS_FILE: &str = "instructions.md";
 pub const DEFAULT_CALLBACK_PORT: u16 = 43871;
 
@@ -40,6 +41,9 @@ pub struct Config {
     /// Read from the profile folders, never from `config.toml`.
     #[serde(skip)]
     pub profiles: BTreeMap<String, Profile>,
+    /// Read from the postmortem folders, by name.
+    #[serde(skip)]
+    pub postmortems: BTreeMap<String, Postmortem>,
     pub routing: Routing,
 }
 
@@ -74,6 +78,40 @@ pub struct Team {
     /// The workflow state an issue moves to on `finish`.
     #[serde(default = "default_review_state")]
     pub review_state: String,
+    /// The postmortem method of this team's runs, a folder under
+    /// `postmortems/`; none when unset.
+    #[serde(default)]
+    pub postmortem: Option<String>,
+}
+
+/// A postmortem method: `postmortems/<name>/config.toml` and the method in
+/// its `instructions.md`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Postmortem {
+    /// The profile of the agent that writes it: a kind that can be a
+    /// routing agent, run the same way.
+    pub profile: String,
+    /// The labels it may add, `Label` or `Group/Label`.
+    pub labels: Vec<String>,
+    pub timeout_seconds: u64,
+    pub instructions: String,
+    /// The first 12 hex digits of a SHA-256 over the two files, told in each
+    /// comment, so summaries of one method can be told from another's.
+    pub version: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PostmortemFile {
+    profile: String,
+    #[serde(default)]
+    labels: Vec<String>,
+    #[serde(default = "default_postmortem_timeout")]
+    timeout_seconds: u64,
+}
+
+fn default_postmortem_timeout() -> u64 {
+    300
 }
 
 impl Team {
@@ -232,17 +270,23 @@ impl Config {
         let text = std::fs::read_to_string(&path)
             .with_context(|| format!("could not read {}", path.display()))?;
         let profiles = load_profiles(&config_dir.join(PROFILES_DIR))?;
-        Self::parse(&text, profiles).with_context(|| format!("{} is not valid", path.display()))
+        let postmortems = load_postmortems(&config_dir.join(POSTMORTEMS_DIR))?;
+        Self::parse(&text, profiles, postmortems)
+            .with_context(|| format!("{} is not valid", path.display()))
     }
 
     /// A SHA-256 over the files `load` reads, by sorted path and content:
-    /// `config.toml` and each profile folder's `config.toml` and
-    /// `instructions.md`. Rewriting a file with the same content keeps it.
+    /// `config.toml` and each profile and postmortem folder's `config.toml`
+    /// and `instructions.md`. Rewriting a file with the same content keeps it.
     pub fn fingerprint(config_dir: &Path) -> Result<[u8; 32]> {
         let path = Self::path(config_dir);
         let mut files = vec![path];
-        if let Ok(entries) = std::fs::read_dir(config_dir.join(PROFILES_DIR)) {
-            for entry in entries.flatten() {
+        for dir in [PROFILES_DIR, POSTMORTEMS_DIR] {
+            for entry in std::fs::read_dir(config_dir.join(dir))
+                .into_iter()
+                .flatten()
+                .flatten()
+            {
                 if entry.file_name().to_string_lossy().starts_with('.') {
                     continue;
                 }
@@ -272,7 +316,11 @@ impl Config {
         Ok(hash.finalize().into())
     }
 
-    fn parse(text: &str, profiles: BTreeMap<String, Profile>) -> Result<Config> {
+    fn parse(
+        text: &str,
+        profiles: BTreeMap<String, Profile>,
+        postmortems: BTreeMap<String, Postmortem>,
+    ) -> Result<Config> {
         let table: toml::Table = toml::from_str(text)?;
         ensure!(
             !table.contains_key("profiles"),
@@ -280,6 +328,7 @@ impl Config {
         );
         let mut config: Config = table.try_into()?;
         config.profiles = profiles;
+        config.postmortems = postmortems;
         config.validate()?;
         Ok(config)
     }
@@ -388,6 +437,35 @@ impl Config {
             "routing.agent: the `{}` kind cannot be a routing agent",
             agent.kind
         );
+        for (name, method) in &self.postmortems {
+            let at = format!("{POSTMORTEMS_DIR}/{name}");
+            let agent = self
+                .profile(&method.profile)
+                .with_context(|| format!("{at}: profile"))?;
+            ensure!(
+                routing::registered(&agent.kind),
+                "{at}: the `{}` kind cannot write a postmortem",
+                agent.kind
+            );
+            ensure!(
+                (1..=3600).contains(&method.timeout_seconds),
+                "{at}: timeout_seconds must be between 1 and 3600"
+            );
+            ensure!(
+                !method.instructions.trim().is_empty(),
+                "{at}: {INSTRUCTIONS_FILE} is missing or blank"
+            );
+        }
+        for (name, workspace) in &self.workspaces {
+            for (key, team) in &workspace.teams {
+                if let Some(method) = &team.postmortem {
+                    ensure!(
+                        self.postmortems.contains_key(method),
+                        "workspaces.{name}.teams.{key}.postmortem: there is no {POSTMORTEMS_DIR}/{method}"
+                    );
+                }
+            }
+        }
         ensure!(
             !routing.coordinators.is_empty(),
             "routing.coordinators lists no profile"
@@ -494,6 +572,58 @@ fn load_profiles(dir: &Path) -> Result<BTreeMap<String, Profile>> {
         .keys()
         .map(|name| Ok((name.clone(), resolve(name, &files)?)))
         .collect()
+}
+
+/// Reads every postmortem folder under `dir`, named by the folder. A missing
+/// `dir` gives none.
+fn load_postmortems(dir: &Path) -> Result<BTreeMap<String, Postmortem>> {
+    let mut methods = BTreeMap::new();
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(methods),
+        Err(error) => {
+            return Err(error).with_context(|| format!("could not read {}", dir.display()));
+        }
+    };
+    for entry in entries {
+        let folder = entry
+            .with_context(|| format!("could not read {}", dir.display()))?
+            .path();
+        let name = folder
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        if name.starts_with('.') {
+            continue;
+        }
+        let read = |file: &str| {
+            let path = folder.join(file);
+            std::fs::read_to_string(&path)
+                .with_context(|| format!("could not read {}", path.display()))
+        };
+        let config = read(FILE_NAME)?;
+        let instructions = read(INSTRUCTIONS_FILE).unwrap_or_default();
+        let file: PostmortemFile = toml::from_str(&config)
+            .with_context(|| format!("{} is not valid", folder.join(FILE_NAME).display()))?;
+        let mut hash = sha2::Sha256::new();
+        hash.update(config.as_bytes());
+        hash.update([0]);
+        hash.update(instructions.as_bytes());
+        let digest: [u8; 32] = hash.finalize().into();
+        let version = digest.iter().take(6).map(|b| format!("{b:02x}")).collect();
+        methods.insert(
+            name,
+            Postmortem {
+                profile: file.profile,
+                labels: file.labels,
+                timeout_seconds: file.timeout_seconds,
+                instructions,
+                version,
+            },
+        );
+    }
+    Ok(methods)
 }
 
 /// A profile folder's `config.toml` and its `instructions.md`, `None` when
@@ -1038,6 +1168,60 @@ workers = ["standard", "deep"]
             set("run_read_interval_seconds = 3601")
                 .unwrap_err()
                 .ends_with("workspaces.acme.run_read_interval_seconds must be between 1 and 3600")
+        );
+    }
+
+    #[test]
+    fn a_team_names_a_postmortem_method_whose_version_follows_its_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let text = SAMPLE.replace(
+            "allowed_user_ids = [\"user-1\"]",
+            "allowed_user_ids = [\"user-1\"]\npostmortem = \"review\"",
+        );
+        write_sample(dir.path(), &text);
+        let error = format!("{:#}", Config::load(dir.path()).unwrap_err());
+        assert!(
+            error
+                .ends_with("workspaces.acme.teams.DATA.postmortem: there is no postmortems/review"),
+            "{error}"
+        );
+        let method = dir.path().join("postmortems/review");
+        std::fs::create_dir_all(&method).unwrap();
+        std::fs::write(
+            method.join(FILE_NAME),
+            "profile = \"router\"\nlabels = [\"Improvement\"]\n",
+        )
+        .unwrap();
+        let error = format!("{:#}", Config::load(dir.path()).unwrap_err());
+        assert!(
+            error.ends_with("postmortems/review: instructions.md is missing or blank"),
+            "{error}"
+        );
+        std::fs::write(method.join(INSTRUCTIONS_FILE), "Say what went well.\n").unwrap();
+        let before = Config::fingerprint(dir.path()).unwrap();
+        let config = Config::load(dir.path()).unwrap();
+        let review = &config.postmortems["review"];
+        assert_eq!(
+            (
+                review.profile.as_str(),
+                review.labels.as_slice(),
+                review.timeout_seconds
+            ),
+            ("router", &["Improvement".to_string()][..], 300)
+        );
+        assert_eq!(review.version.len(), 12);
+        assert_eq!(
+            config.team("acme", "DATA").unwrap().postmortem.as_deref(),
+            Some("review")
+        );
+
+        std::fs::write(method.join(INSTRUCTIONS_FILE), "Say what to change.\n").unwrap();
+        let changed = Config::load(dir.path()).unwrap();
+        assert_ne!(changed.postmortems["review"].version, review.version);
+        assert_ne!(
+            Config::fingerprint(dir.path()).unwrap(),
+            before,
+            "a reload is offered"
         );
     }
 

@@ -471,6 +471,7 @@ impl Reconciler {
         self.update_and_push(run, move |r| {
             r.status = Status::Closed;
             r.coordinator.status = AgentStatus::Stopped;
+            r.postmortem_due = Some(crate::postmortem::Stage::Final);
             if r.session_id.is_empty() {
                 return Vec::new();
             }

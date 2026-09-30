@@ -557,22 +557,55 @@ async fn run(
     path_var: Option<&str>,
     parent: &Path,
 ) -> Result<Result<String, Fallback>> {
+    let call = Ask {
+        profile,
+        schema: &schema(candidates),
+        instructions: &instructions(candidates),
+        input: &input(issue),
+        timeout,
+        path_var,
+        parent,
+        role: "routing",
+    };
+    let answer = ask(&call).await?;
+    Ok(answer.and_then(|answer| pick(&answer, candidates).map_err(Fallback::Invalid)))
+}
+
+/// One headless call of a profile's kind, run the way the routing agent is.
+pub struct Ask<'a> {
+    pub profile: &'a Profile,
+    /// The JSON schema the answer follows.
+    pub schema: &'a Value,
+    /// The system prompt.
+    pub instructions: &'a str,
+    /// Written to standard input.
+    pub input: &'a str,
+    pub timeout: Duration,
+    pub path_var: Option<&'a str>,
+    /// Holds the call's temporary folder.
+    pub parent: &'a Path,
+    /// Names the agent in errors and its folder, `hla-<role>-…`.
+    pub role: &'a str,
+}
+
+/// Runs the call once with the kind's recipe, in a fresh folder removed
+/// afterwards, and returns its JSON answer, or why there is none.
+pub async fn ask(call: &Ask<'_>) -> Result<Result<Value, Fallback>> {
+    let (profile, role) = (call.profile, call.role);
     let recipe = recipe(&profile.kind)
-        .with_context(|| format!("the `{}` kind cannot be a routing agent", profile.kind))?;
+        .with_context(|| format!("the `{}` kind cannot be a {role} agent", profile.kind))?;
     let sandbox = tempfile::Builder::new()
-        .prefix("hla-routing-")
-        .tempdir_in(parent)
-        .with_context(|| format!("could not create a folder in {}", parent.display()))?;
-    let schema = schema(candidates);
+        .prefix(&format!("hla-{role}-"))
+        .tempdir_in(call.parent)
+        .with_context(|| format!("could not create a folder in {}", call.parent.display()))?;
     let schema_path = sandbox.path().join("schema.json");
-    std::fs::write(&schema_path, schema.to_string())?;
-    let instructions = instructions(candidates);
+    std::fs::write(&schema_path, call.schema.to_string())?;
     let invocation = (recipe.invocation)(&Call {
         profile,
         dir: sandbox.path(),
-        schema: &schema,
+        schema: call.schema,
         schema_path: &schema_path,
-        instructions: &instructions,
+        instructions: call.instructions,
     });
     for (path, text) in &invocation.files {
         if let Some(parent) = path.parent() {
@@ -587,7 +620,7 @@ async fn run(
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .kill_on_drop(true);
-    if let Some(path) = path_var {
+    if let Some(path) = call.path_var {
         cmd.env("PATH", path);
     }
     // The profile's own variables first: the recipe's cut wins over them.
@@ -596,13 +629,12 @@ async fn run(
     }
     let mut child = cmd
         .spawn()
-        .with_context(|| format!("could not start the routing agent `{}`", invocation.program))?;
-    let stdin_text = input(issue);
+        .with_context(|| format!("could not start the {role} agent `{}`", invocation.program))?;
     // A child past the timeout is dropped with the future and so killed.
-    let finished = tokio::time::timeout(timeout, async {
+    let finished = tokio::time::timeout(call.timeout, async {
         if let Some(mut stdin) = child.stdin.take() {
             // A child that exits early closes the pipe; its answer then decides.
-            let _ = stdin.write_all(stdin_text.as_bytes()).await;
+            let _ = stdin.write_all(call.input.as_bytes()).await;
         }
         child.wait_with_output().await
     })
@@ -610,7 +642,7 @@ async fn run(
     let Ok(output) = finished else {
         return Ok(Err(Fallback::TimedOut));
     };
-    let output = output.context("could not wait for the routing agent")?;
+    let output = output.with_context(|| format!("could not wait for the {role} agent"))?;
     if !output.status.success() {
         return Ok(Err(Fallback::Failed(format!(
             "it exited with {}",
@@ -630,17 +662,14 @@ async fn run(
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .kill_on_drop(true);
-        if let Some(path) = path_var {
+        if let Some(path) = call.path_var {
             cleanup.env("PATH", path);
         }
         cleanup.envs(call_env(profile, &invocation));
         // Best effort: a session left behind only shows in the user's list.
         let _ = tokio::time::timeout(CLEANUP_TIMEOUT, cleanup.status()).await;
     }
-    let Some(answer) = (recipe.answer)(&text) else {
-        return Ok(Err(Fallback::Invalid("no JSON answer".into())));
-    };
-    Ok(pick(&answer, candidates).map_err(Fallback::Invalid))
+    Ok((recipe.answer)(&text).ok_or_else(|| Fallback::Invalid("no JSON answer".into())))
 }
 
 #[cfg(test)]

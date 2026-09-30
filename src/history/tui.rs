@@ -14,7 +14,7 @@ use super::{Entry, entries, filter, minute, status, theme};
 use crate::herdr::{Client, Herdr};
 use crate::paths::Env;
 use crate::run::AgentStatus;
-use crate::transcript::{self, Roots, Session, Sessions};
+use crate::transcript::{self, Roots, Session};
 
 const PAGE: u16 = 10;
 
@@ -106,32 +106,10 @@ fn rows(entry: &Entry, roots: &Roots) -> Vec<Row> {
             open: record.status == AgentStatus::Open,
             found,
         };
-        // The run folder's copies first; then the agent's own files of the
-        // recorded session, or of the folder when none is recorded.
-        let mut found = transcript::kept(&entry.run.transcripts_dir(&agent.label));
-        let originals = match transcript::sessions(roots, &record.kind, &record.cwd) {
-            Sessions::Found { sessions, searched } => Ok((sessions, searched)),
-            Sessions::Unreadable(why) => Err(why),
-        };
-        if let Ok((sessions, _)) = &originals {
-            let wanted =
-                |s: &&Session| record.agent_session.is_empty() || s.id == record.agent_session;
-            let new: Vec<Session> = sessions
-                .iter()
-                .filter(wanted)
-                .filter(|s| !found.iter().any(|k| k.id == s.id))
-                .cloned()
-                .collect();
-            found.extend(new);
+        match transcript::agent_sessions(roots, &entry.run, &agent.label, &record) {
+            Ok(found) => rows.extend(found.into_iter().map(|s| row(Ok(s)))),
+            Err(why) => rows.push(row(Err(why))),
         }
-        if !found.is_empty() {
-            rows.extend(found.into_iter().map(|s| row(Ok(s))));
-            continue;
-        }
-        rows.push(row(Err(match originals {
-            Ok((_, searched)) => format!("No transcript is left in {searched}."),
-            Err(why) => format!("Cannot read this transcript: {why}."),
-        })));
     }
     rows
 }

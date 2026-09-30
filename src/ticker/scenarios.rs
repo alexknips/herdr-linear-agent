@@ -967,6 +967,132 @@ async fn a_detached_run_and_a_restarted_worker_keep_their_transcripts() {
     assert_eq!(lines_of(&copy), 1);
 }
 
+/// Gives team DATA the postmortem method `review` (labels `Improvement`
+/// and `postmortem/rework`), and a fake `claude` that answers routing with
+/// `coordinator` and a postmortem with `answer` (a JSON object), or fails
+/// it when `answer` is empty.
+fn postmortem_method(world: &mut World, answer: &str) {
+    let config = world.env.config_dir();
+    let method = config.join("postmortems/review");
+    std::fs::create_dir_all(&method).unwrap();
+    std::fs::write(
+        method.join("config.toml"),
+        "profile = \"router\"\nlabels = [\"Improvement\", \"postmortem/rework\"]\n",
+    )
+    .unwrap();
+    std::fs::write(
+        method.join("instructions.md"),
+        "Say what went well and what to change.\n",
+    )
+    .unwrap();
+    let text = std::fs::read_to_string(config.join("config.toml")).unwrap();
+    let text = text.replacen(
+        "allowed_user_ids = [\"user-1\"]",
+        "allowed_user_ids = [\"user-1\"]\npostmortem = \"review\"",
+        1,
+    );
+    std::fs::write(config.join("config.toml"), text).unwrap();
+    world.reload_config();
+    let postmortem = if answer.is_empty() {
+        "exit 1".to_string()
+    } else {
+        format!("echo '{{\"structured_output\":{answer}}}'")
+    };
+    world.router(&format!(
+        "cat > /dev/null\ncase \"$*\" in\n  *'# Method'*) {postmortem} ;;\n  *) echo '{{\"structured_output\":{{\"coordinator\":\"coordinator\"}}}}' ;;\nesac\n"
+    ));
+    world.fake().labels = vec!["Improvement".into(), "postmortem/rework".into()];
+}
+
+fn posted(world: &World) -> Vec<String> {
+    world.fake().issue("DATA-1")["posted"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|c| c["body"].as_str().unwrap_or_default().to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn a_finish_and_a_close_each_get_one_postmortem_comment() {
+    let mut world = World::sample();
+    postmortem_method(
+        &mut world,
+        r#"{"summary":"It went well.","labels":["Improvement","Bogus"]}"#,
+    );
+    world.running_issue().await;
+    commands::finish(&world.ctx(), &world.session(), KEY, "Done.")
+        .await
+        .unwrap();
+    world.settle().await;
+    let version = world.config.postmortems["review"].version.clone();
+    assert_eq!(
+        posted(&world),
+        [format!(
+            "**Postmortem (interim)**, method `review` version `{version}`\n\nIt went well."
+        )]
+    );
+    let labels: Vec<String> = world.fake().issue("DATA-1")["labels"]["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|l| l["name"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        labels,
+        ["Improvement"],
+        "a label outside the method's list is dropped"
+    );
+
+    world.move_issue(KEY, "Canceled");
+    world.later(5);
+    world.settle().await;
+    world.later(5);
+    world.settle().await;
+    let comments = posted(&world);
+    assert_eq!(comments.len(), 2, "{comments:?}");
+    assert!(
+        comments[1].starts_with("**Postmortem (final)**"),
+        "{comments:?}"
+    );
+    assert_eq!(world.record(KEY).postmortem_due, None);
+    let kept = std::fs::read_dir(world.run(KEY).state_dir().join("postmortems"))
+        .unwrap()
+        .count();
+    assert_eq!(kept, 2);
+    let log = world.log_text();
+    assert!(
+        log.contains("acme/DATA-1: wrote the interim postmortem"),
+        "{log}"
+    );
+    assert!(
+        log.contains("acme/DATA-1: wrote the final postmortem"),
+        "{log}"
+    );
+}
+
+#[tokio::test]
+async fn a_failed_postmortem_is_logged_and_not_tried_again() {
+    let mut world = World::sample();
+    postmortem_method(&mut world, "");
+    world.running_issue().await;
+    commands::finish(&world.ctx(), &world.session(), KEY, "Done.")
+        .await
+        .unwrap();
+    world.settle().await;
+    world.later(5);
+    world.settle().await;
+    assert!(posted(&world).is_empty());
+    assert_eq!(world.record(KEY).postmortem_due, None);
+    let log = world.log_text();
+    assert_eq!(
+        log.matches("acme/DATA-1: the interim postmortem failed: it exited with")
+            .count(),
+        1,
+        "{log}"
+    );
+}
+
 #[tokio::test]
 async fn context_prints_the_digest_and_marks_its_items_seen() {
     let mut world = World::sample();

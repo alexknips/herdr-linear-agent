@@ -5,6 +5,7 @@
 
 mod intake;
 mod launch;
+mod postmortems;
 pub mod reconcile;
 #[cfg(test)]
 mod scenarios;

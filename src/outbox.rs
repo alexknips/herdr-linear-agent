@@ -32,10 +32,26 @@ pub enum StateTarget {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Op {
-    Activity { activity: Activity },
-    Plan { plan: Value },
-    ExternalUrls { urls: Vec<ExternalUrl> },
-    IssueState { target: StateTarget },
+    Activity {
+        activity: Activity,
+    },
+    Plan {
+        plan: Value,
+    },
+    ExternalUrls {
+        urls: Vec<ExternalUrl>,
+    },
+    IssueState {
+        target: StateTarget,
+    },
+    /// A comment on the issue, created with the request's id.
+    Comment {
+        body: String,
+    },
+    /// Labels added to the issue, `Label` or `Group/Label`.
+    Labels {
+        names: Vec<String>,
+    },
 }
 
 impl Op {
@@ -215,8 +231,9 @@ async fn send_one(
         Op::Activity { .. } if request.attempted => {
             linear.activity_exists(session_id, &request.id).await?
         }
-        // Replacing the plan or the URL list is idempotent, and a state move
-        // reads the issue before it writes.
+        Op::Comment { .. } if request.attempted => linear.comment_exists(&request.id).await?,
+        // Replacing the plan or the URL list and adding labels are
+        // idempotent, and a state move reads the issue before it writes.
         _ => false,
     };
     if checked {
@@ -232,6 +249,8 @@ async fn send_one(
         }
         Op::Plan { plan } => linear.set_plan(session_id, plan).await,
         Op::ExternalUrls { urls } => linear.set_external_urls(session_id, urls).await,
+        Op::Comment { body } => linear.create_comment(issue_id, &request.id, body).await,
+        Op::Labels { names } => linear.add_labels(issue_id, names).await,
         Op::IssueState { target } => {
             let issue = linear.issue(issue_id).await?;
             let Some(state_id) = target_state(&issue, *target, review_state)? else {

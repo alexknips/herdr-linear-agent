@@ -227,7 +227,11 @@ pub async fn finish<H: Herdr>(
             target: StateTarget::Review,
         },
     )?;
-    run.update(|r| r.finished = true)?;
+    run.update(|r| {
+        r.finished = true;
+        r.postmortem_due
+            .get_or_insert(crate::postmortem::Stage::Interim);
+    })?;
     ticker::poke(&ctx.state_dir());
     let review_state = config
         .team(&record.workspace, &record.team_key)

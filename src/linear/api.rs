@@ -86,6 +86,30 @@ const ISSUE_STATE_UPDATE: &str = r#"mutation HlaIssueState($id: String!, $stateI
   issueUpdate(id: $id, input: { stateId: $stateId }) { success }
 }"#;
 
+const COMMENT_CREATE: &str = r#"mutation HlaCommentCreate($input: CommentCreateInput!) {
+  commentCreate(input: $input) { success comment { id } }
+}"#;
+
+const COMMENT_FIND: &str = r#"query HlaCommentFind($id: ID!) {
+  viewer { id app isMe }
+  comments(filter: { id: { eq: $id } }) { nodes { id } }
+}"#;
+
+/// The issue's labels, and every label its team can use (the team's and
+/// the workspace's), with their groups.
+const LABELS: &str = r#"query HlaLabels($id: String!) {
+  viewer { id app isMe }
+  issue(id: $id) {
+    labels { nodes { id } }
+    team { labels(first: 250) { nodes { id name parent { name } } } }
+  }
+  issueLabels(first: 250, filter: { team: { null: true } }) { nodes { id name parent { name } } }
+}"#;
+
+const LABEL_ADD: &str = r#"mutation HlaLabelAdd($id: String!, $labelId: String!) {
+  issueAddLabel(id: $id, labelId: $labelId) { success }
+}"#;
+
 /// One run's part of `HlaRuns`; `@` is replaced by the run's index. The text
 /// is fixed: only the alias number varies.
 const RUN_PART: &str = r#"  i@: issue(id: $i@) { updatedAt state { type name } delegate { id } }
@@ -536,6 +560,85 @@ pub trait LinearApi: Sync {
         }
     }
 
+    /// Creates a comment on the issue with the caller's UUID as its ID.
+    fn create_comment(
+        &self,
+        issue_id: &str,
+        id: &str,
+        body: &str,
+    ) -> impl Future<Output = Result<(), ApiError>> + Send {
+        async move {
+            let variables = json!({ "input": { "id": id, "issueId": issue_id, "body": body } });
+            self.mutate(
+                "HlaCommentCreate",
+                COMMENT_CREATE,
+                variables,
+                "commentCreate",
+            )
+            .await
+            .map(|_| ())
+        }
+    }
+
+    /// Whether a comment with that id exists.
+    fn comment_exists(&self, id: &str) -> impl Future<Output = Result<bool, ApiError>> + Send {
+        async move {
+            let data = self
+                .execute("HlaCommentFind", COMMENT_FIND, json!({ "id": id }), false)
+                .await?;
+            Ok(nodes(field(&data, "comments")?).next().is_some())
+        }
+    }
+
+    /// Adds the labels named `Label` or `Group/Label` the issue lacks. A
+    /// name no label of the issue's team or workspace has is an error, after
+    /// the others were added.
+    fn add_labels(
+        &self,
+        issue_id: &str,
+        names: &[String],
+    ) -> impl Future<Output = Result<(), ApiError>> + Send {
+        async move {
+            let data = self
+                .execute("HlaLabels", LABELS, json!({ "id": issue_id }), false)
+                .await?;
+            let issue = field(&data, "issue")?;
+            let has: Vec<&Value> = nodes(&issue["labels"]).map(|l| &l["id"]).collect();
+            let known: Vec<(String, &Value)> = nodes(&issue["team"]["labels"])
+                .chain(nodes(field(&data, "issueLabels")?))
+                .map(|l| {
+                    let name = l["name"].as_str().unwrap_or("");
+                    let name = match l["parent"]["name"].as_str() {
+                        Some(group) => format!("{group}/{name}"),
+                        None => name.to_string(),
+                    };
+                    (name, &l["id"])
+                })
+                .collect();
+            let mut unknown = Vec::new();
+            for name in names {
+                let Some((_, id)) = known.iter().find(|(known, _)| known == name) else {
+                    unknown.push(name.as_str());
+                    continue;
+                };
+                if has.contains(id) {
+                    continue;
+                }
+                let variables = json!({ "id": issue_id, "labelId": id });
+                self.mutate("HlaLabelAdd", LABEL_ADD, variables, "issueAddLabel")
+                    .await?;
+            }
+            if unknown.is_empty() {
+                Ok(())
+            } else {
+                Err(ApiError::Graphql(format!(
+                    "no label named {}",
+                    unknown.join(", ")
+                )))
+            }
+        }
+    }
+
     /// Every given run's issue state and new prompts, in one `HlaRuns`
     /// request, in query order.
     fn run_updates(
@@ -834,6 +937,8 @@ pub mod fake {
         /// Session threads (root, activities, replies) do not show as issue
         /// comments and so do not move `updatedAt`, for tests that count reads.
         pub no_session_comments: bool,
+        /// The labels the issue's team can use, `Label` or `Group/Label`.
+        pub labels: Vec<String>,
         /// The organization's URL key in issue URLs, `acme` when empty; set,
         /// it also sets the issue ids apart from another fake's.
         pub organization: String,
@@ -1198,6 +1303,67 @@ pub mod fake {
                         session.external_urls = serde_json::from_value(urls.clone()).unwrap();
                     }
                     Ok(json!({ "agentSessionUpdate": { "success": true } }))
+                }
+                "HlaCommentCreate" => {
+                    let input = &variables["input"];
+                    let issue = self.issue_mut(input["issueId"].as_str().unwrap_or(""));
+                    issue["posted"]
+                        .as_array_mut()
+                        .map(|posted| {
+                            posted.push(json!({ "id": input["id"], "body": input["body"] }))
+                        })
+                        .unwrap_or_else(|| {
+                            issue["posted"] = json!([{ "id": input["id"], "body": input["body"] }]);
+                        });
+                    Ok(
+                        json!({ "commentCreate": { "success": true, "comment": { "id": input["id"] } } }),
+                    )
+                }
+                "HlaCommentFind" => {
+                    let id = &variables["id"];
+                    let found: Vec<Value> = self
+                        .issues
+                        .iter()
+                        .flat_map(|i| i["posted"].as_array().cloned().unwrap_or_default())
+                        .filter(|c| &c["id"] == id)
+                        .map(|c| json!({ "id": c["id"] }))
+                        .collect();
+                    Ok(json!({ "viewer": viewer(), "comments": { "nodes": found } }))
+                }
+                "HlaLabels" => {
+                    let issue = self.issue(variables["id"].as_str().unwrap_or(""));
+                    let has: Vec<Value> = issue["labels"]["nodes"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .map(|l| json!({ "id": format!("label-{}", l["name"].as_str().unwrap_or("")) }))
+                        .collect();
+                    let known: Vec<Value> = self
+                        .labels
+                        .iter()
+                        .map(|name| match name.split_once('/') {
+                            Some((group, name)) => json!({ "id": format!("label-{name}"), "name": name, "parent": { "name": group } }),
+                            None => json!({ "id": format!("label-{name}"), "name": name, "parent": null }),
+                        })
+                        .collect();
+                    Ok(json!({
+                        "viewer": viewer(),
+                        "issue": { "labels": { "nodes": has }, "team": { "labels": { "nodes": known } } },
+                        "issueLabels": { "nodes": [] }
+                    }))
+                }
+                "HlaLabelAdd" => {
+                    let name = variables["labelId"]
+                        .as_str()
+                        .unwrap_or("")
+                        .trim_start_matches("label-")
+                        .to_string();
+                    let issue = self.issue_mut(variables["id"].as_str().unwrap_or(""));
+                    issue["labels"]["nodes"]
+                        .as_array_mut()
+                        .expect("label nodes")
+                        .push(json!({ "name": name, "parent": null }));
+                    Ok(json!({ "issueAddLabel": { "success": true } }))
                 }
                 "HlaIssueState" => {
                     let state_id = variables["stateId"].clone();

@@ -531,6 +531,38 @@ fn format(items: &[Item]) -> String {
     out
 }
 
+/// The sessions of an agent of `run` to read: the run folder's copies first,
+/// then the agent's own files of the recorded session, or of its folder when
+/// none is recorded. `Err` says why there is none.
+pub fn agent_sessions(
+    roots: &Roots,
+    run: &Run,
+    label: &str,
+    agent: &AgentRecord,
+) -> Result<Vec<Session>, String> {
+    let mut found = kept(&run.transcripts_dir(label));
+    let searched = match sessions(roots, &agent.kind, &agent.cwd) {
+        Sessions::Found { sessions, searched } => {
+            let wanted =
+                |s: &Session| agent.agent_session.is_empty() || s.id == agent.agent_session;
+            let new: Vec<Session> = sessions
+                .into_iter()
+                .filter(|s| wanted(s) && !found.iter().any(|k| k.id == s.id))
+                .collect();
+            found.extend(new);
+            Ok(searched)
+        }
+        Sessions::Unreadable(why) => Err(why),
+    };
+    if !found.is_empty() {
+        return Ok(found);
+    }
+    Err(match searched {
+        Ok(searched) => format!("No transcript is left in {searched}."),
+        Err(why) => format!("Cannot read this transcript: {why}."),
+    })
+}
+
 /// The agent's session: the recorded one, or else the first begun after its
 /// last start, which is then recorded.
 pub fn find_session(roots: &Roots, run: &Run, label: &str, agent: &AgentRecord) -> Option<String> {

@@ -289,3 +289,15 @@ No Codex or OpenCode profile was set up for a run; their session lookup and the 
 ## History colors (2026-09-30)
 
 With a build of the branch, the browser opened on THLA-21's transcripts drew only these SGR codes, as `herdr pane read --format ansi` reports them: reset, bold, reversed, and the foreground palette entries 2 to 8 (`38;5;2` … `38;5;8`). No RGB (`38;2;…`) and no entry above 15, so the colors come from the Herdr theme's 16-color palette.
+
+## Postmortems (2026-10-01)
+
+Read-only, before the change: Linear's schema has `commentCreate(input: { id, issueId, body, … })`, `issueAddLabel(id, labelId)` and `comments(filter: { id })`. For THLA-21, `issue.team.labels` listed the workspace's labels too (`Bug`, `Feature`, `Improvement`).
+
+With a build of the branch in the default Herdr session, the THLA team given the method `review` (`profile = "router"`, Claude Haiku; `labels = ["Improvement"]`; a short method in `instructions.md`):
+
+| Step | Result |
+| --- | --- |
+| Interim | THLA-22's coordinator called `finish` 56 s after the pick-up; the ticker logged `wrote the interim postmortem` at once, kept `.state/postmortems/<time>-interim.json`, and herdr-agent's comment `**Postmortem (interim)**, method `review` version `9e649254e084`` with the summary was on the issue 3 s later, with the label `Improvement` |
+| Final | canceling the issue closed the run; 16 s later `wrote the final postmortem` was logged and a second comment, `**Postmortem (final)** …`, was posted; the outbox was empty afterwards |
+| Content | both summaries said the coordinator had not replied, because `conversation.md` was empty: the agent did not know that the agents reply through `say`, `ask` and `finish` in the Agent Session. The fixed frame of the instructions now says so |

@@ -241,6 +241,9 @@ pub struct RunRecord {
     pub announce_pending: bool,
     /// Sent by the next pass that has a snapshot.
     pub interrupt: Option<Interrupt>,
+    /// A postmortem the ticker writes next: interim after `finish`, final
+    /// when the run closes (which replaces an interim one not written yet).
+    pub postmortem_due: Option<crate::postmortem::Stage>,
 }
 
 #[derive(Debug, Clone)]
