@@ -54,6 +54,7 @@ pub enum Action {
     Pause,
     Resume,
     Doctor,
+    Reload,
 }
 
 /// `workspace` names the one workspace `login` logs in to again; the other
@@ -70,6 +71,7 @@ pub async fn run(ctx: &Ctx<'_>, action: Action, workspace: Option<&str>) -> Resu
         Action::Pause => pause(ctx, true).await,
         Action::Resume => pause(ctx, false).await,
         Action::Doctor => doctor(ctx).await,
+        Action::Reload => reload(ctx).await,
     };
     match result {
         Ok(message) => {
@@ -174,6 +176,28 @@ async fn login_workspace(
             viewer.name
         }
     ))
+}
+
+/// Checks the config and asks the running ticker to load it again, which
+/// starts its tasks over and reads the credentials again; without a running
+/// ticker, starts one, which loads it anyway.
+async fn reload(ctx: &Ctx<'_>) -> Result<String> {
+    Config::load(&ctx.config_dir())?;
+    let state_dir = ctx.state_dir();
+    if matches!(ticker::lock_state(&state_dir), ticker::LockState::Free) {
+        ticker::start(ctx).await?;
+        return Ok("The ticker was not running; it started with the config.".into());
+    }
+    let request = ticker::reload_path(&state_dir);
+    std::fs::write(&request, b"")
+        .with_context(|| format!("could not write {}", request.display()))?;
+    for _ in 0..50 {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        if !request.exists() {
+            return Ok("Reloaded the config: the ticker's tasks start again with it.".into());
+        }
+    }
+    Ok("Asked the ticker to reload the config; it has not taken the request yet.".into())
 }
 
 /// One line per run: its state, the coordinator and the workers.
@@ -519,6 +543,40 @@ mod tests {
             issue_from_url("https://evil.example/acme/issue/DATA-12"),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn reload_checks_the_config_then_asks_the_running_ticker() {
+        let home = tempfile::tempdir().unwrap();
+        let env = Env::for_test(home.path(), &[]);
+        let runner = FakeRunner::new();
+        let ctx = Ctx {
+            env: &env,
+            runner: &runner,
+            detached_ticker: false,
+        };
+        let config_dir = ctx.config_dir();
+        crate::config::tests::write_sample(&config_dir, "not toml [");
+        let state_dir = ctx.ensure_state_dir().unwrap();
+        let _lock = ticker::acquire(&state_dir).await.unwrap();
+        assert!(reload(&ctx).await.is_err());
+        assert!(
+            !ticker::reload_path(&state_dir).exists(),
+            "nothing is asked of the ticker for a config that does not load"
+        );
+
+        crate::config::tests::write_sample(&config_dir, crate::config::tests::SAMPLE);
+        let request = ticker::reload_path(&state_dir);
+        let taker = tokio::spawn(async move {
+            while std::fs::remove_file(&request).is_err() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        });
+        assert_eq!(
+            reload(&ctx).await.unwrap(),
+            "Reloaded the config: the ticker's tasks start again with it."
+        );
+        taker.await.unwrap();
     }
 
     #[tokio::test]

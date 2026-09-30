@@ -91,7 +91,7 @@ timeout_seconds = 120
 workers = ["standard", "deep"]           # the profiles a coordinator may start workers with
 ```
 
-**Config changes apply within seconds.** The ticker compares `config.toml` and the profile folders with the ones it runs on every 5 seconds, by content. When they changed and the new config loads, it starts its tasks again with it, as a ticker restart would; a config that does not load is logged (`config reload failed: <error>`, once per version of the files) and the old one stays in use until the files are fixed. A change takes effect for what is decided and started afterwards: routing of new issues, coordinator and worker launches and restarts, limits and notifications.
+**Reloading the config.** The running ticker keeps the config it started with until you run the Herdr action **herdr-linear-agent: reload the config**. The action checks the config first and shows why it does not load; when it loads, the ticker starts its tasks again with it, as a ticker restart would, and reads the Linear credentials again, so the macOS Keychain may ask once more. The ticker also compares `config.toml` and the profile folders with the ones it runs on every second, by content, and when they changed it shows a Herdr notification (if `notifications.herdr` is on) asking you to reload, or saying why the new files do not load; it tells once per change. A reload takes effect for what is decided and started afterwards: routing of new issues, coordinator and worker launches and restarts, limits and notifications.
 
 - An agent that is running keeps its arguments and instructions; the change reaches it at its next launch or restart. `AGENTS.md` and briefs already written are not rewritten.
 - Removing a profile that a running run uses is not refused; restarting or resuming with it fails then with the usual unknown-profile error.
@@ -342,6 +342,7 @@ When a pane needs a person (a permission or trust dialog), the ticker says so in
 | herdr-linear-agent: stop taking new issues | Pauses intake; running runs continue |
 | herdr-linear-agent: take new issues again | Resumes intake |
 | herdr-linear-agent: check setup | Checks Herdr, the config, the agent CLIs, each workspace's login and the ticker |
+| herdr-linear-agent: reload the config | Checks the config and makes the running ticker start its tasks again with it (starts the ticker when none runs) |
 
 ## Files
 
