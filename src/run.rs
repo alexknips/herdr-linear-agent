@@ -244,6 +244,8 @@ pub struct RunRecord {
     /// A postmortem the ticker writes next: interim after `finish`, final
     /// when the run closes (which replaces an interim one not written yet).
     pub postmortem_due: Option<crate::postmortem::Stage>,
+    /// The workflow state the issue was in when the run closed.
+    pub closed_state: String,
 }
 
 #[derive(Debug, Clone)]

@@ -118,10 +118,13 @@ pub fn input(roots: &Roots, run: &Run, record: &RunRecord, stage: Stage) -> Stri
     let mut text = format!(
         "# Run {}\n\n- Stage: {}\n- Issue: {} {}\n- Team: {}\n- Picked up: {}\n- Last activity: {}\n- Finished (`finish` accepted): {}\n- Coordinator: `{}` profile, {} kind\n",
         run.key,
-        match stage {
-            Stage::Interim =>
-                "interim: the coordinator called `finish`; people may still ask for changes",
-            Stage::Final => "final: the issue was completed or canceled",
+        match (stage, record.closed_state.as_str()) {
+            (Stage::Interim, _) => {
+                "interim: the coordinator called `finish`; people may still ask for changes"
+                    .to_string()
+            }
+            (Stage::Final, "") => "final: the issue was completed or canceled".to_string(),
+            (Stage::Final, state) => format!("final: the issue is {state}, so the run is closed"),
         },
         record.title,
         record.url,
@@ -277,6 +280,29 @@ pub fn keep(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_final_stage_names_the_state_the_issue_closed_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = RunRecord {
+            workspace: "acme".into(),
+            identifier: "DATA-1".into(),
+            closed_state: "Canceled".into(),
+            ..RunRecord::default()
+        };
+        let run = Run::create(dir.path(), record.clone()).unwrap();
+        let roots = Roots::from_env(&crate::paths::Env::for_test(dir.path(), &[]));
+        let text = input(&roots, &run, &record, Stage::Final);
+        assert!(
+            text.contains("- Stage: final: the issue is Canceled, so the run is closed\n"),
+            "{text}"
+        );
+        let interim = input(&roots, &run, &record, Stage::Interim);
+        assert!(
+            interim.contains("- Stage: interim: the coordinator called `finish`"),
+            "{interim}"
+        );
+    }
 
     #[test]
     fn a_long_transcript_keeps_its_start_and_its_end() {

@@ -1055,6 +1055,7 @@ async fn a_finish_and_a_close_each_get_one_postmortem_comment() {
         comments[1].starts_with("**Postmortem (final)**"),
         "{comments:?}"
     );
+    assert_eq!(world.record(KEY).closed_state, "Canceled");
     assert_eq!(world.record(KEY).postmortem_due, None);
     let kept = std::fs::read_dir(world.run(KEY).state_dir().join("postmortems"))
         .unwrap()

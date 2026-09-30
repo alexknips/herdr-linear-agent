@@ -468,8 +468,10 @@ impl Reconciler {
         }
         // Linear shows the session working until a response ends it.
         let body = format!("The issue is {state}; this run is closed.");
+        let closed_state = state.to_string();
         self.update_and_push(run, move |r| {
             r.status = Status::Closed;
+            r.closed_state = closed_state;
             r.coordinator.status = AgentStatus::Stopped;
             r.postmortem_due = Some(crate::postmortem::Stage::Final);
             if r.session_id.is_empty() {
