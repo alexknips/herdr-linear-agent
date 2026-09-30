@@ -177,3 +177,16 @@ THLA-17 was picked up 20.5 s after it was created, where the earlier checks took
 The first workspace's webhook delivery was disabled about 20 minutes before THLA-17, whose run opened its session and sent every activity with nothing left in its outbox.
 
 The second workspace's app then had its webhook delivery disabled too (the webhook and its "Agent session events" category kept) before `action login --workspace second` revoked its credential and authorized it again. THLA-2 of that workspace, delegated at 15:09:02, was picked up 4 s later with its Agent Session opened, moved to In Progress and had every activity sent; a coordinator was chosen and started. During the new login the running ticker logged `second: intake: Linear OAuth access is not ready` once and went on with the new token without a restart. So Agent Sessions need the webhook's category, not its delivery.
+
+## Closing response and manual reload (2026-09-30)
+
+With a build of `f4ea69d`, THLA-18 was canceled right after it was picked up: the run closed 3 s later, the closing response went out at once (the run's last activity moved to the close, with nothing left in its outbox), where THLA-17 and the second workspace's THLA-2, canceled before `finish` on earlier builds, had kept their sessions showing "Working".
+
+With a build of `13c7fb2` in the default Herdr session:
+
+| Step | Result |
+| --- | --- |
+| Change notice | a comment line added to the `worker` profile's `config.toml` was noticed within 1 s (`config changed; run the reload action to apply it`), and nothing was reloaded |
+| Reload action | `action reload` answered `Reloaded the config: the ticker's tasks start again with it.` and the ticker logged `config reloaded; restarting the ticker's tasks` |
+| Back again | removing the line gave a new notice 1 s later and a second reload applied it |
+| After the reloads | `doctor` read both workspaces' credentials and budgets |
