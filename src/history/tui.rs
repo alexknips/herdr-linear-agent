@@ -7,11 +7,10 @@ use anyhow::Result;
 use ratatui::Frame;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Layout};
-use ratatui::style::{Style, Stylize};
-use ratatui::text::Line;
-use ratatui::widgets::{Block, List, ListState, Paragraph, Wrap};
+use ratatui::text::{Line, Text};
+use ratatui::widgets::{List, ListState, Paragraph, Wrap};
 
-use super::{Entry, entries, filter, minute};
+use super::{Entry, entries, filter, minute, status, theme};
 use crate::herdr::{Client, Herdr};
 use crate::paths::Env;
 use crate::run::AgentStatus;
@@ -30,18 +29,21 @@ struct Row {
 }
 
 impl Row {
-    fn line(&self) -> String {
-        match &self.found {
-            Ok(s) => format!(
-                "{}  {}  {}  {}  {}",
-                self.agent,
-                self.kind,
-                minute(s.at),
-                s.id.chars().take(8).collect::<String>(),
-                if s.kept { "copy" } else { "original" }
-            ),
-            Err(_) => format!("{}  {}  no transcript", self.agent, self.kind),
-        }
+    fn styled(&self) -> Line<'static> {
+        let found = self.found.as_ref().ok();
+        let at = found.map(|s| minute(s.at));
+        let id: Option<String> = found.map(|s| s.id.chars().take(8).collect());
+        theme::agent_line(
+            &self.agent,
+            &self.kind,
+            found.map(|s| {
+                (
+                    at.as_deref().unwrap_or(""),
+                    id.as_deref().unwrap_or(""),
+                    s.kept,
+                )
+            }),
+        )
     }
 
     /// The agent's session to resume in a new workspace: not while it is
@@ -281,6 +283,16 @@ impl App {
         self.text.as_ref().map_or("", |(_, text)| text.as_str())
     }
 
+    fn run_line(entry: &Entry) -> Line<'static> {
+        theme::run_line(
+            &entry.run.key,
+            &entry.record.title,
+            status(entry.record.status),
+            &minute(entry.updated),
+            &entry.prs(),
+        )
+    }
+
     fn draw(&mut self, frame: &mut Frame) {
         let [top, body, help] = Layout::vertical([
             Constraint::Length(1),
@@ -291,52 +303,69 @@ impl App {
         let [left, right] =
             Layout::horizontal([Constraint::Percentage(40), Constraint::Percentage(60)])
                 .areas(body);
-        let (title, items, selected, keys) = match &self.screen {
+        let (title, items, selected, keys, panes) = match &self.screen {
             Screen::List => (
-                format!("> {}", self.query),
+                theme::prompt(&self.query),
                 self.shown
                     .iter()
-                    .map(|&i| self.entries[i].line())
+                    .map(|&i| Self::run_line(&self.entries[i]))
                     .collect::<Vec<_>>(),
                 self.selected,
-                "type to filter  ↑↓ move  Enter transcripts  PgUp/PgDn scroll  Esc quit"
-                    .to_string(),
+                vec![
+                    ("type", "filter"),
+                    ("↑↓", "move"),
+                    ("Enter", "transcripts"),
+                    ("PgUp/PgDn", "scroll"),
+                    ("Esc", "quit"),
+                ],
+                (
+                    format!("Runs {}/{}", self.shown.len(), self.entries.len()),
+                    "Preview",
+                ),
             ),
             Screen::Agents { rows, selected } => {
-                let resumable = rows.get(*selected).and_then(Row::resume).is_some();
+                let mut keys = vec![("↑↓", "move"), ("PgUp/PgDn", "scroll")];
+                if rows.get(*selected).and_then(Row::resume).is_some() {
+                    keys.push(("r", "resume"));
+                }
+                keys.extend([("Esc", "back"), ("q", "quit")]);
                 (
-                    self.entry().map(|e| e.line()).unwrap_or_default(),
-                    rows.iter().map(Row::line).collect(),
+                    self.entry().map(Self::run_line).unwrap_or_default(),
+                    rows.iter().map(Row::styled).collect(),
                     *selected,
-                    format!(
-                        "↑↓ move  PgUp/PgDn scroll{}  Esc back  q quit",
-                        if resumable { "  r resume" } else { "" }
-                    ),
+                    keys,
+                    ("Transcripts".to_string(), "Transcript"),
                 )
             }
         };
         let count = items.len();
-        frame.render_widget(Line::from(title).bold(), top);
+        frame.render_widget(title, top);
         let list = List::new(items)
-            .block(Block::bordered())
-            .highlight_style(Style::new().reversed());
+            .block(theme::block(&panes.0, true))
+            .highlight_style(theme::selected());
         let mut state = ListState::default().with_selected((count > 0).then_some(selected));
         frame.render_stateful_widget(list, left, &mut state);
         let scroll = self.scroll;
+        let read = match &self.screen {
+            Screen::List => None,
+            Screen::Agents { rows, selected } => {
+                Some(rows.get(*selected).is_some_and(|r| r.found.is_ok()))
+            }
+        };
         let text = self.text().to_string();
+        let text: Text = match read {
+            None => theme::preview(&text),
+            Some(true) => theme::transcript(&text),
+            Some(false) => theme::note(&text),
+        };
         frame.render_widget(
             Paragraph::new(text)
-                .block(Block::bordered())
+                .block(theme::block(panes.1, false))
                 .wrap(Wrap { trim: false })
                 .scroll((scroll, 0)),
             right,
         );
-        let footer = if self.status.is_empty() {
-            keys
-        } else {
-            format!("{}  |  {keys}", self.status)
-        };
-        frame.render_widget(Line::from(footer).dim(), help);
+        frame.render_widget(theme::footer(&keys, &self.status), help);
     }
 }
 
@@ -405,6 +434,20 @@ mod tests {
         for c in text.chars() {
             press(app, KeyCode::Char(c));
         }
+    }
+
+    /// Every color on the screen is one the theme's palette draws: a named
+    /// ANSI color or the default.
+    fn only_palette_colors(app: &mut App) -> bool {
+        use ratatui::style::Color;
+        let mut terminal = Terminal::new(TestBackend::new(120, 20)).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let buffer = terminal.backend().buffer();
+        buffer.content().iter().all(|cell| {
+            [cell.fg, cell.bg]
+                .iter()
+                .all(|c| !matches!(c, Color::Rgb(..) | Color::Indexed(_)))
+        })
     }
 
     fn screen(app: &mut App) -> String {
@@ -508,7 +551,8 @@ mod tests {
             [("s-1".to_string(), true), ("s-2".to_string(), false)],
             "the copy, then the recorded session's own file; s-3 is not the agent's"
         );
-        assert!(rows[0].line().ends_with("s-1  copy"), "{}", rows[0].line());
+        let first = rows[0].styled().to_string();
+        assert!(first.ends_with("s-1  copy"), "{first}");
         let mut app = App::new(entries, roots);
         press(&mut app, KeyCode::Enter);
         let first = screen(&mut app);
@@ -518,6 +562,12 @@ mod tests {
         let second = screen(&mut app);
         assert!(second.contains("The agent's own file"), "{second}");
         assert!(second.contains("original s-2"), "{second}");
+        assert!(
+            only_palette_colors(&mut app),
+            "the transcripts follow the theme"
+        );
+        press(&mut app, KeyCode::Esc);
+        assert!(only_palette_colors(&mut app), "the list follows the theme");
     }
 
     #[test]

@@ -1106,6 +1106,8 @@ The transcripts (Enter):
 
 Resume (`r` on a transcript line): offered when `resume_args(kind, session id)` gives arguments (`claude`, `codex`, `opencode`, `copilot`, `cursor`), the agent's status is not `open`, and its folder exists. It creates a workspace in the folder labeled `<KEY> (resumed)`, starts the kind there as `<agent name>-resumed` with those arguments, and focuses it; the footer says `Resumed in the workspace <label>` or `Could not resume: <error>`. `src/history/tui.rs:a_stopped_claude_session_in_a_folder_still_there_can_be_resumed`
 
+Colors: only the 16 ANSI colors and the terminal's default colors, never RGB, so Herdr's theme palette draws them. Run keys, agent names, keys to press and the focused border are cyan; a run's state is green (active), yellow (detached) or gray (closed); times, borders and explanations are gray; PR links blue; the preview's title cyan and its headings magenta. In a transcript the source line is gray, the person's messages green, the agent's blue, tool calls yellow, results gray and errors red; a line without a transcript says why in yellow. The selected line is reversed and bold. `src/history/theme.rs:a_transcript_colors_each_side`, `src/history/theme.rs:the_preview_marks_its_title_headings_and_links`, `src/history/tui.rs:the_run_folders_copy_comes_first_and_the_recorded_session_is_the_one_shown`
+
 Keys: printable characters and Backspace edit the query; ↑↓ or Ctrl-p/Ctrl-n move; PgUp/PgDn or Ctrl-u/Ctrl-d scroll the right side by 10 lines; Enter opens the transcripts; there ↑↓ or `k`/`j` move, `r` resumes, and Esc, ← or Backspace go back; Esc on the list, `q` on the transcripts and Ctrl-c quit.
 
 ## Command line

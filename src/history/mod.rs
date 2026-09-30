@@ -1,6 +1,7 @@
 //! `history`: past runs, newest first, filtered as you type, with a preview
 //! of each run's files and its agents' transcripts.
 
+mod theme;
 mod tui;
 
 use std::path::{Path, PathBuf};
@@ -41,7 +42,7 @@ pub fn minute(at: Option<Timestamp>) -> String {
     )
 }
 
-fn status(status: Status) -> &'static str {
+pub(super) fn status(status: Status) -> &'static str {
     match status {
         Status::Active => "active",
         Status::Detached => "detached",

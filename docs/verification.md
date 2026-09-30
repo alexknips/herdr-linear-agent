@@ -285,3 +285,7 @@ With a build of the branch in the default Herdr session, THLA-21 (a coordinator 
 | History | the browser listed `coordinator  claude  … fc0cd56e  copy` and `w1  claude  … 62e463e4  copy`, one line each, and showed `The run folder's copy, <path>` above each transcript |
 
 No Codex or OpenCode profile was set up for a run; their session lookup and the OpenCode export were checked with the CLIs above and with fixtures in the tests.
+
+## History colors (2026-09-30)
+
+With a build of the branch, the browser opened on THLA-21's transcripts drew only these SGR codes, as `herdr pane read --format ansi` reports them: reset, bold, reversed, and the foreground palette entries 2 to 8 (`38;5;2` … `38;5;8`). No RGB (`38;2;…`) and no entry above 15, so the colors come from the Herdr theme's 16-color palette.

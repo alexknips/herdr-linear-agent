@@ -367,6 +367,8 @@ A run's panes close when it ends. To look back at how a run went, run **herdr-li
 
 Keys: ↑↓ (or Ctrl-p/Ctrl-n) move, PgUp/PgDn (or Ctrl-u/Ctrl-d) scroll the right side, Esc goes back, and Esc on the list, `q` on the transcripts or Ctrl-c quits.
 
+The screens use only the terminal's 16 ANSI colors, so they follow the Herdr theme, dark or light, and change with it. In a transcript the person's messages are green, the agent's blue, tool calls yellow, results gray and errors red.
+
 **Sessions and kept transcripts.** No Herdr agent integration is needed. The plugin records each agent's session itself: it starts Claude Code with a session id it picks (`--session-id`), and finds the session Codex, OpenCode or Cursor began after the start in the agent's folder. So a coordinator whose pane was closed, or a closed run delegated again, resumes its previous session. When a run closes or is detached, and before `worker restart`, the plugin copies each agent's transcript into the run folder (`.state/transcripts/<agent>/<session>.jsonl`, OpenCode's export as `.json`): the agent CLIs may delete their own files later, and the copy stays. It reads Claude Code's `~/.claude/projects` (or `$CLAUDE_CONFIG_DIR/projects`), Codex's `~/.codex/sessions` (or `$CODEX_HOME/sessions`), Cursor's `~/.cursor/projects`, and `opencode session list` and `opencode session export`, and writes to none of them.
 
 ## Files
