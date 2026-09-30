@@ -36,10 +36,11 @@ Conventions:
 23. [Coordinator commands and the digest](#coordinator-commands-and-the-digest)
 24. [Progress reports](#progress-reports)
 25. [Actions and doctor](#actions-and-doctor)
-26. [Command line](#command-line)
-27. [Install script and build version](#install-script-and-build-version)
-28. [Porting the scenario tests](#porting-the-scenario-tests)
-29. [Decisions for the questions the inputs left open](#decisions-for-the-questions-the-inputs-left-open)
+26. [Past runs](#past-runs)
+27. [Command line](#command-line)
+28. [Install script and build version](#install-script-and-build-version)
+29. [Porting the scenario tests](#porting-the-scenario-tests)
+30. [Decisions for the questions the inputs left open](#decisions-for-the-questions-the-inputs-left-open)
 
 ## Architecture of the rewrite
 
@@ -1035,6 +1036,7 @@ Each action prints its result and shows it as a notification titled `herdr-linea
 | `pause` | writes `<state_dir>/paused` | `Paused: new issues are not picked up. Running runs continue.` |
 | `resume` | removes it, `ticker start` | `Resumed: delegated issues are picked up again.` |
 | `doctor` | checks | see below |
+| `browse` | sends `plugin.pane.open` with `plugin_id` `herdr-linear-agent`, `entrypoint` `history` and `focus`, over the invoking session's socket or the configured session's; the manifest's `history` pane runs `herdr-linear-agent history` with Herdr's default placement, an overlay over the focused pane. It shows no notification unless it fails | none: the pane |
 | `reload` | loads the config (its error is the action's); with no ticker holding the lock, `ticker start`; else writes `<state_dir>/ticker.reload` and waits up to 10 s for the ticker to take it. `src/actions.rs:reload_checks_the_config_then_asks_the_running_ticker` | `The ticker was not running; it started with the config.`, `Reloaded the config: the ticker's tasks start again with it.`, or `Asked the ticker to reload the config; it has not taken the request yet.` |
 
 Errors: `this action needs a pane of a run`, `this pane does not belong to a run`, `could not open <url>: <error>`, `Ctrl-click a Linear issue link to focus its run`, `<url> is not a Linear issue URL`, `there is no run for <ISSUE>`, `<KEY> has no coordinator workspace yet`.
@@ -1050,7 +1052,36 @@ Errors: `this action needs a pane of a run`, `this pane does not belong to a run
   - per workspace, with a stored credential, one viewer read: ``Linear `<name>`: budget <requests remaining>/<limit> requests, <points remaining>/<limit> points, resets <latest reset, whole seconds>`` OK, or ``Linear `<name>`: budget unknown`` when the read failed, a header was missing, or no credential is stored;
   - `<n> active run(s)` OK.
   - Text: `All checks passed.` or `<n> problem(s):\n- <problem>\n- ...`, then `\nOK:\n- <ok>\n- ...`.
-- The manifest names only existing actions; `command[2]` equals the action id; every link handler has a non-empty title (Herdr 0.9.1 refuses one without). `src/cli.rs:the_manifest_names_only_existing_actions`
+- The manifest names only existing actions and pane commands; `command[2]` equals the action id; the `history` pane exists; every link handler has a non-empty title (Herdr 0.9.1 refuses one without). `src/cli.rs:the_manifest_names_only_existing_actions`
+
+## Past runs
+
+`herdr-linear-agent history` is a terminal browser of the runs under `runs/<workspace>/<KEY>`, built into the binary (`ratatui` on `crossterm`, `nucleo-matcher` for the fuzzy match). It reads and never writes: the run folders, and the agents' own transcripts.
+
+The list:
+
+- One line per run, `<KEY>  <title>  <active|detached|closed>  <updated>  <PR URLs...>`, where updated is the latest of the run's `created`, `last_activity` and coordinator `last_state_change`, and each worker's `updated` and `last_state_change`, shown as `YYYY-MM-DD HH:MM` in UTC. The most recently updated run comes first, with ties ordered by key. `src/history/mod.rs:runs_are_listed_newest_first_and_filtered_as_typed`
+- The query matches that line with `nucleo-matcher` (smart case, smart normalization, words in any order); the best match comes first, and a blank query keeps the order.
+- The preview: the key and title, state and update time, the issue URL, each PR, then `issue.md`, `conversation.md` under `# Conversation` when it has text, and each worker's `workers/<id>.md` under `# Worker <id>: <title>` (`(no report)` without one). `src/history/mod.rs:the_preview_shows_the_issue_the_conversation_the_reports_and_the_prs`
+
+The transcripts (Enter):
+
+- One line per transcript file of the coordinator, then of each worker, oldest first: `<agent>  <kind>  <file modified>  <first 8 characters of the session id>`, or `<agent>  <kind>  no transcript`. The agent's folder is its recorded `cwd`, else the run folder (coordinator) or the worktree path (worker). Herdr reports no agent session id unless its agent integration is installed, and none was recorded in practice, so the folder is the link.
+
+| Kind | Where | Session id |
+| --- | --- | --- |
+| `claude` | `<CLAUDE_CONFIG_DIR or ~/.claude>/projects/<cwd with each non-alphanumeric byte as ->/*.jsonl` | the file name |
+| `codex` | `<CODEX_HOME or ~/.codex>/sessions/**/*.jsonl` whose first line is `session_meta` with `payload.cwd` equal to the folder | `payload.id` |
+| `cursor` | `~/.cursor/projects/<cwd's alphanumeric runs joined by ->/agent-transcripts/<id>/*.jsonl` | the file name |
+| `opencode` | not read: its sessions are in a SQLite database (`~/.local/share/opencode/opencode.db`) | |
+| others | not read | |
+
+- A transcript shows, in order: `── user` or `── assistant` and the text; `→ <tool> <input on one line, at most 200 characters>` for each call; `← result:` or `← error:` with its first 5 lines (each at most 200 characters) and `… <n> more lines`, or `(empty)`. Tabs become four spaces. Claude records of other types, `isMeta` user records and thinking are left out; Codex `developer` messages, reasoning and other items are left out; Cursor records have no results. `src/history/transcript.rs:a_claude_transcript_is_found_by_its_folder_and_shown_as_steps`, `src/history/transcript.rs:a_codex_transcript_is_found_by_the_folder_in_its_first_line`, `src/history/transcript.rs:a_cursor_transcript_has_no_results_and_opencode_is_not_read`
+- No file left: `No transcript is left in <folder searched>.` A kind that is not read: `Cannot read this transcript: <why>.` Both are followed by `The run folder's records:` and the run's preview. `src/history/tui.rs:typing_filters_enter_lists_the_agents_and_a_missing_transcript_is_said`
+
+Resume (`r` on a transcript line): offered when `resume_args(kind, session id)` gives arguments (`claude`, `codex`, `opencode`, `copilot`; only the first two have readable transcripts), the agent's status is not `open`, and its folder exists. It creates a workspace in the folder labeled `<KEY> (resumed)`, starts the kind there as `<agent name>-resumed` with those arguments, and focuses it; the footer says `Resumed in the workspace <label>` or `Could not resume: <error>`. `src/history/tui.rs:a_stopped_claude_session_in_a_folder_still_there_can_be_resumed`
+
+Keys: printable characters and Backspace edit the query; ↑↓ or Ctrl-p/Ctrl-n move; PgUp/PgDn or Ctrl-u/Ctrl-d scroll the right side by 10 lines; Enter opens the transcripts; there ↑↓ or `k`/`j` move, `r` resumes, and Esc, ← or Backspace go back; Esc on the list, `q` on the transcripts and Ctrl-c quit.
 
 ## Command line
 
@@ -1058,8 +1089,9 @@ Errors: `this action needs a pane of a run`, `this pane does not belong to a run
 
 ```text
 startup
-action <login|status|open-issue|focus-run|pause|resume|doctor>
+action <login|status|open-issue|focus-run|pause|resume|doctor|reload|browse>
 ticker <start|stop|status|run>
+history
 skill [KEY]
 context KEY
 inbox done KEY [IDS...] [--all]

@@ -231,6 +231,15 @@ impl Subscription {
     }
 }
 
+/// The socket of the session a Herdr action or pane runs in
+/// (`HERDR_SOCKET_PATH`), else of `session`.
+pub async fn invoking_socket(env: &crate::paths::Env, session: Option<&str>) -> Result<PathBuf> {
+    match env.var("HERDR_SOCKET_PATH").filter(|s| !s.is_empty()) {
+        Some(socket) => Ok(socket.into()),
+        None => session_socket(&env.herdr_bin(), session).await,
+    }
+}
+
 /// Asks `herdr session list --json` for a session's socket path.
 pub async fn session_socket(herdr_bin: &str, session: Option<&str>) -> Result<PathBuf> {
     let output = tokio::time::timeout(

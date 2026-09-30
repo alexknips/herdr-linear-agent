@@ -9,7 +9,7 @@ mod memory;
 mod requests;
 mod wake;
 
-pub use client::{Client, Snapshot, Subscription, session_socket};
+pub use client::{Client, Snapshot, Subscription, invoking_socket, session_socket};
 #[cfg(test)]
 pub use memory::FakeHerdr;
 pub use requests::{Herdr, Placed};

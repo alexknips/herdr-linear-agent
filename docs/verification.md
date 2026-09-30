@@ -232,3 +232,28 @@ With a build of #73:
 The config was put back afterwards, and THLA-19 and THLA-20 were canceled.
 
 The Herdr notification, shown with `notification_show`, was not checked by eye; Herdr's CLI lists no past notifications.
+
+## Past runs (2026-09-30)
+
+Before the change, read-only:
+
+| Question | Finding |
+| --- | --- |
+| Can an action open a pane that runs the binary's TUI? | Yes. Herdr 0.9.1's plugin manifest declares `[[panes]]` entrypoints, and the `plugin.pane.open` request (`plugin_id`, `entrypoint`, optional `placement` `overlay`, `popup`, `split`, `tab` or `zoomed`) opens one; the default placement is an overlay over the focused pane |
+| Is `agent_session` recorded? | No: it is empty in every coordinator and worker record, since Herdr reports a session id only with its agent integrations, which are not installed. The agent's folder (`cwd`) is recorded |
+| `claude` | `~/.claude/projects/<cwd with each non-alphanumeric byte as ->/<session id>.jsonl`. THLA-19's run folder had two, one per start of its coordinator, and THLA-17's worker worktree one. THLA-15, THLA-16 and the second workspace's THLA-1 and THLA-2 have a folder with only `memory/` left, so their transcripts are gone |
+| `codex` | `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`, the folder in the first line (`session_meta.payload.cwd`), then `response_item` records: `message` (user, assistant, developer), `function_call`/`custom_tool_call` and their `*_output`, `reasoning`. No run of the scratch team used Codex, so only its record shapes were checked |
+| `cursor` | `~/.cursor/projects/<cwd's alphanumeric runs joined by ->/agent-transcripts/<id>/<id>.jsonl`, found for the old THLA-13 coordinator: user and assistant text and `tool_use`, without results |
+| `opencode` | a SQLite database, `~/.local/share/opencode/opencode.db` (`session_v2.directory` holds the folder); not read, to keep a SQLite library out |
+
+With a build of the branch in the default Herdr session:
+
+| Step | Result |
+| --- | --- |
+| Action | `herdr plugin action invoke herdr-linear-agent.browse` opened the `herdr-linear-agent: past runs` pane over the focused pane; the action exited 0 without a notification |
+| List | the eight runs of both workspaces, newest first (second/THLA-3 at 08:25, then civitaspo/THLA-19 at 05:04, …), with the PR of each run that has one, and the preview of the selected run |
+| Filter | typing `THLA-19` left THLA-19 first, with THLA-18 after it, and the preview followed the selection once the text cache was keyed by run (a first build kept the previous run's preview) |
+| Coordinator transcript | Enter on THLA-19 listed its two coordinator sessions (`393e265d`, `6843b742`); the first showed the launch prompt, each `Bash` call of the plugin's `skill`, `context` and `say` commands with the first lines of their output, and the coordinator's text |
+| Worker transcript | THLA-17's `w1` showed the worker reading its brief; `r resume` was offered, since the worker is stopped and its worktree is there (not pressed: it would start the agent) |
+| Gone | THLA-16 showed `coordinator  claude  no transcript` and `w1  claude  no transcript`, with `No transcript is left in …` and the run folder's records |
+| Quit | `q` closed the pane |

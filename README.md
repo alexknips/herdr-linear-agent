@@ -355,6 +355,19 @@ When a pane needs a person (a permission or trust dialog), the ticker says so in
 | herdr-linear-agent: take new issues again | Resumes intake |
 | herdr-linear-agent: check setup | Checks Herdr, the config, the agent CLIs, each workspace's login and the ticker |
 | herdr-linear-agent: reload the config | Checks the config and makes the running ticker start its tasks again with it (starts the ticker when none runs) |
+| herdr-linear-agent: browse past runs | Opens the past-runs browser over the focused pane (see [Past runs](#past-runs)) |
+
+### Past runs
+
+A run's panes close when it ends. To look back at how a run went, run **herdr-linear-agent: browse past runs**, or `herdr-linear-agent history` in any terminal:
+
+- **The list.** It shows every run of every workspace, the most recently updated first, with its key, the issue title, its state, when it was last updated, and its pull requests. Type to filter it, fuzzy, as in fzf. The right side previews the selected run: `issue.md`, `conversation.md`, each worker's report and the pull requests.
+- **Transcripts.** Enter lists the run's coordinator and workers, one line per transcript each left, and shows the selected one: what the agent and the person said, each tool call, and the first lines of each result. It is read-only. Claude Code, Codex and Cursor transcripts are read. For OpenCode, whose sessions are in a SQLite database, and for a transcript that is gone, the run folder's records are shown instead, with the reason.
+- **Resume.** `r` opens a Herdr workspace in the agent's folder and resumes the selected Claude Code or Codex session there. It is offered only while the agent is not running and its folder is still there.
+
+Keys: ↑↓ (or Ctrl-p/Ctrl-n) move, PgUp/PgDn (or Ctrl-u/Ctrl-d) scroll the right side, Esc goes back, and Esc on the list, `q` on the transcripts or Ctrl-c quits.
+
+The transcripts are found by the folder each agent ran in, the run folder or the worker's worktree, since Herdr reports no session id without its agent integrations. The plugin reads Claude Code's `~/.claude/projects` (or `$CLAUDE_CONFIG_DIR/projects`), Codex's `~/.codex/sessions` (or `$CODEX_HOME/sessions`) and Cursor's `~/.cursor/projects`, and writes to none of them.
 
 ## Files
 

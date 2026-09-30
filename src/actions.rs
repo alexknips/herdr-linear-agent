@@ -33,11 +33,7 @@ async fn tell(ctx: &Ctx<'_>, body: &str) {
         .ok()
         .and_then(|c| c.herdr.session);
     let shown = async {
-        // The session the action was invoked from, when there is one.
-        let socket = match ctx.env.var("HERDR_SOCKET_PATH").filter(|s| !s.is_empty()) {
-            Some(socket) => socket.into(),
-            None => herdr::session_socket(&ctx.env.herdr_bin(), session.as_deref()).await?,
-        };
+        let socket = herdr::invoking_socket(ctx.env, session.as_deref()).await?;
         Client::new(socket).notification_show(TITLE, body).await?;
         anyhow::Ok(())
     };
@@ -55,6 +51,7 @@ pub enum Action {
     Resume,
     Doctor,
     Reload,
+    Browse,
 }
 
 /// `workspace` names the one workspace `login` logs in to again; the other
@@ -72,6 +69,11 @@ pub async fn run(ctx: &Ctx<'_>, action: Action, workspace: Option<&str>) -> Resu
         Action::Resume => pause(ctx, false).await,
         Action::Doctor => doctor(ctx).await,
         Action::Reload => reload(ctx).await,
+        // The pane is the answer; only a failure is told.
+        Action::Browse => match browse(ctx).await {
+            Ok(()) => return Ok(()),
+            Err(error) => Err(error),
+        },
     };
     match result {
         Ok(message) => {
@@ -83,6 +85,17 @@ pub async fn run(ctx: &Ctx<'_>, action: Action, workspace: Option<&str>) -> Resu
             Err(error)
         }
     }
+}
+
+/// Opens the plugin's `history` pane over the focused one.
+async fn browse(ctx: &Ctx<'_>) -> Result<()> {
+    let session = Config::load(&ctx.config_dir())?.herdr.session;
+    let socket = herdr::invoking_socket(ctx.env, session.as_deref()).await?;
+    let params = serde_json::json!({ "plugin_id": TITLE, "entrypoint": "history", "focus": true });
+    Client::new(socket)
+        .call::<serde_json::Value>("plugin.pane.open", params)
+        .await?;
+    Ok(())
 }
 
 /// The workspace's stored credential, read without the network.

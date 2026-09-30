@@ -39,6 +39,8 @@ enum Command {
         #[command(subcommand)]
         command: TickerCommand,
     },
+    /// Browse past runs, their files and their agents' transcripts.
+    History,
     /// Print the coordinator sheet.
     Skill {
         /// The issue key to fill into the commands.
@@ -195,6 +197,13 @@ pub async fn run() -> Result<()> {
             command: DebugCommand::HerdrWatch { socket },
         } => herdr_watch(socket).await,
         Command::Startup => ticker::start(&ctx).await,
+        Command::History => {
+            let (env, runs) = (env.clone(), ctx.runs_dir());
+            let session = Config::load(&ctx.config_dir())
+                .ok()
+                .and_then(|c| c.herdr.session);
+            tokio::task::spawn_blocking(move || crate::history::run(&env, &runs, session)).await?
+        }
         Command::Action { action, workspace } => {
             actions::run(&ctx, action, workspace.as_deref()).await
         }
@@ -330,6 +339,22 @@ mod tests {
             assert!(Cli::try_parse_from(&argv).is_ok(), "{argv:?}");
             assert_eq!(command[2], action["id"].as_str().unwrap());
         }
+        let panes = manifest["panes"].as_array().unwrap();
+        for pane in panes {
+            let command: Vec<&str> = pane["command"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap())
+                .collect();
+            let mut argv = vec!["hla"];
+            argv.extend(&command[1..]);
+            assert!(Cli::try_parse_from(&argv).is_ok(), "{argv:?}");
+        }
+        assert!(
+            panes.iter().any(|p| p["id"].as_str() == Some("history")),
+            "the browse action opens the history pane"
+        );
         // Herdr refuses a manifest whose link handler has no title (0.9.1).
         for handler in manifest["link_handlers"].as_array().unwrap() {
             assert!(

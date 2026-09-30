@@ -7,6 +7,7 @@ mod config;
 mod coordinator;
 mod files;
 mod herdr;
+mod history;
 mod inbox;
 mod linear;
 mod names;

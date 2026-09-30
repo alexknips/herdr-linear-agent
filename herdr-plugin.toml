@@ -60,6 +60,17 @@ title = "herdr-linear-agent: reload the config"
 contexts = ["global"]
 command = ["target/release/herdr-linear-agent", "action", "reload"]
 
+[[actions]]
+id = "browse"
+title = "herdr-linear-agent: browse past runs"
+contexts = ["global"]
+command = ["target/release/herdr-linear-agent", "action", "browse"]
+
+[[panes]]
+id = "history"
+title = "herdr-linear-agent: past runs"
+command = ["target/release/herdr-linear-agent", "history"]
+
 [[link_handlers]]
 id = "linear-issue"
 title = "herdr-linear-agent: focus the run of this issue"
