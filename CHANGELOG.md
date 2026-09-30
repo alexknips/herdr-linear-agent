@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-09-30
+
+
+### Bug Fixes
+
+- begin each postmortem with how the run stands (#81)
+- tell the final postmortem which state the issue closed in (#80)
+- color the history screens with the theme's palette (#78)
+
+
+### Features
+
+- post interim and final postmortems per team (#79)
+- record agent sessions and keep their transcripts in the run folder (#76)
+- browse past runs and their agent transcripts (#74)
+
+
+### Maintenance
+
+- update dependency jdx/mise to v2026.9.18 (#77)
+
 ## [0.4.0] - 2026-09-30
 
 
