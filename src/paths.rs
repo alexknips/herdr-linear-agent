@@ -94,11 +94,47 @@ impl Ctx<'_> {
         self.env.state_dir().join("runs")
     }
 
-    /// The state directory, created when missing.
+    /// The private state directory, created when missing.
     pub fn ensure_state_dir(&self) -> Result<PathBuf> {
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+
         let state = self.env.state_dir();
-        std::fs::create_dir_all(&state)
-            .map_err(|e| anyhow!("cannot create the state folder {}: {e}", state.display()))?;
+
+        if let Some(parent) = state.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                anyhow!(
+                    "cannot create the parent of the state folder {}: {e}",
+                    state.display()
+                )
+            })?;
+        }
+
+        match std::fs::DirBuilder::new().mode(0o700).create(&state) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return Err(anyhow!(
+                    "cannot create the state folder {}: {error}",
+                    state.display()
+                ));
+            }
+        }
+
+        let directory = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
+            .open(&state)
+            .map_err(|e| anyhow!("cannot open the state folder {}: {e}", state.display()))?;
+        if directory.metadata()?.uid() != unsafe { libc::geteuid() } {
+            bail!(
+                "the state folder {} is not owned by the current user",
+                state.display()
+            );
+        }
+        directory
+            .set_permissions(std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| anyhow!("cannot restrict the state folder {}: {e}", state.display()))?;
+
         Ok(state)
     }
 }
@@ -181,5 +217,79 @@ mod tests {
         assert!(!state.exists());
         assert_eq!(ctx.ensure_state_dir().unwrap(), state);
         assert!(state.is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_state_directory_is_restricted_to_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = tempfile::tempdir().unwrap();
+        let state = home.path().join("herdr-linear-agent");
+        std::fs::create_dir(&state).unwrap();
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let state_home = home.path().to_str().unwrap();
+        let env = Env::for_test(home.path(), &[("XDG_STATE_HOME", state_home)]);
+        let runner = FakeRunner::new();
+        let ctx = Ctx {
+            env: &env,
+            runner: &runner,
+            detached_ticker: false,
+        };
+
+        ctx.ensure_state_dir().unwrap();
+
+        let mode = std::fs::metadata(&state).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "mode is {mode:04o}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn new_state_directory_is_created_with_owner_only_access() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = tempfile::tempdir().unwrap();
+        let state = home.path().join("herdr-linear-agent");
+        let state_home = home.path().to_str().unwrap();
+        let env = Env::for_test(home.path(), &[("XDG_STATE_HOME", state_home)]);
+        let runner = FakeRunner::new();
+        let ctx = Ctx {
+            env: &env,
+            runner: &runner,
+            detached_ticker: false,
+        };
+
+        assert_eq!(ctx.ensure_state_dir().unwrap(), state);
+        let mode = std::fs::metadata(&state).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "mode is {mode:04o}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_state_directory_is_rejected_without_changing_its_target() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let home = tempfile::tempdir().unwrap();
+        let target = home.path().join("target");
+        let state = home.path().join("herdr-linear-agent");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        symlink(&target, &state).unwrap();
+
+        let state_home = home.path().to_str().unwrap();
+        let env = Env::for_test(home.path(), &[("XDG_STATE_HOME", state_home)]);
+        let runner = FakeRunner::new();
+        let ctx = Ctx {
+            env: &env,
+            runner: &runner,
+            detached_ticker: false,
+        };
+
+        assert!(ctx.ensure_state_dir().is_err());
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
     }
 }

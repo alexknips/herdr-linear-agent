@@ -4,7 +4,7 @@
 
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 
 use crate::actions::{self, Action};
@@ -192,6 +192,20 @@ pub async fn run() -> Result<()> {
         runner: &runner,
         detached_ticker: true,
     };
+
+    let state_dir = ctx.state_dir();
+    match std::fs::symlink_metadata(&state_dir) {
+        Ok(_) => {
+            ctx.ensure_state_dir()?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("cannot inspect the state folder {}", state_dir.display())
+            });
+        }
+    }
+
     match command {
         Command::Debug {
             command: DebugCommand::HerdrWatch { socket },

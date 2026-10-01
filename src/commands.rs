@@ -400,6 +400,25 @@ pub async fn worker_start<H: Herdr>(
             w.agent.agent_name = names::agent_name(key, &record.issue_id, &w.id);
         },
     )?;
+    let task_path = worker::task_path(&run, &worker.id);
+    if let Err(error) =
+        files::write_atomic(&task_path, format!("{}\n", args.task.trim()).as_bytes())
+    {
+        let worker_id = worker.id.clone();
+        let message = format!("could not persist the task: {error:#}");
+        if let Err(state_error) = worker::update(&run, &worker_id, |w| {
+            w.agent.status = AgentStatus::Stopped;
+            w.agent.error = message;
+            w.agent.prompt_pending = false;
+            w.restarting = false;
+        }) {
+            return Err(error).context(format!(
+                "could not record failed task persistence for worker {worker_id}: {state_error:#}"
+            ));
+        }
+        ticker::poke(&ctx.state_dir());
+        return Err(error).context(format!("could not persist the task for worker {worker_id}"));
+    }
     let base = format!("origin/{}", repo.base);
     let placed = match create_worktree(
         ctx.runner,
@@ -440,8 +459,8 @@ pub async fn worker_start<H: Herdr>(
     Ok(worker)
 }
 
-/// Writes the task and the brief into the new pane's worktree and records
-/// the placement. The agent's own fields are reset for a fresh launch.
+/// Writes the brief into the new pane's worktree and records the placement.
+/// The agent's own fields are reset for a fresh launch.
 #[allow(clippy::too_many_arguments)]
 async fn place(
     ctx: &Ctx<'_>,
@@ -461,31 +480,52 @@ async fn place(
     let _ = exclude_from_git(ctx.runner, &worktree).await;
     worker.worktree_path = worktree.clone();
     worker.brief_dir = worker::brief_dir(&worktree, &run.key, &worker.id);
-    if !restart {
+    let prepare = || -> Result<()> {
+        std::fs::create_dir_all(&worker.brief_dir)
+            .with_context(|| format!("could not create {}", worker.brief_dir))?;
+        let brief = worker::compose_brief(&worker::BriefInput {
+            issue_key: &record.identifier,
+            issue_title: &record.title,
+            issue_url: &record.url,
+            worker: &worker,
+            task,
+            restart,
+            binary: &coordinator::binary_command()?,
+            instructions,
+        });
         files::write_atomic(
-            &worker::task_path(run, &worker.id),
-            format!("{task}\n").as_bytes(),
+            &Path::new(&worker.brief_dir).join("brief.md"),
+            brief.as_bytes(),
         )?;
+        Ok(())
+    };
+    if let Err(error) = prepare() {
+        let worker_id = worker.id.clone();
+        let worktree_path = worker.worktree_path.clone();
+        let brief_dir = worker.brief_dir.clone();
+        let message = format!("{error:#}");
+        if let Err(state_error) = worker::update(run, &worker_id, |w| {
+            w.worktree_path = worktree_path;
+            w.brief_dir = brief_dir;
+            w.agent.placed(placed);
+            w.agent.status = AgentStatus::Failed;
+            w.agent.error = message;
+            w.agent.prompt_pending = false;
+            w.restarting = false;
+        }) {
+            return Err(error).context(format!(
+                "could not record failed placement for worker {worker_id}: {state_error:#}"
+            ));
+        }
+        ticker::poke(&ctx.state_dir());
+        return Err(error);
     }
-    std::fs::create_dir_all(&worker.brief_dir)
-        .with_context(|| format!("could not create {}", worker.brief_dir))?;
-    let brief = worker::compose_brief(&worker::BriefInput {
-        issue_key: &record.identifier,
-        issue_title: &record.title,
-        issue_url: &record.url,
-        worker: &worker,
-        task,
-        restart,
-        binary: &coordinator::binary_command()?,
-        instructions,
-    });
-    files::write_atomic(
-        &Path::new(&worker.brief_dir).join("brief.md"),
-        brief.as_bytes(),
-    )?;
     worker::update(run, &worker.id, |w| {
         w.worktree_path = worker.worktree_path.clone();
         w.brief_dir = worker.brief_dir.clone();
+        if restart {
+            w.restarts += 1;
+        }
         w.agent.placed(placed);
     })
 }
@@ -608,6 +648,13 @@ pub async fn worker_restart<H: Herdr>(
     if !w.counts() {
         check_agents(ctx, config.limits)?;
     }
+    let task_path = worker::task_path(&run, id);
+    let task = std::fs::read_to_string(&task_path).with_context(|| {
+        format!(
+            "could not read task for worker {id} at {}",
+            task_path.display()
+        )
+    })?;
     // The old session's transcript is kept before a new session begins.
     let (roots, kept_run, kept_id) = (
         crate::transcript::Roots::from_env(ctx.env),
@@ -648,7 +695,6 @@ pub async fn worker_restart<H: Herdr>(
         }
     };
     let reset = worker::update(&run, id, |w| {
-        w.restarts += 1;
         w.report_hash.clear();
         w.gone_reported = false;
         w.agent.profile = profile_name.clone();
@@ -661,7 +707,6 @@ pub async fn worker_restart<H: Herdr>(
         w.agent.resume = false;
         w.agent.agent_session.clear();
     })?;
-    let task = std::fs::read_to_string(worker::task_path(&run, id)).unwrap_or_default();
     let instructions = profile.instructions.as_slice();
     let worker = place(
         ctx,
@@ -689,6 +734,7 @@ mod tests {
     use crate::herdr::{FakeHerdr, PaneId};
     use crate::paths::Env;
     use crate::process::fake::{FakeRunner, fail, ok};
+    use std::path::PathBuf;
 
     fn pane(record: &crate::run::AgentRecord) -> PaneId {
         PaneId(record.pane_id.clone())
@@ -807,6 +853,29 @@ mod tests {
             };
             worker_start(&self.ctx(), &self.session, "acme/DATA-1", &args).await
         }
+    }
+
+    fn brief_dir(setup: &Setup, branch: &str, id: &str) -> PathBuf {
+        let worktree = setup
+            .home
+            .path()
+            .join("worktrees")
+            .join(branch.replace('/', "-"));
+        PathBuf::from(worker::brief_dir(
+            &worktree.to_string_lossy(),
+            "acme/DATA-1",
+            id,
+        ))
+    }
+
+    fn force_brief_dir_error(path: &std::path::Path) {
+        if path.is_dir() {
+            std::fs::remove_dir_all(path).unwrap();
+        } else if path.exists() {
+            std::fs::remove_file(path).unwrap();
+        }
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, "not a directory").unwrap();
     }
 
     #[tokio::test]
@@ -934,6 +1003,10 @@ mod tests {
             "{}",
             w.agent.error
         );
+        assert_eq!(
+            std::fs::read_to_string(worker::task_path(&setup.run(), "w1")).unwrap(),
+            "Make the change and open a PR.\n"
+        );
         // A restart places it again from its base.
         setup.session.herdr.set_down(false);
         let w = worker_restart(&setup.ctx(), &setup.session, "acme/DATA-1", "w1", None)
@@ -941,6 +1014,149 @@ mod tests {
             .unwrap();
         assert_eq!((w.agent.status, w.restarts), (AgentStatus::Open, 1));
         assert_eq!(setup.session.herdr.worktrees().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_worker_task_write_failure_does_not_place_a_worktree() {
+        let setup = Setup::new(|c| c);
+        std::fs::create_dir_all(worker::task_path(&setup.run(), "w1")).unwrap();
+
+        let error = setup.start("api", "standard").await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("could not persist the task for worker w1"),
+            "{error:#}"
+        );
+        let failed = worker::load(&setup.run(), "w1").unwrap();
+        assert_eq!(failed.agent.status, AgentStatus::Stopped);
+        assert!(failed.agent.error.contains("could not write"));
+        assert!(setup.session.herdr.requests().is_empty());
+        assert!(setup.session.herdr.worktrees().is_empty());
+
+        std::fs::remove_dir_all(worker::task_path(&setup.run(), "w1")).unwrap();
+        let retried = setup.start("api", "standard").await.unwrap();
+        assert_eq!(
+            (retried.id.as_str(), retried.agent.status),
+            ("w2", AgentStatus::Open)
+        );
+        assert_eq!(retried.repo, "api");
+        assert_eq!(setup.session.herdr.worktrees().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_worker_start_brief_failure_persists_placement_for_retry() {
+        let setup = Setup::new(|c| c);
+        let branch = "herdr-linear-agent/acme/data-1/w1-change-api";
+        let worktree = setup
+            .home
+            .path()
+            .join("worktrees")
+            .join(branch.replace('/', "-"));
+        let brief = brief_dir(&setup, branch, "w1");
+        force_brief_dir_error(&brief);
+
+        let error = setup.start("api", "standard").await.unwrap_err();
+        assert!(error.to_string().contains("could not create"), "{error:#}");
+        assert!(
+            setup
+                .session
+                .herdr
+                .requests()
+                .contains(&"worktree.create".into())
+        );
+
+        let failed = worker::load(&setup.run(), "w1").unwrap();
+        assert_eq!(failed.agent.status, AgentStatus::Failed);
+        assert!(!failed.restarting);
+        assert!(!failed.agent.prompt_pending);
+        assert_eq!(failed.agent.workspace_id, "w1");
+        assert_eq!(failed.agent.pane_id, "w1:p1");
+        assert_eq!(failed.worktree_path, worktree.to_string_lossy());
+        assert_eq!(failed.brief_dir, brief.to_string_lossy());
+        assert!(failed.agent.error.contains("could not create"));
+
+        std::fs::remove_file(&brief).unwrap();
+        let retried = worker_restart(&setup.ctx(), &setup.session, "acme/DATA-1", "w1", None)
+            .await
+            .unwrap();
+        assert_eq!(
+            (retried.agent.status, retried.restarts),
+            (AgentStatus::Open, 1)
+        );
+        assert_eq!(retried.agent.pane_id, "w2:p1");
+        assert_eq!(retried.worktree_path, worktree.to_string_lossy());
+    }
+
+    #[tokio::test]
+    async fn a_worker_restart_brief_failure_persists_placement_for_retry() {
+        let setup = Setup::new(|c| c);
+        let original = setup.start("api", "standard").await.unwrap();
+        worker::update(&setup.run(), "w1", |w| {
+            w.restarts = worker::MAX_RESTARTS - 1;
+        })
+        .unwrap();
+        let brief = PathBuf::from(&original.brief_dir);
+        force_brief_dir_error(&brief);
+
+        let error = worker_restart(&setup.ctx(), &setup.session, "acme/DATA-1", "w1", None)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("could not create"), "{error:#}");
+        assert!(
+            setup
+                .session
+                .herdr
+                .requests()
+                .contains(&"worktree.open".into())
+        );
+
+        let failed = worker::load(&setup.run(), "w1").unwrap();
+        assert_eq!(failed.agent.status, AgentStatus::Failed);
+        assert!(!failed.restarting);
+        assert!(!failed.agent.prompt_pending);
+        assert_eq!(failed.agent.workspace_id, "w2");
+        assert_eq!(failed.agent.pane_id, "w2:p1");
+        assert_eq!(failed.worktree_path, original.worktree_path);
+        assert_eq!(failed.brief_dir, original.brief_dir);
+        assert!(failed.agent.error.contains("could not create"));
+        assert_eq!(failed.restarts, worker::MAX_RESTARTS - 1);
+
+        std::fs::remove_file(&brief).unwrap();
+        let retried = worker_restart(&setup.ctx(), &setup.session, "acme/DATA-1", "w1", None)
+            .await
+            .unwrap();
+        assert_eq!(
+            (retried.agent.status, retried.restarts),
+            (AgentStatus::Open, 2)
+        );
+        assert_eq!(retried.agent.pane_id, "w3:p1");
+        assert_eq!(retried.worktree_path, original.worktree_path);
+        assert_eq!(
+            setup.session.herdr.closed(),
+            [WorkspaceId("w1".into()), WorkspaceId("w2".into())]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_restart_with_a_missing_task_does_not_reopen_the_worker() {
+        let setup = Setup::new(|c| c);
+        let original = setup.start("api", "standard").await.unwrap();
+        std::fs::remove_file(worker::task_path(&setup.run(), "w1")).unwrap();
+        let requests = setup.session.herdr.requests();
+
+        let result = worker_restart(&setup.ctx(), &setup.session, "acme/DATA-1", "w1", None).await;
+        assert!(
+            result.is_err(),
+            "a missing task must prevent reopen, got {result:?}"
+        );
+        let error = result.unwrap_err().to_string();
+        assert!(
+            error.contains("could not read task for worker w1"),
+            "{error}"
+        );
+        assert_eq!(setup.session.herdr.requests(), requests);
+        assert_eq!(worker::load(&setup.run(), "w1").unwrap(), original);
     }
 
     /// `git worktree list --porcelain` naming the fake's worktree of `branch`.
@@ -990,6 +1206,10 @@ mod tests {
         assert!(setup.start("api", "standard").await.is_err());
         let failed = worker::load(&setup.run(), "w1").unwrap();
         assert_eq!(failed.agent.status, AgentStatus::Failed);
+        assert_eq!(
+            std::fs::read_to_string(worker::task_path(&setup.run(), "w1")).unwrap(),
+            "Make the change and open a PR.\n"
+        );
         setup.runner.on(
             "worktree list --porcelain",
             ok(&listing(&setup, &failed.branch)),
