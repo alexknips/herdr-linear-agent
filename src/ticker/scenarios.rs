@@ -256,7 +256,10 @@ async fn the_session_linear_opened_on_delegation_is_the_runs_session() {
     assert_eq!(world.record(KEY).session_id, fake.session("DATA-1").id);
     assert_eq!(fake.sessions.len(), 1, "no second session");
     assert_eq!(
-        (fake.count("HlaSessions"), fake.count("HlaSessionCreate")),
+        (
+            fake.count("HerdrLinearAgentSessions"),
+            fake.count("HerdrLinearAgentSessionCreate")
+        ),
         (0, 0)
     );
     drop(fake);

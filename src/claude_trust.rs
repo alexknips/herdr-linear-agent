@@ -65,7 +65,10 @@ fn write_preserving_mode(path: &Path, contents: &[u8]) -> Result<()> {
     let mode = std::fs::metadata(path)
         .map(|m| m.permissions().mode() & 0o777)
         .unwrap_or(0o600);
-    let tmp = path.with_file_name(format!(".claude.json.hla.{}.tmp", std::process::id()));
+    let tmp = path.with_file_name(format!(
+        ".claude.json.herdr-linear-agent.{}.tmp",
+        std::process::id()
+    ));
     let result = (|| -> Result<()> {
         let mut file = std::fs::OpenOptions::new()
             .write(true)

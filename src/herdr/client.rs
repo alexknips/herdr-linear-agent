@@ -47,7 +47,7 @@ pub struct Subscription {
 }
 
 fn request_line(method: &str, params: Value) -> String {
-    let id = format!("hla-{}", uuid::Uuid::new_v4().simple());
+    let id = format!("herdr-linear-agent-{}", uuid::Uuid::new_v4().simple());
     let mut line = json!({"id": id, "method": method, "params": params}).to_string();
     line.push('\n');
     line

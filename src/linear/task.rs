@@ -844,8 +844,8 @@ mod tests {
                 requests: allowance(5_000, requests),
                 complexity: allowance(2_000_000, points),
                 cost: Some(match operation {
-                    "HlaDelegatedIssues" => 100,
-                    "HlaRuns" => per_run * fake::runs(variables) as u64,
+                    "HerdrLinearAgentDelegatedIssues" => 100,
+                    "HerdrLinearAgentRuns" => per_run * fake::runs(variables) as u64,
                     _ => 1,
                 }),
             }
@@ -919,18 +919,18 @@ mod tests {
         fn reads(&self) -> (usize, usize, usize) {
             let fake = self.fake();
             (
-                fake.count("HlaViewer"),
-                fake.count("HlaDelegatedIssues"),
-                fake.count("HlaRuns"),
+                fake.count("HerdrLinearAgentViewer"),
+                fake.count("HerdrLinearAgentDelegatedIssues"),
+                fake.count("HerdrLinearAgentRuns"),
             )
         }
 
-        /// The number of runs in each `HlaRuns` request, oldest first.
+        /// The number of runs in each `HerdrLinearAgentRuns` request, oldest first.
         fn batches(&self) -> Vec<usize> {
             self.fake()
                 .calls
                 .iter()
-                .filter(|(name, _, _)| name == "HlaRuns")
+                .filter(|(name, _, _)| name == "HerdrLinearAgentRuns")
                 .map(|(_, variables, _)| fake::runs(variables))
                 .collect()
         }
@@ -1001,7 +1001,7 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert_eq!(detail_of(&events[0]), Some(UPDATED));
         assert_eq!(detail_of(&events[1]), None);
-        assert_eq!(s.fake().count("HlaIssue"), 1);
+        assert_eq!(s.fake().count("HerdrLinearAgentIssue"), 1);
 
         s.fake().issue_mut("DATA-2")["updatedAt"] = "2026-09-27T00:00:00.000Z".into();
         let queries = [
@@ -1011,7 +1011,7 @@ mod tests {
         let events = step(&mut task, &s.linear, &queries, at(5)).await;
         assert_eq!(detail_of(&events[0]), None);
         assert_eq!(detail_of(&events[1]), Some("2026-09-27T00:00:00.000Z"));
-        assert_eq!(s.fake().count("HlaIssue"), 2);
+        assert_eq!(s.fake().count("HerdrLinearAgentIssue"), 2);
     }
 
     #[tokio::test]
@@ -1072,8 +1072,8 @@ mod tests {
         let events = step(&mut task, &s.linear, &queries, at(2)).await;
         assert!(outbox::pending(&s.runs[0]).is_empty());
         assert_eq!(s.fake().sessions[0].sent("thought").len(), 1);
-        assert_eq!(s.fake().count("HlaActivityCreate"), 1);
-        assert_eq!(s.fake().count("HlaActivityFind"), 1);
+        assert_eq!(s.fake().count("HerdrLinearAgentActivityCreate"), 1);
+        assert_eq!(s.fake().count("HerdrLinearAgentActivityFind"), 1);
         assert_eq!(
             events,
             [
@@ -1145,8 +1145,8 @@ mod tests {
         outbox::push(&s.runs[0], thought("third")).unwrap();
         step(&mut task, &s.linear, &queries, at(2)).await;
         assert_eq!(s.fake().sessions.len(), 1);
-        assert_eq!(s.fake().count("HlaSessions"), 1);
-        assert_eq!(s.fake().count("HlaSessionCreate"), 0);
+        assert_eq!(s.fake().count("HerdrLinearAgentSessions"), 1);
+        assert_eq!(s.fake().count("HerdrLinearAgentSessionCreate"), 0);
         assert_eq!(s.fake().sessions[0].sent("thought").len(), 3);
     }
 
@@ -1335,7 +1335,11 @@ mod tests {
         step(&mut task, &s.linear, &queries, at(0)).await;
         assert_eq!(
             s.calls_since(0),
-            ["HlaViewer", "HlaDelegatedIssues", "HlaRuns"]
+            [
+                "HerdrLinearAgentViewer",
+                "HerdrLinearAgentDelegatedIssues",
+                "HerdrLinearAgentRuns"
+            ]
         );
         assert_eq!(task.budget().requests.remaining, Some(4_900));
         assert_eq!(task.budget().complexity.remaining, Some(1_900_000));
@@ -1343,7 +1347,10 @@ mod tests {
         step(&mut task, &s.linear, &queries, at(3)).await;
         assert_eq!(s.calls_since(3), Vec::<String>::new());
         step(&mut task, &s.linear, &queries, at(5)).await;
-        assert_eq!(s.calls_since(3), ["HlaDelegatedIssues", "HlaRuns"]);
+        assert_eq!(
+            s.calls_since(3),
+            ["HerdrLinearAgentDelegatedIssues", "HerdrLinearAgentRuns"]
+        );
         assert_eq!(task.next_due(at(5)), at(10));
         assert_eq!(
             task.take_log(),
@@ -1378,7 +1385,11 @@ mod tests {
         step(&mut task, &s.linear, &queries, at(10)).await;
         assert_eq!(
             s.calls_since(calls),
-            ["HlaActivityCreate", "HlaRuns", "HlaDelegatedIssues"]
+            [
+                "HerdrLinearAgentActivityCreate",
+                "HerdrLinearAgentRuns",
+                "HerdrLinearAgentDelegatedIssues"
+            ]
         );
         assert_eq!(task.take_log(), Vec::<String>::new(), "no line per read");
 
@@ -1408,7 +1419,7 @@ mod tests {
         step(&mut task, &s.linear, &queries, at(5)).await;
         assert_eq!(
             s.calls_since(calls),
-            ["HlaDelegatedIssues"],
+            ["HerdrLinearAgentDelegatedIssues"],
             "the rate limit ends the step"
         );
         assert_eq!(task.next_due(at(5)), at(60));
@@ -1429,7 +1440,11 @@ mod tests {
         step(&mut task, &s.linear, &queries, at(60)).await;
         assert_eq!(
             s.calls_since(calls),
-            ["HlaDelegatedIssues", "HlaRuns", "HlaActivityCreate"]
+            [
+                "HerdrLinearAgentDelegatedIssues",
+                "HerdrLinearAgentRuns",
+                "HerdrLinearAgentActivityCreate"
+            ]
         );
         assert!(outbox::pending(&s.runs[0]).is_empty());
         assert_eq!(task.next_due(at(60)), at(65));
@@ -1447,7 +1462,7 @@ mod tests {
             s.fake().fail_next = Some(ApiError::RateLimited);
             let calls = s.fake().calls.len();
             step(&mut task, &s.linear, &queries, now).await;
-            assert_eq!(s.calls_since(calls), ["HlaDelegatedIssues"]);
+            assert_eq!(s.calls_since(calls), ["HerdrLinearAgentDelegatedIssues"]);
             let until = now + SignedDuration::from_secs(wait);
             assert_eq!(task.next_due(now), until, "after waiting {wait}s");
             now = until;
@@ -1459,7 +1474,10 @@ mod tests {
 
         let calls = s.fake().calls.len();
         step(&mut task, &s.linear, &queries, now).await;
-        assert_eq!(s.calls_since(calls), ["HlaDelegatedIssues", "HlaRuns"]);
+        assert_eq!(
+            s.calls_since(calls),
+            ["HerdrLinearAgentDelegatedIssues", "HerdrLinearAgentRuns"]
+        );
         let later = now + SignedDuration::from_secs(5);
         s.fake().fail_next = Some(ApiError::RateLimited);
         step(&mut task, &s.linear, &queries, later).await;

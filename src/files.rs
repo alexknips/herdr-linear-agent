@@ -125,7 +125,10 @@ mod tests {
 
     #[test]
     fn words_are_quoted_only_when_needed() {
-        assert_eq!(shell_quote("/bin/hla"), "/bin/hla");
+        assert_eq!(
+            shell_quote("/bin/herdr-linear-agent"),
+            "/bin/herdr-linear-agent"
+        );
         assert_eq!(shell_quote("a-b_c.d/E9"), "a-b_c.d/E9");
         assert_eq!(shell_quote("/my dir/it's"), r"'/my dir/it'\''s'");
         assert_eq!(shell_quote(""), "''");

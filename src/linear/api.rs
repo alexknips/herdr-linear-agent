@@ -14,11 +14,11 @@ use super::transport::RateHeaders;
 /// Pages read per poll at most: 50 issues each.
 const MAX_PAGES: usize = 4;
 
-const VIEWER_QUERY: &str = r#"query HlaViewer {
+const VIEWER_QUERY: &str = r#"query HerdrLinearAgentViewer {
   viewer { id app isMe name }
 }"#;
 
-const DELEGATED_QUERY: &str = r#"query HlaDelegatedIssues($teamKeys: [String!]!, $after: String) {
+const DELEGATED_QUERY: &str = r#"query HerdrLinearAgentDelegatedIssues($teamKeys: [String!]!, $after: String) {
   viewer { id app isMe }
   issues(
     first: 50
@@ -43,7 +43,7 @@ const DELEGATED_QUERY: &str = r#"query HlaDelegatedIssues($teamKeys: [String!]!,
   }
 }"#;
 
-const ISSUE_QUERY: &str = r#"query HlaIssue($id: String!) {
+const ISSUE_QUERY: &str = r#"query HerdrLinearAgentIssue($id: String!) {
   viewer { id app isMe }
   issue(id: $id) {
     id identifier title url description updatedAt estimate
@@ -60,44 +60,44 @@ const ISSUE_QUERY: &str = r#"query HlaIssue($id: String!) {
 
 /// The app's recent sessions. Linear creates one when an issue is delegated
 /// to the app (with the agent session webhook category enabled).
-const SESSIONS_QUERY: &str = r#"query HlaSessions {
+const SESSIONS_QUERY: &str = r#"query HerdrLinearAgentSessions {
   viewer { id app isMe }
   agentSessions(first: 50) { nodes { id status createdAt issue { id } appUser { id } } }
 }"#;
 
-const SESSION_CREATE: &str = r#"mutation HlaSessionCreate($issueId: String!) {
+const SESSION_CREATE: &str = r#"mutation HerdrLinearAgentSessionCreate($issueId: String!) {
   agentSessionCreateOnIssue(input: { issueId: $issueId }) { success agentSession { id } }
 }"#;
 
-const ACTIVITY_CREATE: &str = r#"mutation HlaActivityCreate($input: AgentActivityCreateInput!) {
+const ACTIVITY_CREATE: &str = r#"mutation HerdrLinearAgentActivityCreate($input: AgentActivityCreateInput!) {
   agentActivityCreate(input: $input) { success agentActivity { id } }
 }"#;
 
-const ACTIVITY_FIND: &str = r#"query HlaActivityFind($sessionId: String!, $id: ID!) {
+const ACTIVITY_FIND: &str = r#"query HerdrLinearAgentActivityFind($sessionId: String!, $id: ID!) {
   viewer { id app isMe }
   agentSession(id: $sessionId) { activities(filter: { id: { eq: $id } }) { nodes { id } } }
 }"#;
 
-const SESSION_UPDATE: &str = r#"mutation HlaSessionUpdate($id: String!, $input: AgentSessionUpdateInput!) {
+const SESSION_UPDATE: &str = r#"mutation HerdrLinearAgentSessionUpdate($id: String!, $input: AgentSessionUpdateInput!) {
   agentSessionUpdate(id: $id, input: $input) { success }
 }"#;
 
-const ISSUE_STATE_UPDATE: &str = r#"mutation HlaIssueState($id: String!, $stateId: String!) {
+const ISSUE_STATE_UPDATE: &str = r#"mutation HerdrLinearAgentIssueState($id: String!, $stateId: String!) {
   issueUpdate(id: $id, input: { stateId: $stateId }) { success }
 }"#;
 
-const COMMENT_CREATE: &str = r#"mutation HlaCommentCreate($input: CommentCreateInput!) {
+const COMMENT_CREATE: &str = r#"mutation HerdrLinearAgentCommentCreate($input: CommentCreateInput!) {
   commentCreate(input: $input) { success comment { id } }
 }"#;
 
-const COMMENT_FIND: &str = r#"query HlaCommentFind($id: ID!) {
+const COMMENT_FIND: &str = r#"query HerdrLinearAgentCommentFind($id: ID!) {
   viewer { id app isMe }
   comments(filter: { id: { eq: $id } }) { nodes { id } }
 }"#;
 
 /// The issue's labels, and every label its team can use (the team's and
 /// the workspace's), with their groups.
-const LABELS: &str = r#"query HlaLabels($id: String!) {
+const LABELS: &str = r#"query HerdrLinearAgentLabels($id: String!) {
   viewer { id app isMe }
   issue(id: $id) {
     labels { nodes { id } }
@@ -106,11 +106,11 @@ const LABELS: &str = r#"query HlaLabels($id: String!) {
   issueLabels(first: 250, filter: { team: { null: true } }) { nodes { id name parent { name } } }
 }"#;
 
-const LABEL_ADD: &str = r#"mutation HlaLabelAdd($id: String!, $labelId: String!) {
+const LABEL_ADD: &str = r#"mutation HerdrLinearAgentLabelAdd($id: String!, $labelId: String!) {
   issueAddLabel(id: $id, labelId: $labelId) { success }
 }"#;
 
-/// One run's part of `HlaRuns`; `@` is replaced by the run's index. The text
+/// One run's part of `HerdrLinearAgentRuns`; `@` is replaced by the run's index. The text
 /// is fixed: only the alias number varies.
 const RUN_PART: &str = r#"  i@: issue(id: $i@) { updatedAt state { type name } delegate { id } }
   s@: agentSession(id: $s@) {
@@ -373,7 +373,7 @@ pub trait LinearApi: Sync {
     fn viewer(&self) -> impl Future<Output = Result<Viewer, ApiError>> + Send {
         async move {
             let data = self
-                .execute("HlaViewer", VIEWER_QUERY, json!({}), false)
+                .execute("HerdrLinearAgentViewer", VIEWER_QUERY, json!({}), false)
                 .await?;
             serde_json::from_value(field(&data, "viewer")?.clone())
                 .map_err(|_| ApiError::ReadFieldsInvalid)
@@ -392,7 +392,12 @@ pub trait LinearApi: Sync {
             for _ in 0..MAX_PAGES {
                 let variables = json!({ "teamKeys": team_keys, "after": after });
                 let data = self
-                    .execute("HlaDelegatedIssues", DELEGATED_QUERY, variables, false)
+                    .execute(
+                        "HerdrLinearAgentDelegatedIssues",
+                        DELEGATED_QUERY,
+                        variables,
+                        false,
+                    )
                     .await?;
                 let viewer = text(field(&data, "viewer")?, "id")?;
                 let page = field(&data, "issues")?;
@@ -416,7 +421,12 @@ pub trait LinearApi: Sync {
     fn issue(&self, id: &str) -> impl Future<Output = Result<IssueDetail, ApiError>> + Send {
         async move {
             let data = self
-                .execute("HlaIssue", ISSUE_QUERY, json!({ "id": id }), false)
+                .execute(
+                    "HerdrLinearAgentIssue",
+                    ISSUE_QUERY,
+                    json!({ "id": id }),
+                    false,
+                )
                 .await?;
             parse_issue(field(&data, "issue")?)
         }
@@ -430,7 +440,7 @@ pub trait LinearApi: Sync {
     ) -> impl Future<Output = Result<Option<String>, ApiError>> + Send {
         async move {
             let data = self
-                .execute("HlaSessions", SESSIONS_QUERY, json!({}), false)
+                .execute("HerdrLinearAgentSessions", SESSIONS_QUERY, json!({}), false)
                 .await?;
             let viewer = text(field(&data, "viewer")?, "id")?;
             nodes(field(&data, "agentSessions")?)
@@ -450,7 +460,7 @@ pub trait LinearApi: Sync {
         async move {
             let payload = self
                 .mutate(
-                    "HlaSessionCreate",
+                    "HerdrLinearAgentSessionCreate",
                     SESSION_CREATE,
                     json!({ "issueId": issue_id }),
                     "agentSessionCreateOnIssue",
@@ -482,7 +492,7 @@ pub trait LinearApi: Sync {
             }
             let variables = json!({ "input": input });
             self.mutate(
-                "HlaActivityCreate",
+                "HerdrLinearAgentActivityCreate",
                 ACTIVITY_CREATE,
                 variables,
                 "agentActivityCreate",
@@ -500,7 +510,12 @@ pub trait LinearApi: Sync {
         async move {
             let variables = json!({ "sessionId": session_id, "id": id });
             let data = self
-                .execute("HlaActivityFind", ACTIVITY_FIND, variables, false)
+                .execute(
+                    "HerdrLinearAgentActivityFind",
+                    ACTIVITY_FIND,
+                    variables,
+                    false,
+                )
                 .await?;
             Ok(nodes(&field(&data, "agentSession")?["activities"]).any(|n| n["id"] == id))
         }
@@ -514,7 +529,7 @@ pub trait LinearApi: Sync {
         async move {
             let variables = json!({ "id": session_id, "input": { "plan": plan } });
             self.mutate(
-                "HlaSessionUpdate",
+                "HerdrLinearAgentSessionUpdate",
                 SESSION_UPDATE,
                 variables,
                 "agentSessionUpdate",
@@ -532,7 +547,7 @@ pub trait LinearApi: Sync {
         async move {
             let variables = json!({ "id": session_id, "input": { "externalUrls": urls } });
             self.mutate(
-                "HlaSessionUpdate",
+                "HerdrLinearAgentSessionUpdate",
                 SESSION_UPDATE,
                 variables,
                 "agentSessionUpdate",
@@ -550,7 +565,7 @@ pub trait LinearApi: Sync {
         async move {
             let variables = json!({ "id": issue_id, "stateId": state_id });
             self.mutate(
-                "HlaIssueState",
+                "HerdrLinearAgentIssueState",
                 ISSUE_STATE_UPDATE,
                 variables,
                 "issueUpdate",
@@ -570,7 +585,7 @@ pub trait LinearApi: Sync {
         async move {
             let variables = json!({ "input": { "id": id, "issueId": issue_id, "body": body } });
             self.mutate(
-                "HlaCommentCreate",
+                "HerdrLinearAgentCommentCreate",
                 COMMENT_CREATE,
                 variables,
                 "commentCreate",
@@ -584,7 +599,12 @@ pub trait LinearApi: Sync {
     fn comment_exists(&self, id: &str) -> impl Future<Output = Result<bool, ApiError>> + Send {
         async move {
             let data = self
-                .execute("HlaCommentFind", COMMENT_FIND, json!({ "id": id }), false)
+                .execute(
+                    "HerdrLinearAgentCommentFind",
+                    COMMENT_FIND,
+                    json!({ "id": id }),
+                    false,
+                )
                 .await?;
             Ok(nodes(field(&data, "comments")?).next().is_some())
         }
@@ -600,7 +620,12 @@ pub trait LinearApi: Sync {
     ) -> impl Future<Output = Result<(), ApiError>> + Send {
         async move {
             let data = self
-                .execute("HlaLabels", LABELS, json!({ "id": issue_id }), false)
+                .execute(
+                    "HerdrLinearAgentLabels",
+                    LABELS,
+                    json!({ "id": issue_id }),
+                    false,
+                )
                 .await?;
             let issue = field(&data, "issue")?;
             let has: Vec<&Value> = nodes(&issue["labels"]).map(|l| &l["id"]).collect();
@@ -625,8 +650,13 @@ pub trait LinearApi: Sync {
                     continue;
                 }
                 let variables = json!({ "id": issue_id, "labelId": id });
-                self.mutate("HlaLabelAdd", LABEL_ADD, variables, "issueAddLabel")
-                    .await?;
+                self.mutate(
+                    "HerdrLinearAgentLabelAdd",
+                    LABEL_ADD,
+                    variables,
+                    "issueAddLabel",
+                )
+                .await?;
             }
             if unknown.is_empty() {
                 Ok(())
@@ -639,7 +669,7 @@ pub trait LinearApi: Sync {
         }
     }
 
-    /// Every given run's issue state and new prompts, in one `HlaRuns`
+    /// Every given run's issue state and new prompts, in one `HerdrLinearAgentRuns`
     /// request, in query order.
     fn run_updates(
         &self,
@@ -661,9 +691,17 @@ pub trait LinearApi: Sync {
                 variables.insert(format!("s{n}"), json!(run.session_id));
                 variables.insert(format!("c{n}"), json!(run.cursor));
             }
-            let query = format!("query HlaRuns({}) {{\n{body}}}", declarations.join(", "));
+            let query = format!(
+                "query HerdrLinearAgentRuns({}) {{\n{body}}}",
+                declarations.join(", ")
+            );
             let data = self
-                .execute("HlaRuns", &query, Value::Object(variables), false)
+                .execute(
+                    "HerdrLinearAgentRuns",
+                    &query,
+                    Value::Object(variables),
+                    false,
+                )
                 .await?;
             (0..runs.len())
                 .map(|n| {
@@ -740,7 +778,7 @@ fn text(value: &Value, name: &str) -> Result<String, ApiError> {
 }
 
 /// An issue's delegator and the app's newest session on it, from a node of
-/// `HlaDelegatedIssues`.
+/// `HerdrLinearAgentDelegatedIssues`.
 fn delegation(
     issue: &Value,
     viewer: &str,
@@ -872,7 +910,7 @@ pub mod fake {
     /// The rate-limit headers of the response to (operation, variables).
     pub type Headers = Box<dyn Fn(&str, &Value) -> RateHeaders + Send>;
 
-    /// The number of runs in the variables of one `HlaRuns` request.
+    /// The number of runs in the variables of one `HerdrLinearAgentRuns` request.
     pub fn runs(variables: &Value) -> usize {
         variables
             .as_object()
@@ -916,7 +954,7 @@ pub mod fake {
 
     #[derive(Default)]
     pub struct FakeLinear {
-        /// Issue records in the shape `HlaIssue` returns.
+        /// Issue records in the shape `HerdrLinearAgentIssue` returns.
         pub issues: Vec<Value>,
         pub sessions: Vec<FakeSession>,
         /// (operation name, variables, write) of every call.
@@ -1184,8 +1222,8 @@ pub mod fake {
 
         fn answer(&mut self, operation: &str, variables: &Value) -> Result<Value, ApiError> {
             match operation {
-                "HlaViewer" => Ok(json!({ "viewer": viewer() })),
-                "HlaDelegatedIssues" => {
+                "HerdrLinearAgentViewer" => Ok(json!({ "viewer": viewer() })),
+                "HerdrLinearAgentDelegatedIssues" => {
                     let teams: Vec<&str> = variables["teamKeys"]
                         .as_array()
                         .into_iter()
@@ -1217,7 +1255,7 @@ pub mod fake {
                         json!({ "viewer": viewer(), "issues": { "nodes": nodes, "pageInfo": { "hasNextPage": false, "endCursor": null } } }),
                     )
                 }
-                "HlaIssue" => {
+                "HerdrLinearAgentIssue" => {
                     let id = variables["id"].as_str().unwrap_or("");
                     let issue = self
                         .issues
@@ -1227,12 +1265,14 @@ pub mod fake {
                         .ok_or(ApiError::Graphql("Entity not found".into()))?;
                     Ok(json!({ "viewer": viewer(), "issue": issue }))
                 }
-                "HlaSessions" | "HlaSessionCreate" if self.sessions_disabled => {
+                "HerdrLinearAgentSessions" | "HerdrLinearAgentSessionCreate"
+                    if self.sessions_disabled =>
+                {
                     Err(ApiError::Graphql(
                         "Agent sessions are not enabled for this application.".into(),
                     ))
                 }
-                "HlaSessions" => {
+                "HerdrLinearAgentSessions" => {
                     let nodes: Vec<Value> = self
                         .sessions
                         .iter()
@@ -1240,7 +1280,7 @@ pub mod fake {
                         .collect();
                     Ok(json!({ "viewer": viewer(), "agentSessions": { "nodes": nodes } }))
                 }
-                "HlaSessionCreate" => {
+                "HerdrLinearAgentSessionCreate" => {
                     let issue_id = self.issue(variables["issueId"].as_str().unwrap_or(""))["id"]
                         .as_str()
                         .unwrap()
@@ -1250,7 +1290,7 @@ pub mod fake {
                         json!({ "agentSessionCreateOnIssue": { "success": true, "agentSession": { "id": id } } }),
                     )
                 }
-                "HlaActivityCreate" => {
+                "HerdrLinearAgentActivityCreate" => {
                     let input = &variables["input"];
                     let created = self.tick_clock();
                     let session =
@@ -1279,7 +1319,7 @@ pub mod fake {
                         json!({ "agentActivityCreate": { "success": true, "agentActivity": { "id": input["id"] } } }),
                     )
                 }
-                "HlaActivityFind" => {
+                "HerdrLinearAgentActivityFind" => {
                     let id = variables["id"].clone();
                     let session =
                         self.session_mut(variables["sessionId"].as_str().unwrap_or(""))?;
@@ -1293,7 +1333,7 @@ pub mod fake {
                         json!({ "viewer": viewer(), "agentSession": { "activities": { "nodes": found } } }),
                     )
                 }
-                "HlaSessionUpdate" => {
+                "HerdrLinearAgentSessionUpdate" => {
                     let input = variables["input"].clone();
                     let session = self.session_mut(variables["id"].as_str().unwrap_or(""))?;
                     if let Some(plan) = input.get("plan") {
@@ -1304,7 +1344,7 @@ pub mod fake {
                     }
                     Ok(json!({ "agentSessionUpdate": { "success": true } }))
                 }
-                "HlaCommentCreate" => {
+                "HerdrLinearAgentCommentCreate" => {
                     let input = &variables["input"];
                     let issue = self.issue_mut(input["issueId"].as_str().unwrap_or(""));
                     issue["posted"]
@@ -1319,7 +1359,7 @@ pub mod fake {
                         json!({ "commentCreate": { "success": true, "comment": { "id": input["id"] } } }),
                     )
                 }
-                "HlaCommentFind" => {
+                "HerdrLinearAgentCommentFind" => {
                     let id = &variables["id"];
                     let found: Vec<Value> = self
                         .issues
@@ -1330,7 +1370,7 @@ pub mod fake {
                         .collect();
                     Ok(json!({ "viewer": viewer(), "comments": { "nodes": found } }))
                 }
-                "HlaLabels" => {
+                "HerdrLinearAgentLabels" => {
                     let issue = self.issue(variables["id"].as_str().unwrap_or(""));
                     let has: Vec<Value> = issue["labels"]["nodes"]
                         .as_array()
@@ -1352,7 +1392,7 @@ pub mod fake {
                         "issueLabels": { "nodes": [] }
                     }))
                 }
-                "HlaLabelAdd" => {
+                "HerdrLinearAgentLabelAdd" => {
                     let name = variables["labelId"]
                         .as_str()
                         .unwrap_or("")
@@ -1365,7 +1405,7 @@ pub mod fake {
                         .push(json!({ "name": name, "parent": null }));
                     Ok(json!({ "issueAddLabel": { "success": true } }))
                 }
-                "HlaIssueState" => {
+                "HerdrLinearAgentIssueState" => {
                     let state_id = variables["stateId"].clone();
                     let issue = self.issue_mut(variables["id"].as_str().unwrap_or(""));
                     let state = issue["team"]["states"]["nodes"]
@@ -1378,7 +1418,7 @@ pub mod fake {
                     issue["state"] = state;
                     Ok(json!({ "issueUpdate": { "success": true } }))
                 }
-                "HlaRuns" => {
+                "HerdrLinearAgentRuns" => {
                     let mut data = json!({ "viewer": viewer() });
                     let mut n = 0;
                     while let Some(issue_id) =

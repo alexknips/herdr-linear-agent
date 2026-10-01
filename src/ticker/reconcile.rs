@@ -760,7 +760,7 @@ impl Reconciler {
                 &pane_id,
                 progress::SOURCE,
                 display,
-                &[("hla_state".into(), state.into())],
+                &[(progress::STATE_TOKEN.into(), state.into())],
                 progress::TOKEN_TTL_MS,
             )
             .await;

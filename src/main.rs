@@ -28,7 +28,11 @@ use std::path::{Path, PathBuf};
 /// The release version plus a build identifier (short git hash and build
 /// time), so a rebuilt binary always differs from the one a running ticker was
 /// started from.
-pub const VERSION: &str = concat!(env!("HLA_RELEASE_VERSION"), "+", env!("HLA_BUILD_ID"));
+pub const VERSION: &str = concat!(
+    env!("HERDR_LINEAR_AGENT_RELEASE_VERSION"),
+    "+",
+    env!("HERDR_LINEAR_AGENT_BUILD_ID")
+);
 
 /// `current` with each existing folder it lacks appended, or `None` when
 /// nothing is missing. Herdr may start plugins with a bare `PATH` when it was

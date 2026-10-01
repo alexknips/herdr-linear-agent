@@ -1,7 +1,7 @@
 //! Sets the two halves of the binary's version:
 //!
-//! - `HLA_RELEASE_VERSION`: the contents of `.release-version`;
-//! - `HLA_BUILD_ID`: the short git hash (`nogit` outside a checkout) and the
+//! - `HERDR_LINEAR_AGENT_RELEASE_VERSION`: the contents of `.release-version`;
+//! - `HERDR_LINEAR_AGENT_BUILD_ID`: the short git hash (`nogit` outside a checkout) and the
 //!   build time in Unix seconds, joined by `.`.
 //!
 //! No `rerun-if-changed` line is printed on purpose: Cargo then runs this
@@ -31,6 +31,6 @@ fn main() {
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
-    println!("cargo:rustc-env=HLA_RELEASE_VERSION={release}");
-    println!("cargo:rustc-env=HLA_BUILD_ID={hash}.{built}");
+    println!("cargo:rustc-env=HERDR_LINEAR_AGENT_RELEASE_VERSION={release}");
+    println!("cargo:rustc-env=HERDR_LINEAR_AGENT_BUILD_ID={hash}.{built}");
 }

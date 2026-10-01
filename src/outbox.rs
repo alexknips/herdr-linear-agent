@@ -431,7 +431,7 @@ mod tests {
         assert_eq!(sent.count, 1);
         let fake = linear.lock().unwrap();
         assert_eq!(fake.sessions[0].sent("thought").len(), 1);
-        assert_eq!(fake.count("HlaActivityFind"), 1);
+        assert_eq!(fake.count("HerdrLinearAgentActivityFind"), 1);
     }
 
     #[tokio::test]

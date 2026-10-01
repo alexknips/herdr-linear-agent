@@ -16,6 +16,10 @@ pub const WAITING: &str = "Waiting for you";
 /// The metadata source of every pane token the plugin reports.
 pub const SOURCE: &str = "herdr-linear-agent";
 pub const TOKEN_TTL_MS: u64 = 300_000;
+/// The token with an agent's state, on coordinator and worker panes.
+pub const STATE_TOKEN: &str = "herdr_linear_agent_state";
+/// The token with what a worker reports it is doing.
+pub const ACTIVITY_TOKEN: &str = "herdr_linear_agent_activity";
 const ACTIVITY_COLUMNS: usize = 40;
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -188,7 +192,7 @@ pub async fn report_in_pane<H: Herdr>(
             &pane.id,
             SOURCE,
             "",
-            &[("hla_activity".into(), activity)],
+            &[(ACTIVITY_TOKEN.into(), activity)],
             TOKEN_TTL_MS,
         )
         .await;
@@ -201,6 +205,20 @@ mod tests {
     use crate::herdr::FakeHerdr;
 
     const WORK_SOCKET: &str = "/tmp/herdr-work.sock";
+
+    #[test]
+    fn token_names_fit_herdrs_limits() {
+        // Herdr takes names matching `^[A-Za-z0-9_-]{1,32}$`.
+        for name in [STATE_TOKEN, ACTIVITY_TOKEN] {
+            assert!(
+                (1..=32).contains(&name.len())
+                    && name
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
+                "{name}"
+            );
+        }
+    }
     const SIDE_SOCKET: &str = "/tmp/herdr-side.sock";
 
     fn progress_of(socket: &str, pane: &str, terminal: &str) -> Record {
@@ -317,7 +335,10 @@ mod tests {
         assert_eq!(token.source, "herdr-linear-agent");
         assert_eq!(
             token.tokens,
-            [("hla_activity".to_string(), "Running tests".to_string())]
+            [(
+                "herdr_linear_agent_activity".to_string(),
+                "Running tests".to_string()
+            )]
         );
         assert_eq!(token.ttl_ms, 300_000);
 

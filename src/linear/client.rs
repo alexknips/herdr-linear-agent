@@ -296,8 +296,8 @@ mod tests {
         .unwrap();
         let read = unbound
             .request(
-                "HlaViewer",
-                "query HlaViewer { viewer { id } }",
+                "HerdrLinearAgentViewer",
+                "query HerdrLinearAgentViewer { viewer { id } }",
                 json!({}),
                 false,
             )
@@ -305,7 +305,7 @@ mod tests {
         assert_eq!(read, Err(ApiError::RequestFailed), "plain HTTP is refused");
         assert_eq!(
             unbound
-                .execute("HlaIssueState", "mutation", json!({}), true)
+                .execute("HerdrLinearAgentIssueState", "mutation", json!({}), true)
                 .await,
             Err(ApiError::Credential(CredentialError::NotReady))
         );
@@ -318,7 +318,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             bound
-                .execute("HlaIssueState", "mutation", json!({}), true)
+                .execute("HerdrLinearAgentIssueState", "mutation", json!({}), true)
                 .await,
             Err(ApiError::RequestFailed)
         );
@@ -394,11 +394,11 @@ mod tests {
             updates[1],
             Err(ApiError::Graphql("Entity not found: AgentSession".into()))
         );
-        assert_eq!(linear.lock().unwrap().count("HlaRuns"), 3);
+        assert_eq!(linear.lock().unwrap().count("HerdrLinearAgentRuns"), 3);
 
         linear.lock().unwrap().fail_next = Some(ApiError::RateLimited);
         let updates = linear.read_runs(&[query(&one, &session)]).await;
         assert_eq!(updates, [Err(ApiError::RateLimited)]);
-        assert_eq!(linear.lock().unwrap().count("HlaRuns"), 4);
+        assert_eq!(linear.lock().unwrap().count("HerdrLinearAgentRuns"), 4);
     }
 }

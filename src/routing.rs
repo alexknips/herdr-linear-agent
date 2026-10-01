@@ -612,7 +612,7 @@ pub struct Ask<'a> {
     pub path_var: Option<&'a str>,
     /// Holds the call's temporary folder.
     pub parent: &'a Path,
-    /// Names the agent in errors and its folder, `hla-<role>-…`.
+    /// Names the agent in errors and its folder, `herdr-linear-agent-<role>-…`.
     pub role: &'a str,
 }
 
@@ -623,7 +623,7 @@ pub async fn ask(call: &Ask<'_>) -> Result<Result<Value, Fallback>> {
     let recipe = recipe(&profile.kind)
         .with_context(|| format!("the `{}` kind cannot be a {role} agent", profile.kind))?;
     let sandbox = tempfile::Builder::new()
-        .prefix(&format!("hla-{role}-"))
+        .prefix(&format!("herdr-linear-agent-{role}-"))
         .tempdir_in(call.parent)
         .with_context(|| format!("could not create a folder in {}", call.parent.display()))?;
     let schema_path = sandbox.path().join("schema.json");

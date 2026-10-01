@@ -326,7 +326,7 @@ mod tests {
     use super::*;
     use crate::herdr::{Agent, AgentStatus as Seen, Pane, PaneId, WorkspaceId};
 
-    const BIN: &str = "/opt/hla/bin/herdr-linear-agent";
+    const BIN: &str = "/opt/herdr-linear-agent/bin/herdr-linear-agent";
 
     struct Folder {
         _home: tempfile::TempDir,
@@ -412,8 +412,8 @@ mod tests {
             "If your working directory is this folder, you are the coordinator of the \
              herdr-linear-agent run for the Linear issue DATA-1 (Fix the login).",
             "",
-            "Run `/opt/hla/bin/herdr-linear-agent skill acme/DATA-1` now and follow the sheet it \
-             prints. Then run `/opt/hla/bin/herdr-linear-agent context acme/DATA-1` at the start \
+            "Run `/opt/herdr-linear-agent/bin/herdr-linear-agent skill acme/DATA-1` now and follow the sheet it \
+             prints. Then run `/opt/herdr-linear-agent/bin/herdr-linear-agent context acme/DATA-1` at the start \
              of every turn.",
         ];
         assert_eq!(agents, format!("{}\n", expected.join("\n")));
@@ -437,7 +437,7 @@ mod tests {
             "finish",
         ]
         .iter()
-        .map(|sub| format!("Bash(/opt/hla/bin/herdr-linear-agent {sub}:*)"))
+        .map(|sub| format!("Bash(/opt/herdr-linear-agent/bin/herdr-linear-agent {sub}:*)"))
         .collect();
         assert_eq!(
             settings,
@@ -453,29 +453,32 @@ mod tests {
         assert_eq!(
             cursor,
             serde_json::json!({"permissions": {
-                "allow": ["Shell(/opt/hla/bin/herdr-linear-agent)"],
+                "allow": ["Shell(/opt/herdr-linear-agent/bin/herdr-linear-agent)"],
                 "deny": []
             }})
         );
 
         // A second placement keeps the link and rewrites the text.
-        write_priming(&f.run, &f.record, "/usr/local/bin/hla", &[]).unwrap();
+        write_priming(&f.run, &f.record, "/usr/local/bin/herdr-linear-agent", &[]).unwrap();
         assert!(
             std::fs::read_to_string(f.run.dir.join("CLAUDE.md"))
                 .unwrap()
-                .contains("Run `/usr/local/bin/hla skill acme/DATA-1`")
+                .contains("Run `/usr/local/bin/herdr-linear-agent skill acme/DATA-1`")
         );
     }
 
     #[test]
     fn the_sheet_fills_in_the_binary_and_the_key() {
-        let filled = sheet("/bin/hla", "DATA-7");
+        let filled = sheet("/bin/herdr-linear-agent", "DATA-7");
         assert!(
-            filled.contains("`/bin/hla worker start DATA-7 --repo "),
+            filled.contains("`/bin/herdr-linear-agent worker start DATA-7 --repo "),
             "{filled}"
         );
         assert!(!filled.contains("{bin}") && !filled.contains("{key}"));
-        assert!(sheet("/bin/hla", "<ISSUE-KEY>").contains("worker start <ISSUE-KEY> --repo"));
+        assert!(
+            sheet("/bin/herdr-linear-agent", "<ISSUE-KEY>")
+                .contains("worker start <ISSUE-KEY> --repo")
+        );
     }
 
     #[test]
@@ -546,7 +549,8 @@ mod tests {
             },
         ];
 
-        let (text, shown) = digest(&f.run, &sample_config(), "/bin/hla", &rows).unwrap();
+        let (text, shown) =
+            digest(&f.run, &sample_config(), "/bin/herdr-linear-agent", &rows).unwrap();
         assert_in_order(
             &text,
             &[
@@ -576,7 +580,7 @@ mod tests {
 
         inbox::mark_seen(&f.run, &shown).unwrap();
         inbox::done(&f.run, &[], true).unwrap();
-        let (_, shown) = digest(&f.run, &sample_config(), "/bin/hla", &[]).unwrap();
+        let (_, shown) = digest(&f.run, &sample_config(), "/bin/herdr-linear-agent", &[]).unwrap();
         assert!(shown.is_empty());
     }
 

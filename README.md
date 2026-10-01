@@ -276,12 +276,12 @@ description = "Coordinator on OpenCode"
 | `cursor` | Cursor Agent 2026.09.26 | The `Task` tool; `.cursor/cli.json` permissions do not cover it | `--allowed-tools` with the tools a coordinator needs, as above. The flag is hidden and marked internal; `--exclude-tools task_tool_call` is accepted but does not remove the tool |
 | `opencode` | OpenCode 2.0.15 | The `subagent` tool, with the built-in `general` and `explore` agents | `args` alone cannot; an agent in your OpenCode config can (below) |
 
-For OpenCode, add an agent like this to your OpenCode config (for example `~/.config/opencode/opencode.json`) and pass `--agent hla-coordinator` in the profile's `args`. Without it, and for any kind not in the table, the sheet's rule is the only thing that keeps a coordinator from starting subagents.
+For OpenCode, add an agent like this to your OpenCode config (for example `~/.config/opencode/opencode.json`) and pass `--agent herdr-linear-agent-coordinator` in the profile's `args`. Without it, and for any kind not in the table, the sheet's rule is the only thing that keeps a coordinator from starting subagents.
 
 ```json
 {
   "agent": {
-    "hla-coordinator": {
+    "herdr-linear-agent-coordinator": {
       "mode": "primary",
       "description": "herdr-linear-agent coordinator",
       "permission": { "subagent": "deny" }

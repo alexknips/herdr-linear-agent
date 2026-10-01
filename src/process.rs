@@ -302,7 +302,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_program_that_does_not_exist_is_an_error() {
-        let missing = Cmd::new("/nonexistent/hla-no-such-program", PROMPT);
+        let missing = Cmd::new("/nonexistent/herdr-linear-agent-no-such-program", PROMPT);
         let (result, _) = timed(missing).await;
         let error = result.unwrap_err().to_string();
         assert!(error.contains("could not run"), "{error}");

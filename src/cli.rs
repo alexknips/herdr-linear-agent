@@ -334,7 +334,7 @@ mod tests {
                 .iter()
                 .map(|v| v.as_str().unwrap())
                 .collect();
-            let mut argv = vec!["hla"];
+            let mut argv = vec!["herdr-linear-agent"];
             argv.extend(&command[1..]);
             assert!(Cli::try_parse_from(&argv).is_ok(), "{argv:?}");
             assert_eq!(command[2], action["id"].as_str().unwrap());
@@ -347,7 +347,7 @@ mod tests {
                 .iter()
                 .map(|v| v.as_str().unwrap())
                 .collect();
-            let mut argv = vec!["hla"];
+            let mut argv = vec!["herdr-linear-agent"];
             argv.extend(&command[1..]);
             assert!(Cli::try_parse_from(&argv).is_ok(), "{argv:?}");
         }
@@ -368,7 +368,7 @@ mod tests {
     fn the_command_line_is_consistent() {
         Cli::command().debug_assert();
         let parsed = Cli::try_parse_from([
-            "hla",
+            "herdr-linear-agent",
             "ask",
             "DATA-1",
             "--text-file",
@@ -380,12 +380,21 @@ mod tests {
         ])
         .unwrap();
         assert!(matches!(parsed.command, Command::Ask { ref options, .. } if options.len() == 2));
-        assert!(Cli::try_parse_from(["hla", "action", "open-issue"]).is_ok());
-        assert!(Cli::try_parse_from(["hla", "action", "logout"]).is_err());
-        assert!(Cli::try_parse_from(["hla", "debug", "herdr-watch", "--socket", "/s"]).is_ok());
+        assert!(Cli::try_parse_from(["herdr-linear-agent", "action", "open-issue"]).is_ok());
+        assert!(Cli::try_parse_from(["herdr-linear-agent", "action", "logout"]).is_err());
         assert!(
             Cli::try_parse_from([
-                "hla",
+                "herdr-linear-agent",
+                "debug",
+                "herdr-watch",
+                "--socket",
+                "/s"
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "herdr-linear-agent",
                 "worker",
                 "start",
                 "DATA-1",

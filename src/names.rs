@@ -64,7 +64,7 @@ mod tests {
         for good in ["a", "data-1-w1", "x_y", &"a".repeat(32)] {
             assert!(is_valid(good), "{good}");
         }
-        for bad in ["", "Hla-x", "1abc", "-a", "a.b", &"a".repeat(33)] {
+        for bad in ["", "Agent-x", "1abc", "-a", "a.b", &"a".repeat(33)] {
             assert!(!is_valid(bad), "{bad}");
         }
     }

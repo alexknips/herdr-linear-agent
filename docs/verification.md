@@ -319,3 +319,16 @@ With a build of the branch in the default Herdr session, THLA-26 asked for no ch
 | Final | canceling the issue closed the run; 21 s later the routing agent picked again, `review-brief` wrote the final postmortem, and its summary began `Closed as Canceled.` |
 
 A routing with one candidate each, which asks no routing agent, was checked with the scenario tests only.
+
+## Spelled-out names (2026-10-01)
+
+With a build of the branch in the default Herdr session, THLA-27 asked for one worker on the testing repository:
+
+| Step | Result |
+| --- | --- |
+| Coordinator pane | `herdr pane get` showed `"tokens": {"herdr_linear_agent_state": "working"}`, and `done` after `finish` |
+| Worker pane | the worker's pane showed `"tokens": {"herdr_linear_agent_activity": "Opening PR", "herdr_linear_agent_state": "Working"}`; it opened civitaspo/testing-herdr-linear-agent#14 |
+| Temporary folders | a watch of the ticker's temp dir (every 0.3 s) saw, for the interim postmortem, `herdr-linear-agent-routing-f40pLj` at 08:49:57, then `herdr-linear-agent-postmortem-9Y2ykb` from 08:50:02 until 08:50:20, and nothing after; for the final one, `herdr-linear-agent-routing-HRo0hS` at 08:50:45 and `herdr-linear-agent-postmortem-HH6bL9` until 08:51:32. No `hla-*` folder appeared |
+| Postmortems | the routing agent picked `review` both times; both comments were posted |
+
+The worker's first start failed: `git fetch` in the testing repository needed the 1Password SSH agent, which was locked. The coordinator asked in the Agent Session, and started the worker after the reply.

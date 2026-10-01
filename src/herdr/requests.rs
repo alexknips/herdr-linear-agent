@@ -358,7 +358,7 @@ mod tests {
                 &pane,
                 "herdr-linear-agent",
                 "",
-                &[("hla_activity".into(), "Testing".into())],
+                &[("herdr_linear_agent_activity".into(), "Testing".into())],
                 300_000,
             )
             .await
@@ -366,7 +366,7 @@ mod tests {
         assert_eq!(
             last_request(&fake, "pane.report_metadata")["params"],
             json!({"pane_id": "w1:p2", "source": "herdr-linear-agent",
-                   "tokens": {"hla_activity": "Testing"}, "ttl_ms": 300000})
+                   "tokens": {"herdr_linear_agent_activity": "Testing"}, "ttl_ms": 300000})
         );
         client.send_escape(&pane).await.unwrap();
         assert_eq!(

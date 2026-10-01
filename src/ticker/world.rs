@@ -24,7 +24,7 @@ use crate::process::fake::{FakeRunner, fail, ok};
 use crate::run::{Run, RunRecord};
 use crate::worker::Worker;
 
-pub const SOCKET: &str = "/tmp/hla-world/work.sock";
+pub const SOCKET: &str = "/tmp/herdr-linear-agent-world/work.sock";
 /// Rounds of Linear step and pass before `settle` gives up.
 const ROUNDS: usize = 50;
 /// Requests that are not effects: reading the state and refreshing tokens.

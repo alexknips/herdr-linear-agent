@@ -780,7 +780,7 @@ mod tests {
                 worker: &worker,
                 task: "\n  Change the session handler.  \n",
                 restart,
-                binary: "/bin/hla",
+                binary: "/bin/herdr-linear-agent",
                 instructions: &[],
             })
         };
@@ -798,7 +798,7 @@ mod tests {
             "/wt/api/.herdr-linear-agent/acme-DATA-1-w1/report.md",
             "previous attempt",
             rules,
-            "/bin/hla report --percent N",
+            "/bin/herdr-linear-agent report --percent N",
             "--activity",
             "Change the session handler.",
         ] {
@@ -818,7 +818,7 @@ mod tests {
             worker: &worker,
             task: "Change the session handler.",
             restart: false,
-            binary: "/bin/hla",
+            binary: "/bin/herdr-linear-agent",
             instructions: &[crate::config::Instructions {
                 profile: "standard".into(),
                 text: "Run `make check` before you commit.\n".into(),
@@ -862,7 +862,7 @@ mod tests {
             worker: &worker,
             task: "Change the session handler.",
             restart: false,
-            binary: "/bin/hla",
+            binary: "/bin/herdr-linear-agent",
             instructions: &layers,
         });
         let last_rule = include_str!("../assets/WORKER.md")
