@@ -1,19 +1,94 @@
 //! Postmortems of the runs whose record marks one due: each is written off
 //! the pass, and its comment and labels are queued when it answers.
 
+use std::collections::BTreeMap;
+use std::time::Duration;
+
 use anyhow::{Result, anyhow};
 use jiff::Timestamp;
 
 use super::reconcile::{Deps, Reconciler, update_run};
-use crate::config::Postmortem;
+use crate::config::{Config, Profile};
 use crate::herdr::Herdr;
 use crate::outbox::Op;
-use crate::postmortem::{self, Outcome, Stage};
-use crate::run::Run;
+use crate::postmortem::{self, Method, Outcome, Stage};
+use crate::routing::{self, Choice};
+use crate::run::{Run, RunRecord};
 use crate::transcript::Roots;
 
-/// A postmortem that answered: its method's name, the method, the outcome.
-pub(super) type Written = Result<(String, Postmortem, Outcome)>;
+/// A postmortem that answered: its method, how its profile was picked, and
+/// the outcome.
+pub(super) type Written = Result<(Method, String, Outcome)>;
+
+/// What writing a run's postmortem needs, taken from the config when it
+/// starts: the routing's candidates with their profiles, its agent with its
+/// timeout, and the postmortem agents' default timeout.
+struct Plan {
+    candidates: Vec<routing::Candidate>,
+    profiles: BTreeMap<String, Profile>,
+    agent: Option<(Profile, Duration)>,
+    postmortem_timeout: u64,
+}
+
+/// The run's routing's postmortem plan; none when it lists no profile.
+fn plan(config: &Config, record: &RunRecord) -> Option<Plan> {
+    let routing = config
+        .routing_of(&record.workspace, &record.team_key)
+        .ok()?;
+    let profiles: BTreeMap<String, Profile> = routing
+        .postmortems
+        .iter()
+        .map(|name| Some((name.clone(), config.profile(name).ok()?.clone())))
+        .collect::<Option<_>>()?;
+    if profiles.is_empty() {
+        return None;
+    }
+    let agent = routing.agent.as_deref().and_then(|name| {
+        let agent = config.profile(name).ok()?.clone();
+        let seconds = agent
+            .timeout_seconds
+            .unwrap_or(config.limits.routing_agent_timeout_seconds);
+        Some((agent, Duration::from_secs(seconds)))
+    });
+    Some(Plan {
+        candidates: routing::candidates(config, &routing.postmortems),
+        profiles,
+        agent,
+        postmortem_timeout: config.limits.postmortem_agent_timeout_seconds,
+    })
+}
+
+/// Picks the profile, with the routing agent when there are several, then
+/// has it write the postmortem.
+async fn write(
+    plan: Plan,
+    brief: String,
+    input: String,
+    path: Option<String>,
+    parent: std::path::PathBuf,
+) -> Written {
+    let choice = match (&plan.agent, &plan.candidates[..]) {
+        (Some((agent, timeout)), [_, _, ..]) => {
+            routing::choose(
+                agent,
+                routing::Pick::Postmortem,
+                &plan.candidates,
+                &brief,
+                *timeout,
+                path.as_deref(),
+                &parent,
+            )
+            .await
+        }
+        _ => Choice::Only(plan.candidates[0].name.clone()),
+    };
+    let name = choice.profile();
+    let profile = &plan.profiles[name];
+    let timeout = profile.timeout_seconds.unwrap_or(plan.postmortem_timeout);
+    let method = Method::new(name, profile, timeout);
+    let outcome = postmortem::write(&method, &input, path.as_deref(), &parent).await?;
+    Ok((method, choice.source(), outcome))
+}
 
 impl Reconciler {
     /// Posts the postmortems that answered and starts the ones due.
@@ -48,17 +123,8 @@ impl Reconciler {
             if self.writing.contains_key(&run.key) {
                 continue;
             }
-            let method = d
-                .config
-                .team(&record.workspace, &record.team_key)
-                .ok()
-                .and_then(|team| team.postmortem.clone())
-                .and_then(|name| Some((d.config.postmortems.get(&name)?.clone(), name)));
-            let profile = method
-                .as_ref()
-                .and_then(|(method, _)| d.config.profile(&method.profile).ok().cloned());
-            let (Some((method, name)), Some(profile)) = (method, profile) else {
-                // The team writes no postmortem.
+            let Some(plan) = plan(d.config, &record) else {
+                // The routing writes no postmortem.
                 let cleared = update_run(&run, move |r| {
                     if r.postmortem_due == Some(stage) {
                         r.postmortem_due = None;
@@ -74,13 +140,13 @@ impl Reconciler {
             let parent = std::env::temp_dir();
             let key = run.key.clone();
             let task = tokio::spawn(async move {
-                let input = tokio::task::spawn_blocking(move || {
-                    postmortem::input(&roots, &run, &record, stage)
+                let (brief, input) = tokio::task::spawn_blocking(move || {
+                    let brief = postmortem::brief(&run, &record, stage);
+                    let input = postmortem::input(&roots, &run, &record, &brief);
+                    (brief, input)
                 })
                 .await?;
-                let outcome =
-                    postmortem::write(&profile, &method, &input, path.as_deref(), &parent).await?;
-                Ok((name, method, outcome))
+                write(plan, brief, input, path, parent).await
             });
             self.writing.insert(key, (stage, task));
         }
@@ -101,7 +167,7 @@ impl Reconciler {
                 r.postmortem_due = None;
             }
         };
-        let (name, method, outcome) = match written {
+        let (method, picked, outcome) = match written {
             Ok(written) => written,
             Err(error) => {
                 d.log.line(&format!(
@@ -114,11 +180,12 @@ impl Reconciler {
             }
         };
         let at = now.to_string();
+        let told = format!("with the `{}` profile ({picked})", method.name);
         self.guarded(run, move |run, lock| {
-            postmortem::keep(run, stage, &name, &method, &outcome, &at)?;
+            postmortem::keep(run, stage, &method, &picked, &outcome, &at)?;
             run.update_held(lock, clear)?;
             let mut ops = vec![Op::Comment {
-                body: postmortem::comment(stage, &name, &method, &outcome.summary),
+                body: postmortem::comment(stage, &method, &outcome.summary),
             }];
             if !outcome.labels.is_empty() {
                 ops.push(Op::Labels {
@@ -129,7 +196,7 @@ impl Reconciler {
         })
         .await?;
         d.log.line(&format!(
-            "{}: wrote the {} postmortem",
+            "{}: wrote the {} postmortem {told}",
             run.key,
             stage.word()
         ));

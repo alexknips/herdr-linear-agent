@@ -151,6 +151,7 @@ client_id = "client-456"
 [workspaces.beta.teams.DATA]
 allowed_user_ids = ["user-2"]
 review_state = "Ready for review"
+routing = "default"
 "#;
 
 #[tokio::test]
@@ -422,7 +423,7 @@ async fn a_name_outside_the_candidates_falls_back_to_the_default() {
     assert_eq!(record.coordinator.profile, "coordinator");
     assert_eq!(
         record.routing_source,
-        "the default: the routing agent's answer was not valid (`deep` is not a candidate)"
+        "the first candidate: the routing agent's answer was not valid (`deep` is not a candidate)"
     );
 }
 
@@ -710,7 +711,7 @@ async fn a_stop_holds_every_prompt_until_the_next_reply() {
 
 #[tokio::test]
 async fn quiet_runs_get_a_heartbeat_and_long_ones_ask_to_go_on() {
-    let mut world = World::with(limit("run_timeout_hours", 1));
+    let mut world = World::with(limit("ask_to_continue_after_hours", 1));
     let pane = world.running_issue().await;
     world.later(2 * 3600);
     world.settle().await;
@@ -967,31 +968,47 @@ async fn a_detached_run_and_a_restarted_worker_keep_their_transcripts() {
     assert_eq!(lines_of(&copy), 1);
 }
 
-/// Gives team DATA the postmortem method `review` (labels `Improvement`
-/// and `postmortem/rework`), and a fake `claude` that answers routing with
-/// `coordinator` and a postmortem with `answer` (a JSON object), or fails
-/// it when `answer` is empty.
-fn postmortem_method(world: &mut World, answer: &str) {
+/// Adds the profile `name` (Claude, with a method in its `instructions.md`)
+/// as a postmortem candidate of the `default` routing.
+fn postmortem_profile(world: &World, name: &str) {
     let config = world.env.config_dir();
-    let method = config.join("postmortems/review");
-    std::fs::create_dir_all(&method).unwrap();
+    let folder = config.join("profiles").join(name);
+    std::fs::create_dir_all(&folder).unwrap();
     std::fs::write(
-        method.join("config.toml"),
-        "profile = \"router\"\nlabels = [\"Improvement\", \"postmortem/rework\"]\n",
+        folder.join("config.toml"),
+        "kind = \"claude\"\nmodel = \"haiku\"\ndescription = \"reviews runs\"\n",
     )
     .unwrap();
     std::fs::write(
-        method.join("instructions.md"),
+        folder.join("instructions.md"),
         "Say what went well and what to change.\n",
     )
     .unwrap();
     let text = std::fs::read_to_string(config.join("config.toml")).unwrap();
-    let text = text.replacen(
-        "allowed_user_ids = [\"user-1\"]",
-        "allowed_user_ids = [\"user-1\"]\npostmortem = \"review\"",
-        1,
-    );
+    let text = if text.contains("postmortems = [") {
+        text.replacen(
+            "postmortems = [",
+            &format!("postmortems = [\"{name}\", "),
+            1,
+        )
+    } else {
+        text.replacen(
+            "workers = [\"standard\", \"deep\"]",
+            &format!("workers = [\"standard\", \"deep\"]\npostmortems = [\"{name}\"]"),
+            1,
+        )
+    };
     std::fs::write(config.join("config.toml"), text).unwrap();
+}
+
+/// Gives the `default` routing the postmortem profile `review` (labels
+/// `Improvement` and `postmortem/rework`), and a fake `claude` that answers
+/// routing with `routing` (a JSON object) and a postmortem with `answer`,
+/// or fails it when `answer` is empty.
+/// A `review` postmortem profile, and a routing agent that picks the
+/// `coordinator` profile and the `pick` postmortem profile.
+fn postmortem_method(world: &mut World, pick: &str, answer: &str) {
+    postmortem_profile(world, "review");
     world.reload_config();
     let postmortem = if answer.is_empty() {
         "exit 1".to_string()
@@ -999,9 +1016,18 @@ fn postmortem_method(world: &mut World, answer: &str) {
         format!("echo '{{\"structured_output\":{answer}}}'")
     };
     world.router(&format!(
-        "cat > /dev/null\ncase \"$*\" in\n  *'# Method'*) {postmortem} ;;\n  *) echo '{{\"structured_output\":{{\"coordinator\":\"coordinator\"}}}}' ;;\nesac\n"
+        "cat > /dev/null\ncase \"$*\" in\n  *'# Method'*) {postmortem} ;;\n  *'postmortem profile'*) echo '{{\"structured_output\":{{\"postmortem\":\"{pick}\"}}}}' ;;\n  *) echo '{{\"structured_output\":{{\"coordinator\":\"coordinator\"}}}}' ;;\nesac\n"
     ));
     world.fake().labels = vec!["Improvement".into(), "postmortem/rework".into()];
+}
+
+fn version_of(world: &World, name: &str) -> String {
+    crate::postmortem::Method::new(
+        name,
+        world.config.profile(name).unwrap(),
+        world.config.limits.postmortem_agent_timeout_seconds,
+    )
+    .version
 }
 
 fn posted(world: &World) -> Vec<String> {
@@ -1018,6 +1044,7 @@ async fn a_finish_and_a_close_each_get_one_postmortem_comment() {
     let mut world = World::sample();
     postmortem_method(
         &mut world,
+        "review",
         r#"{"summary":"It went well.","labels":["Improvement","Bogus"]}"#,
     );
     world.running_issue().await;
@@ -1025,7 +1052,7 @@ async fn a_finish_and_a_close_each_get_one_postmortem_comment() {
         .await
         .unwrap();
     world.settle().await;
-    let version = world.config.postmortems["review"].version.clone();
+    let version = version_of(&world, "review");
     assert_eq!(
         posted(&world),
         [format!(
@@ -1067,7 +1094,75 @@ async fn a_finish_and_a_close_each_get_one_postmortem_comment() {
         "{log}"
     );
     assert!(
-        log.contains("acme/DATA-1: wrote the final postmortem"),
+        log.contains(
+            "acme/DATA-1: wrote the final postmortem with the `review` profile (the only candidate)"
+        ),
+        "{log}"
+    );
+}
+
+#[tokio::test]
+async fn a_routing_with_one_candidate_each_asks_no_routing_agent() {
+    let mut world = World::sample();
+    postmortem_profile(&world, "review");
+    let config = world.env.config_dir().join("config.toml");
+    let text = std::fs::read_to_string(&config).unwrap()
+        + "\n[routing.solo]\ncoordinators = [\"coordinator-light\"]\npostmortems = [\"review\"]\nworkers = [\"standard\"]\n";
+    let text = text.replacen("routing = \"default\"", "routing = \"solo\"", 1);
+    std::fs::write(&config, text).unwrap();
+    world.reload_config();
+    // A routing call fails; only the postmortem itself answers.
+    world.router(
+        "cat > /dev/null\ncase \"$*\" in\n  *'# Method'*) echo '{\"structured_output\":{\"summary\":\"Fine.\",\"labels\":[]}}' ;;\n  *) exit 1 ;;\nesac\n",
+    );
+    world.delegate(KEY, "Small", None);
+    world.settle().await;
+    let record = world.record(KEY);
+    assert_eq!(
+        (
+            record.coordinator.profile.as_str(),
+            record.routing_source.as_str()
+        ),
+        ("coordinator-light", "the only candidate")
+    );
+    assert_eq!(
+        world.bodies(KEY, "thought")[1..],
+        ["The coordinator uses the `coordinator-light` profile (the only candidate)."]
+    );
+    commands::finish(&world.ctx(), &world.session(), KEY, "Done.")
+        .await
+        .unwrap();
+    world.settle().await;
+    assert_eq!(posted(&world).len(), 1);
+    let log = world.log_text();
+    assert!(
+        log.contains("acme/DATA-1: wrote the interim postmortem with the `review` profile (the only candidate)"),
+        "{log}"
+    );
+}
+
+#[tokio::test]
+async fn the_routing_agent_picks_among_postmortem_profiles_and_that_one_writes() {
+    let mut world = World::sample();
+    postmortem_profile(&world, "quick");
+    postmortem_method(&mut world, "quick", r#"{"summary":"Short.","labels":[]}"#);
+    world.running_issue().await;
+    commands::finish(&world.ctx(), &world.session(), KEY, "Done.")
+        .await
+        .unwrap();
+    world.settle().await;
+    let version = version_of(&world, "quick");
+    assert_eq!(
+        posted(&world),
+        [format!(
+            "**Postmortem (interim)**, method `quick` version `{version}`\n\nShort."
+        )]
+    );
+    let log = world.log_text();
+    assert!(
+        log.contains(
+            "wrote the interim postmortem with the `quick` profile (chosen by the routing agent)"
+        ),
         "{log}"
     );
 }
@@ -1075,7 +1170,7 @@ async fn a_finish_and_a_close_each_get_one_postmortem_comment() {
 #[tokio::test]
 async fn a_failed_postmortem_is_logged_and_not_tried_again() {
     let mut world = World::sample();
-    postmortem_method(&mut world, "");
+    postmortem_method(&mut world, "review", "");
     world.running_issue().await;
     commands::finish(&world.ctx(), &world.session(), KEY, "Done.")
         .await
@@ -1871,7 +1966,7 @@ async fn a_waiting_self_report_wakes_the_ticker_when_it_expires() {
 
 #[tokio::test]
 async fn a_routing_agent_that_never_reads_its_input_times_out() {
-    let mut world = World::with(|c| c.replace("timeout_seconds = 60", "timeout_seconds = 1"));
+    let mut world = World::with(limit("routing_agent_timeout_seconds", 1));
     world.router("sleep 30\n");
     world.delegate(KEY, "Huge", None);
     world.fake().issue_mut("DATA-1")["description"] = json!("x".repeat(1 << 20));
@@ -1882,7 +1977,10 @@ async fn a_routing_agent_that_never_reads_its_input_times_out() {
             routed.coordinator.profile.as_str(),
             routed.routing_source.as_str()
         ),
-        ("coordinator", "the default: the routing agent timed out")
+        (
+            "coordinator",
+            "the first candidate: the routing agent timed out"
+        )
     );
 }
 

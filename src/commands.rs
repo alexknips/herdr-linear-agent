@@ -375,7 +375,8 @@ pub async fn worker_start<H: Herdr>(
 ) -> Result<Worker> {
     let (config, run, record) = load_active(ctx, key).await?;
     let repo = config.repository(&args.repo)?.clone();
-    let profile = config.worker_profile(&args.profile)?.clone();
+    let routing = config.routing_of(&record.workspace, &record.team_key)?;
+    let profile = config.worker_profile(routing, &args.profile)?.clone();
     let limits = config.limits;
     check_room(&worker::list(&run), &args.repo, limits)?;
     check_agents(ctx, limits)?;
@@ -592,7 +593,13 @@ pub async fn worker_restart<H: Herdr>(
         );
     }
     let (profile_name, profile) = match profile {
-        Some(name) => (name.to_string(), config.worker_profile(name)?.clone()),
+        Some(name) => {
+            let routing = config.routing_of(&record.workspace, &record.team_key)?;
+            (
+                name.to_string(),
+                config.worker_profile(routing, name)?.clone(),
+            )
+        }
         None => (
             w.agent.profile.clone(),
             config.profile(&w.agent.profile)?.clone(),
@@ -771,6 +778,7 @@ mod tests {
                     issue_id: "issue-1".into(),
                     title: "Fix the login".into(),
                     url: "https://linear.app/acme/issue/DATA-1".into(),
+                    team_key: "DATA".into(),
                     ..RunRecord::default()
                 },
             )

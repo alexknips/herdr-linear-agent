@@ -1,9 +1,10 @@
 //! Postmortems: when the coordinator calls `finish` (interim) and when the
 //! run closes (final), an agent reads the run and writes a summary for the
-//! issue, following the method of the run's team, with labels from the
-//! method's list. It runs headless the way the routing agent does, with the
-//! run's records on standard input; the plugin posts the comment and the
-//! labels, so the agent holds no Linear credential.
+//! issue. The agent is a profile its team's routing picks when it is
+//! written; its `instructions.md` is the method, which also says which labels to add.
+//! It runs headless the way the routing agent does, with the run's records
+//! on standard input; the plugin posts the comment and adds the labels that
+//! exist in Linear, so the agent holds no Linear credential.
 
 use std::path::Path;
 use std::time::Duration;
@@ -12,7 +13,9 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::config::{Postmortem, Profile};
+use sha2::Digest;
+
+use crate::config::Profile;
 use crate::routing::{self, Ask, Fallback};
 use crate::run::{Run, RunRecord};
 use crate::transcript::{self, Roots};
@@ -20,6 +23,53 @@ use crate::worker;
 
 /// Characters of rendered transcripts one postmortem reads at most.
 const TRANSCRIPT_BUDGET: usize = 150_000;
+
+/// A postmortem's agent: a profile, and how long it may take.
+#[derive(Debug, Clone)]
+pub struct Method {
+    /// The profile's name.
+    pub name: String,
+    pub profile: Profile,
+    pub timeout_seconds: u64,
+    /// The first 12 hex digits of a SHA-256 over what makes the method: the
+    /// profile's kind, model, effort, arguments and instructions. Told in
+    /// each comment, so methods can be told apart.
+    pub version: String,
+}
+
+impl Method {
+    pub fn new(name: &str, profile: &Profile, timeout_seconds: u64) -> Method {
+        let mut hash = sha2::Sha256::new();
+        let parts = [
+            profile.kind.clone(),
+            profile.model.clone().unwrap_or_default(),
+            profile.effort.clone().unwrap_or_default(),
+            profile.args.join("\u{1f}"),
+            text_of(profile),
+        ];
+        for part in parts {
+            hash.update(part.as_bytes());
+            hash.update([0]);
+        }
+        let digest: [u8; 32] = hash.finalize().into();
+        Method {
+            name: name.to_string(),
+            profile: profile.clone(),
+            timeout_seconds,
+            version: digest.iter().take(6).map(|b| format!("{b:02x}")).collect(),
+        }
+    }
+}
+
+/// A profile's instructions, every layer of its base chain in order.
+fn text_of(profile: &Profile) -> String {
+    profile
+        .instructions
+        .iter()
+        .map(|i| i.text.trim())
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -39,46 +89,26 @@ impl Stage {
     }
 }
 
-/// What the agent answered, its labels kept to the method's list.
+/// What the agent answered.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Outcome {
     pub summary: String,
     pub labels: Vec<String>,
 }
 
-fn schema(labels: &[String]) -> Value {
-    let items = if labels.is_empty() {
-        json!({ "type": "string" })
-    } else {
-        json!({ "type": "string", "enum": labels })
-    };
-    let max = if labels.is_empty() {
-        json!(0)
-    } else {
-        json!(labels.len())
-    };
+fn schema() -> Value {
     json!({
         "type": "object",
         "properties": {
             "summary": { "type": "string", "minLength": 1 },
-            "labels": { "type": "array", "items": items, "maxItems": max }
+            "labels": { "type": "array", "items": { "type": "string" } }
         },
         "required": ["summary", "labels"],
         "additionalProperties": false
     })
 }
 
-fn instructions(method: &Postmortem) -> String {
-    let labels = if method.labels.is_empty() {
-        "none; answer with an empty list".to_string()
-    } else {
-        method
-            .labels
-            .iter()
-            .map(|l| format!("`{l}`"))
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
+fn instructions(method: &Method) -> String {
     format!(
         "You review one run of herdr-linear-agent, a Herdr plugin in which a coordinator agent \
          and worker agents work on a Linear issue. The purpose is to improve, run after run, how \
@@ -92,10 +122,12 @@ fn instructions(method: &Postmortem) -> String {
          issue, in the language of the issue. Begin it with how the run stands, from the \
          records' Stage line: for a final postmortem, the state the issue closed in (for \
          example Done or Canceled); for an interim one, that the work waits for people's \
-         review. Pick labels only from this list: {labels}.\n\n\
+         review. As `labels`, give the labels the method says to add, by their names in \
+         Linear (`Label`, or `Group/Label` for a label in a group); an empty list when it names \
+         none.\n\n\
          Answer only with JSON: `summary` (the comment's text) and `labels`.\n\n\
          # Method\n\n{}",
-        method.instructions.trim()
+        text_of(&method.profile)
     )
 }
 
@@ -114,8 +146,9 @@ fn clip(text: &str, budget: usize) -> String {
     )
 }
 
-/// The run's records for the postmortem at `stage`.
-pub fn input(roots: &Roots, run: &Run, record: &RunRecord, stage: Stage) -> String {
+/// The run's records for the postmortem at `stage`, without the agents'
+/// transcripts: what the routing agent picks a postmortem profile from.
+pub fn brief(run: &Run, record: &RunRecord, stage: Stage) -> String {
     let read = |path: std::path::PathBuf| std::fs::read_to_string(path).unwrap_or_default();
     let workers = worker::list(run);
     let mut text = format!(
@@ -179,6 +212,14 @@ pub fn input(roots: &Roots, run: &Run, record: &RunRecord, stage: Stage) -> Stri
             }
         ));
     }
+    text
+}
+
+/// The run's records for the postmortem agent: `brief`, then the agents'
+/// transcripts.
+pub fn input(roots: &Roots, run: &Run, record: &RunRecord, brief: &str) -> String {
+    let mut text = brief.to_string();
+    let workers = worker::list(run);
     let mut agents = vec![("coordinator".to_string(), record.coordinator.clone())];
     agents.extend(workers.iter().map(|w| (w.id.clone(), w.agent.clone())));
     let mut transcripts = Vec::new();
@@ -206,10 +247,11 @@ pub fn input(roots: &Roots, run: &Run, record: &RunRecord, stage: Stage) -> Stri
 }
 
 /// The comment the plugin posts.
-pub fn comment(stage: Stage, name: &str, method: &Postmortem, summary: &str) -> String {
+pub fn comment(stage: Stage, method: &Method, summary: &str) -> String {
     format!(
-        "**Postmortem ({})**, method `{name}` version `{}`\n\n{}",
+        "**Postmortem ({})**, method `{}` version `{}`\n\n{}",
         stage.word(),
+        method.name,
         method.version,
         summary.trim()
     )
@@ -217,15 +259,14 @@ pub fn comment(stage: Stage, name: &str, method: &Postmortem, summary: &str) -> 
 
 /// Runs the method's agent on the run's records.
 pub async fn write(
-    profile: &Profile,
-    method: &Postmortem,
+    method: &Method,
     input: &str,
     path_var: Option<&str>,
     parent: &Path,
 ) -> Result<Outcome> {
     let call = Ask {
-        profile,
-        schema: &schema(&method.labels),
+        profile: &method.profile,
+        schema: &schema(),
         instructions: &instructions(method),
         input,
         timeout: Duration::from_secs(method.timeout_seconds),
@@ -245,14 +286,14 @@ pub async fn write(
         .filter(|s| !s.trim().is_empty())
         .context("the answer has no summary")?
         .to_string();
-    let labels = answer["labels"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-        .filter(|l| method.labels.iter().any(|allowed| allowed == l))
-        .map(str::to_string)
-        .collect();
+    let mut labels: Vec<String> = Vec::new();
+    for label in answer["labels"].as_array().into_iter().flatten() {
+        if let Some(label) = label.as_str().map(str::trim).filter(|l| !l.is_empty())
+            && !labels.iter().any(|known| known == label)
+        {
+            labels.push(label.to_string());
+        }
+    }
     Ok(Outcome { summary, labels })
 }
 
@@ -261,8 +302,8 @@ pub async fn write(
 pub fn keep(
     run: &Run,
     stage: Stage,
-    name: &str,
-    method: &Postmortem,
+    method: &Method,
+    picked: &str,
     outcome: &Outcome,
     at: &str,
 ) -> Result<()> {
@@ -272,7 +313,8 @@ pub fn keep(
     let record = json!({
         "stage": stage,
         "at": at,
-        "method": name,
+        "method": method.name,
+        "picked": picked,
         "version": method.version,
         "summary": outcome.summary,
         "labels": outcome.labels,
@@ -294,13 +336,12 @@ mod tests {
             ..RunRecord::default()
         };
         let run = Run::create(dir.path(), record.clone()).unwrap();
-        let roots = Roots::from_env(&crate::paths::Env::for_test(dir.path(), &[]));
-        let text = input(&roots, &run, &record, Stage::Final);
+        let text = brief(&run, &record, Stage::Final);
         assert!(
             text.contains("- Stage: final: the issue is Canceled, so the run is closed\n"),
             "{text}"
         );
-        let interim = input(&roots, &run, &record, Stage::Interim);
+        let interim = brief(&run, &record, Stage::Interim);
         assert!(
             interim.contains("- Stage: interim: the coordinator called `finish`"),
             "{interim}"
@@ -309,13 +350,27 @@ mod tests {
 
     #[test]
     fn the_frame_asks_to_begin_with_how_the_run_stands() {
-        let method = Postmortem {
-            profile: "router".into(),
-            labels: vec!["Improvement".into()],
-            timeout_seconds: 300,
-            instructions: "Say what went well.".into(),
-            version: "0123456789ab".into(),
+        let profile = Profile {
+            kind: "claude".into(),
+            model: None,
+            effort: None,
+            args: Vec::new(),
+            description: String::new(),
+            instructions: vec![crate::config::Instructions {
+                profile: "postmortem".into(),
+                text: "Say what went well.\n".into(),
+            }],
+            env: Default::default(),
+            timeout_seconds: None,
         };
+        let method = Method::new("postmortem", &profile, 300);
+        assert_eq!(method.version.len(), 12);
+        let mut changed = profile.clone();
+        changed.instructions[0].text = "Say what to change.\n".into();
+        assert_ne!(
+            Method::new("postmortem", &changed, 300).version,
+            method.version
+        );
         let text = instructions(&method);
         assert!(
             text.contains("Begin it with how the run stands, from the records' Stage line: for a final postmortem, the state the issue closed in"),
@@ -335,15 +390,5 @@ mod tests {
             "{clipped}"
         );
         assert_eq!(clip("short", 30), "short");
-    }
-
-    #[test]
-    fn the_schema_allows_only_the_methods_labels() {
-        let labels = vec!["Improvement".to_string(), "postmortem/rework".to_string()];
-        assert_eq!(
-            schema(&labels)["properties"]["labels"]["items"]["enum"],
-            json!(["Improvement", "postmortem/rework"])
-        );
-        assert_eq!(schema(&[])["properties"]["labels"]["maxItems"], json!(0));
     }
 }

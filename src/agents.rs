@@ -93,6 +93,7 @@ mod tests {
             description: String::new(),
             instructions: Vec::new(),
             env: Default::default(),
+            timeout_seconds: None,
         }
     }
 

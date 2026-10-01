@@ -305,3 +305,17 @@ With a build of the branch in the default Herdr session, the THLA team given the
 After the frame named `say`, `ask` and `finish` (a build of `f03b1ed`), THLA-23, the same kind of issue, got an interim summary 56 s after the pick-up that said the coordinator read the issue, found no change was needed and finished in 40 s, and no label; after the cancel, a final one 10 s after the close that said the run went well. So the replies are no longer missed. The final one called the canceled run completed, since its input said only "completed or canceled": the run now keeps the state it closed in (`closed_state`), and the final input names it (`final: the issue is Canceled, so the run is closed`).
 
 With a build of `2ba09e0`, THLA-24's run kept `closed_state = "Canceled"`, but its final summary began "THLA-24 live check completed successfully." and did not say the issue was canceled: the state was in the input, and the summary's wording was left to the agent. The frame now asks every summary to begin with how the run stands. With that build, THLA-25's interim summary began with the stage (`interim: the coordinator called `finish`; people may still ask for changes.`, close to the input's words), and its final one, 37 s after the cancel, began `**Status:** Verification run closed—issue Canceled.`
+
+## Routing per team (2026-10-01)
+
+The config was moved to the new format: `[routing.default]` with the routing agent `router` (Claude Haiku), `coordinators = ["coordinator", "coordinator-docs"]`, `postmortems = ["review", "review-brief"]` and `workers = ["worker"]`; both THLA teams name it with `routing = "default"`, and `run_timeout_hours` became `limits.ask_to_continue_after_hours`. The method of the old `postmortems/review` became the profile `profiles/review` ("Reviews runs that changed code or opened pull requests"), and `profiles/review-brief` ("Reviews runs that ended with no change") was added. The ticker of the previous build logged that the new config does not load and kept its own.
+
+With a build of the branch in the default Herdr session, THLA-26 asked for no change:
+
+| Step | Result |
+| --- | --- |
+| Coordinator | picked up 6 s after the delegation reached the ticker; the record kept `coordinator` with `routing_source = "chosen by the routing agent"` |
+| Interim | the coordinator called `finish` about 60 s later; the routing agent read the brief and picked `review-brief`, logged as `wrote the interim postmortem with the `review-brief` profile (chosen by the routing agent)`; the comment `**Postmortem (interim)**, method `review-brief` version `04a55ce8444c`` was posted, and the kept JSON had `picked = "chosen by the routing agent"` |
+| Final | canceling the issue closed the run; 21 s later the routing agent picked again, `review-brief` wrote the final postmortem, and its summary began `Closed as Canceled.` |
+
+A routing with one candidate each, which asks no routing agent, was checked with the scenario tests only.

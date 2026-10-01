@@ -739,12 +739,14 @@ mod tests {
             assert!(notes[0].starts_with("The config changed but does not load: "));
             assert!(notes[1].starts_with("The config was not reloaded: "));
         }
-        let fixed =
-            crate::config::tests::SAMPLE.replace("timeout_seconds = 60", "timeout_seconds = 90");
+        let fixed = crate::config::tests::SAMPLE.replace(
+            "workers = [\"standard\", \"deep\"]",
+            "workers = [\"standard\"]",
+        );
         std::fs::write(&path, fixed).unwrap();
         std::fs::write(reload_path(state.path()), "").unwrap();
         let (config, _) = tokio::time::timeout(POLL * 50, watch).await.unwrap();
-        assert_eq!(config.routing.timeout_seconds, 90);
+        assert_eq!(config.routing["default"].workers, ["standard"]);
         let text = std::fs::read_to_string(state.path().join("ticker.log")).unwrap();
         assert_eq!(text.matches("config reload failed: ").count(), 1);
     }

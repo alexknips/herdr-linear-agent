@@ -257,7 +257,12 @@ pub fn digest(
         text.push('\n');
     }
     text.push_str("\n## Worker profiles\n\n");
-    for name in &config.routing.workers {
+    // A team no longer in the config has no worker profiles.
+    let workers = config
+        .routing_of(&record.workspace, &record.team_key)
+        .map(|r| r.workers.clone())
+        .unwrap_or_default();
+    for name in &workers {
         let Ok(profile) = config.profile(name) else {
             continue;
         };

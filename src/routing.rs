@@ -1,18 +1,18 @@
-//! Coordinator routing: a routing agent, run headless and with no context,
-//! picks each issue's coordinator profile from the candidates the config
-//! lists.
+//! Routing: a team's routing picks each issue's coordinator and postmortem
+//! profiles from the candidates it lists. A pick with one candidate is that
+//! candidate; for several, a routing agent, run headless and with no
+//! context, picks.
 //!
-//! The agent may only answer a name from a fixed enum, so whatever the issue
-//! text says, the profile it leads to is one the config names. Anything else
-//! (a timeout, an answer outside the schema, a name outside the list) falls
-//! back to `routing.default`.
+//! The agent may only answer names from fixed enums, so whatever the issue
+//! text says, the profiles it leads to are ones the config names. Anything
+//! else (a timeout, an answer outside the schema, a name outside the list)
+//! falls back to the first candidate.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
@@ -34,17 +34,16 @@ fn call_env<'a>(
         .chain(invocation.env.iter().map(|(k, v)| (k, v)))
 }
 
-/// A coordinator profile the routing agent may pick.
+/// A profile the routing agent may pick.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Candidate {
     pub name: String,
     pub description: String,
 }
 
-pub fn candidates(config: &Config) -> Vec<Candidate> {
-    config
-        .routing
-        .coordinators
+/// `names` as candidates, with their profiles' descriptions.
+pub fn candidates(config: &Config, names: &[String]) -> Vec<Candidate> {
+    names
         .iter()
         .map(|name| Candidate {
             name: name.clone(),
@@ -57,13 +56,34 @@ pub fn candidates(config: &Config) -> Vec<Candidate> {
         .collect()
 }
 
-/// The routing decision and where it came from.
+/// What a routing picks.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Pick {
+    /// A run's coordinator, at the pick-up.
+    Coordinator,
+    /// A postmortem's profile, when it is written.
+    Postmortem,
+}
+
+impl Pick {
+    /// The answer's one key.
+    fn key(self) -> &'static str {
+        match self {
+            Pick::Coordinator => "coordinator",
+            Pick::Postmortem => "postmortem",
+        }
+    }
+}
+
+/// One pick of a routing and where it came from.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Choice {
+    /// The only candidate: no routing agent was asked.
+    Only(String),
     /// The routing agent picked this candidate.
     Agent(String),
-    /// `routing.default`, because the agent gave no valid answer.
-    Default(Fallback),
+    /// The first candidate, because the agent gave no valid answer.
+    Default(String, Fallback),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -76,48 +96,54 @@ pub enum Fallback {
 }
 
 impl Choice {
-    pub fn profile<'a>(&'a self, config: &'a Config) -> &'a str {
+    pub fn profile(&self) -> &str {
         match self {
-            Choice::Agent(name) => name,
-            Choice::Default(_) => &config.routing.default,
+            Choice::Only(name) | Choice::Agent(name) | Choice::Default(name, _) => name,
         }
     }
 
     /// Where the profile came from, for the Linear thought and the record.
     pub fn source(&self) -> String {
         match self {
+            Choice::Only(_) => "the only candidate".into(),
             Choice::Agent(_) => "chosen by the routing agent".into(),
-            Choice::Default(Fallback::TimedOut) => {
-                "the default: the routing agent timed out".into()
+            Choice::Default(_, Fallback::TimedOut) => {
+                "the first candidate: the routing agent timed out".into()
             }
-            Choice::Default(Fallback::Invalid(why)) => {
-                format!("the default: the routing agent's answer was not valid ({why})")
+            Choice::Default(_, Fallback::Invalid(why)) => {
+                format!("the first candidate: the routing agent's answer was not valid ({why})")
             }
-            Choice::Default(Fallback::Failed(why)) => {
-                format!("the default: the routing agent failed ({why})")
+            Choice::Default(_, Fallback::Failed(why)) => {
+                format!("the first candidate: the routing agent failed ({why})")
             }
         }
     }
 }
 
 /// The answer's JSON Schema: one candidate name.
-pub fn schema(candidates: &[Candidate]) -> Value {
+pub fn schema(pick: Pick, candidates: &[Candidate]) -> Value {
     let names: Vec<&str> = candidates.iter().map(|c| c.name.as_str()).collect();
     json!({
         "type": "object",
-        "properties": { "coordinator": { "type": "string", "enum": names } },
-        "required": ["coordinator"],
+        "properties": { pick.key(): { "type": "string", "enum": names } },
+        "required": [pick.key()],
         "additionalProperties": false
     })
 }
 
-/// The fixed instruction the agent runs with. The issue arrives on standard
-/// input, never in an argument.
-pub fn instructions(candidates: &[Candidate]) -> String {
-    let mut text = String::from(
-        "Pick the coordinator profile that fits the software task on standard input: a Linear issue. \
-         Answer with JSON of the form {\"coordinator\": \"<name>\"}, where <name> is one of these profiles:\n",
-    );
+/// The fixed instruction the agent runs with. What it picks for arrives on
+/// standard input, never in an argument.
+pub fn instructions(pick: Pick, candidates: &[Candidate]) -> String {
+    let mut text = String::from(match pick {
+        Pick::Coordinator => {
+            "Pick the coordinator profile that fits the software task on standard input: a Linear issue. \
+             Answer with JSON of the form {\"coordinator\": \"<name>\"}, where <name> is one of these profiles:\n"
+        }
+        Pick::Postmortem => {
+            "Pick the postmortem profile that fits the run on standard input, a run of herdr-linear-agent on a Linear issue: it reviews the run to improve how the agents work. \
+             Answer with JSON of the form {\"postmortem\": \"<name>\"}, where <name> is one of these profiles:\n"
+        }
+    });
     for c in candidates {
         let about = c.description.replace('\n', " ");
         let about = if about.trim().is_empty() {
@@ -163,21 +189,24 @@ pub fn input(issue: &IssueDetail) -> String {
 
 /// The candidate an answer names, checked against the same schema whatever
 /// the kind already enforced.
-pub fn pick(answer: &Value, candidates: &[Candidate]) -> Result<String, String> {
-    #[derive(Deserialize)]
-    #[serde(deny_unknown_fields)]
-    struct Answer {
-        coordinator: String,
-    }
-    // Serde would also accept `["name"]` for a struct.
-    if !answer.is_object() {
+pub fn picked(answer: &Value, pick: Pick, candidates: &[Candidate]) -> Result<String, String> {
+    // Serde would also accept `["name"]` for a map.
+    let Some(answer) = answer.as_object() else {
         return Err("not a JSON object".into());
+    };
+    let key = pick.key();
+    if let Some(other) = answer.keys().find(|k| *k != key) {
+        return Err(format!("unknown field `{other}`, expected `{key}`"));
     }
-    let Answer { coordinator } = Answer::deserialize(answer).map_err(|e| e.to_string())?;
-    if candidates.iter().any(|c| c.name == coordinator) {
-        Ok(coordinator)
+    let name = match answer.get(key) {
+        Some(Value::String(name)) => name,
+        Some(other) => return Err(format!("`{key}` is not a string: {other}")),
+        None => return Err(format!("missing field `{key}`")),
+    };
+    if candidates.iter().any(|c| &c.name == name) {
+        Ok(name.clone())
     } else {
-        Err(format!("`{coordinator}` is not a candidate"))
+        Err(format!("`{name}` is not a candidate"))
     }
 }
 
@@ -532,43 +561,42 @@ fn plain_answer(text: &str) -> Option<Value> {
     serde_json::from_str(text.trim()).ok()
 }
 
-/// Runs the routing agent once and returns its choice, or the default with
-/// the reason. `parent` holds the call's temporary folder.
+/// Runs the routing agent once and returns its pick, or the first candidate
+/// with the reason. `parent` holds the call's temporary folder.
 pub async fn choose(
     profile: &Profile,
+    pick: Pick,
     candidates: &[Candidate],
-    issue: &IssueDetail,
+    input: &str,
     timeout: Duration,
     path_var: Option<&str>,
     parent: &Path,
 ) -> Choice {
-    match run(profile, candidates, issue, timeout, path_var, parent).await {
-        Ok(Ok(name)) => Choice::Agent(name),
-        Ok(Err(fallback)) => Choice::Default(fallback),
-        Err(error) => Choice::Default(Fallback::Failed(format!("{error:#}"))),
-    }
-}
-
-async fn run(
-    profile: &Profile,
-    candidates: &[Candidate],
-    issue: &IssueDetail,
-    timeout: Duration,
-    path_var: Option<&str>,
-    parent: &Path,
-) -> Result<Result<String, Fallback>> {
     let call = Ask {
         profile,
-        schema: &schema(candidates),
-        instructions: &instructions(candidates),
-        input: &input(issue),
+        schema: &schema(pick, candidates),
+        instructions: &instructions(pick, candidates),
+        input,
         timeout,
         path_var,
         parent,
         role: "routing",
     };
-    let answer = ask(&call).await?;
-    Ok(answer.and_then(|answer| pick(&answer, candidates).map_err(Fallback::Invalid)))
+    let picked = match ask(&call).await {
+        Ok(Ok(answer)) => picked(&answer, pick, candidates).map_err(Fallback::Invalid),
+        Ok(Err(fallback)) => Err(fallback),
+        Err(error) => Err(Fallback::Failed(format!("{error:#}"))),
+    };
+    match picked {
+        Ok(name) => Choice::Agent(name),
+        Err(fallback) => Choice::Default(
+            candidates
+                .first()
+                .map(|c| c.name.clone())
+                .unwrap_or_default(),
+            fallback,
+        ),
+    }
 }
 
 /// One headless call of a profile's kind, run the way the routing agent is.
@@ -739,6 +767,7 @@ mod tests {
             description: String::new(),
             instructions: Vec::new(),
             env: BTreeMap::new(),
+            timeout_seconds: None,
         }
     }
 
@@ -802,8 +831,9 @@ mod tests {
             let path = self.path();
             choose(
                 &profile(kind),
+                Pick::Coordinator,
                 &two(),
-                &issue(),
+                &input(&issue()),
                 timeout,
                 Some(&path),
                 &self.parent(),
@@ -864,7 +894,7 @@ mod tests {
             let fake = Fake::new("claude", answer);
             assert_eq!(
                 fake.choose("claude", Duration::from_secs(10)).await,
-                Choice::Default(expected),
+                Choice::Default("coordinator".into(), expected),
                 "{answer}"
             );
         }
@@ -872,13 +902,13 @@ mod tests {
         std::fs::write(slow.dir.path().join("bin/claude"), "#!/bin/sh\nsleep 30\n").unwrap();
         assert_eq!(
             slow.choose("claude", Duration::from_millis(300)).await,
-            Choice::Default(Fallback::TimedOut)
+            Choice::Default("coordinator".into(), Fallback::TimedOut)
         );
         let missing = Fake::new("claude", PICKS_DOCS);
         std::fs::remove_file(missing.dir.path().join("bin/claude")).unwrap();
         assert!(matches!(
             missing.choose("claude", Duration::from_secs(10)).await,
-            Choice::Default(Fallback::Failed(_))
+            Choice::Default(_, Fallback::Failed(_))
         ));
     }
 
@@ -1023,8 +1053,9 @@ mod tests {
             let started = std::time::Instant::now();
             let choice = choose(
                 &p,
+                Pick::Coordinator,
                 &two(),
-                &issue(),
+                &input(&issue()),
                 Duration::from_secs(120),
                 std::env::var("PATH").ok().as_deref(),
                 parent.path(),
@@ -1112,8 +1143,9 @@ mod tests {
         };
         choose(
             &p,
+            Pick::Coordinator,
             &two(),
-            &issue(),
+            &input(&issue()),
             Duration::from_secs(10),
             Some(&path),
             &fake.parent(),
@@ -1130,7 +1162,7 @@ mod tests {
     #[test]
     fn the_schema_and_the_answer_check_agree() {
         assert_eq!(
-            schema(&two()),
+            schema(Pick::Coordinator, &two()),
             json!({
                 "type": "object",
                 "properties": { "coordinator": { "type": "string", "enum": ["coordinator", "docs"] } },
@@ -1139,12 +1171,34 @@ mod tests {
             })
         );
         assert_eq!(
-            pick(&json!({"coordinator": "docs"}), &two()),
-            Ok("docs".into())
+            schema(Pick::Postmortem, &two())["required"],
+            json!(["postmortem"])
         );
         assert_eq!(
-            pick(&json!(["docs"]), &two()),
-            Err("not a JSON object".into())
+            picked(&json!({"coordinator": "docs"}), Pick::Coordinator, &two()),
+            Ok("docs".into())
+        );
+        for (answer, pick, why) in [
+            (json!(["docs"]), Pick::Coordinator, "not a JSON object"),
+            (
+                json!({"coordinator": "docs"}),
+                Pick::Postmortem,
+                "unknown field `coordinator`, expected `postmortem`",
+            ),
+            (json!({}), Pick::Postmortem, "missing field `postmortem`"),
+            (
+                json!({"postmortem": 1}),
+                Pick::Postmortem,
+                "`postmortem` is not a string: 1",
+            ),
+        ] {
+            assert_eq!(picked(&answer, pick, &two()), Err(why.into()), "{answer}");
+        }
+        let text = instructions(Pick::Postmortem, &two());
+        assert!(
+            text.starts_with("Pick the postmortem profile that fits the run on standard input")
+                && text.contains("- docs: documentation changes\n"),
+            "{text}"
         );
         assert!(
             ["claude", "codex", "cursor", "opencode"]

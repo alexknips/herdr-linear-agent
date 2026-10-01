@@ -1,7 +1,9 @@
 //! The Linear side of a pass: Linear events, run reads (close, detach,
 //! issue edits, relay), intake and claim, and routing.
 
-use anyhow::Result;
+use std::time::Duration;
+
+use anyhow::{Context, Result};
 use jiff::Timestamp;
 
 use super::reconcile::{
@@ -713,19 +715,34 @@ impl Reconciler {
         self.route(d, run, detail).await
     }
 
-    /// Starts the routing agent in its own task; its choice comes back as a
-    /// `RoutingDone`.
+    /// Picks the coordinator with the run's routing: at once when it lists
+    /// one, else by the routing agent in its own task, whose pick comes back
+    /// as a `RoutingDone`.
     async fn route<H: Herdr>(
         &mut self,
         d: &Deps<'_, H>,
         run: &Run,
         detail: &IssueDetail,
     ) -> Result<()> {
-        let routing = &d.config.routing;
-        let profile = d.config.profile(&routing.agent)?.clone();
-        let candidates = routing::candidates(d.config);
-        let timeout = std::time::Duration::from_secs(routing.timeout_seconds);
-        let issue = detail.clone();
+        let record = run.record()?;
+        let routing = d.config.routing_of(&record.workspace, &record.team_key)?;
+        if let [only] = &routing.coordinators[..] {
+            return self
+                .decide(d, run, &routing::Choice::Only(only.clone()))
+                .await;
+        }
+        let coordinators = routing::candidates(d.config, &routing.coordinators);
+        let agent = routing
+            .agent
+            .as_deref()
+            .context("the routing has no agent to pick with")?;
+        let profile = d.config.profile(agent)?.clone();
+        let timeout = Duration::from_secs(
+            profile
+                .timeout_seconds
+                .unwrap_or(d.config.limits.routing_agent_timeout_seconds),
+        );
+        let input = routing::input(detail);
         let path = d.ctx.env.var("PATH").map(str::to_string);
         let parent = std::env::temp_dir();
         let key = run.key.clone();
@@ -734,8 +751,9 @@ impl Reconciler {
         tokio::spawn(async move {
             let choice = routing::choose(
                 &profile,
-                &candidates,
-                &issue,
+                routing::Pick::Coordinator,
+                &coordinators,
+                &input,
                 timeout,
                 path.as_deref(),
                 &parent,
@@ -751,7 +769,7 @@ impl Reconciler {
         let Ok(run) = Run::load(&d.ctx.runs_dir(), &done.key) else {
             return;
         };
-        if let routing::Choice::Default(routing::Fallback::Failed(error)) = &done.choice {
+        if let routing::Choice::Default(_, routing::Fallback::Failed(error)) = &done.choice {
             d.log
                 .line(&format!("{}: the routing agent failed: {error}", run.key));
         }
@@ -771,7 +789,7 @@ impl Reconciler {
         if !record.coordinator.profile.is_empty() || record.status != Status::Active {
             return Ok(());
         }
-        let name = choice.profile(d.config).to_string();
+        let name = choice.profile().to_string();
         let profile = d.config.profile(&name)?;
         let mut pending = coordinator::pending_record(&record, &name, &profile.kind);
         pending.agent_session = record.coordinator.agent_session.clone();

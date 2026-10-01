@@ -53,17 +53,19 @@ client_id = "your-oauth-client-id"       # the OAuth application of this workspa
 allowed_user_ids = ["linear-user-uuid"]  # whose replies reach the coordinator
 # allowed_delegator_ids = ["linear-user-uuid"]  # whose delegations are taken (default: allowed_user_ids)
 review_state = "In Review"               # where `finish` moves the issue (default)
-# postmortem = "review"                  # the postmortem method of this team's runs (see Postmortems)
+routing = "default"                      # the routing of this team's issues, a table under [routing] (required)
 
-[workspaces.acme.teams.OPS]              # each team has its own allowed users and review state
+[workspaces.acme.teams.OPS]              # each team has its own allowed users, review state and routing
 allowed_user_ids = ["another-user-uuid"]
 review_state = "Ready for review"
+routing = "default"
 
 [workspaces.other]                       # another workspace, with its own OAuth application
 client_id = "another-oauth-client-id"
 
 [workspaces.other.teams.DATA]            # the same team key as in `acme` is fine
 allowed_user_ids = ["linear-user-uuid-in-other"]
+routing = "default"
 
 [herdr]
 session = "default"                      # the Herdr session runs start in; omit for the default session
@@ -72,7 +74,9 @@ session = "default"                      # the Herdr session runs start in; omit
 max_runs = 2
 max_workers_per_run = 4
 max_agents = 8
-run_timeout_hours = 8
+ask_to_continue_after_hours = 8          # after this many hours a run asks whether to go on
+routing_agent_timeout_seconds = 120      # how long a routing agent may take, unless its profile says
+postmortem_agent_timeout_seconds = 300   # how long a postmortem agent may take, unless its profile says
 
 [notifications]
 herdr = true                             # also show a Herdr notification when a run needs a person
@@ -85,11 +89,10 @@ path = "/Users/me/src/github.com/acme/api"
 base = "main"                            # workers branch from origin/<base>; never guessed
 description = "The API server"
 
-[routing]
-agent = "router"                         # the profile of the routing agent
-coordinators = ["coordinator", "coordinator-light"]  # the coordinator profiles it may pick
-default = "coordinator"                  # when it gives no valid answer
-timeout_seconds = 120
+[routing.default]                        # a routing; teams name one (see Coordinator routing)
+agent = "router"                         # the profile of the routing agent; needed only when a list below has several profiles
+coordinators = ["coordinator", "coordinator-light"]  # the coordinator profiles it picks from
+postmortems = ["postmortem"]             # the profiles that may write postmortems (see Postmortems); none writes none
 workers = ["standard", "deep"]           # the profiles a coordinator may start workers with
 ```
 
@@ -105,25 +108,24 @@ workers = ["standard", "deep"]           # the profiles a coordinator may start 
 
 ### Postmortems
 
-To improve how the agents work run after run, a team can have a postmortem: when the coordinator calls `finish` (an interim one) and when the issue is completed or canceled (a final one), an agent reads the run and the plugin posts its summary as a comment on the issue, with labels from a list you allow. The method lives in a folder next to `config.toml`, so you can change it as often as you like; each comment names the method and its version.
+To improve how the agents work run after run, a routing can list postmortem profiles: when the coordinator calls `finish` (an interim postmortem) and when the issue is completed or canceled (a final one), an agent reads the run and the plugin posts its summary as a comment on the issue, with the labels it names. A postmortem profile is an ordinary profile: its `instructions.md` is the method, and says which labels to add. Edit it as often as you like; each comment names the profile and the method's version.
 
 ```toml
-# postmortems/review/config.toml
-profile = "router"                       # the agent that writes it: a kind that can be a routing agent
-labels = ["Improvement", "Process/Rework"]  # labels it may add, `Label` or `Group/Label`; they must exist in Linear
-# timeout_seconds = 300
+# profiles/postmortem/config.toml: any kind that can be a routing agent
+kind = "claude"
+model = "haiku"
+description = "Reviews a run for what to change in how the agents work"
 ```
 
-`postmortems/review/instructions.md` holds the method, for example:
-
 ```markdown
+<!-- profiles/postmortem/instructions.md -->
 - What was asked, and what was delivered.
 - What was smooth, and where time went (retries, failed commands, waiting for people).
 - What to change next time, concretely.
-Add `Improvement` only when there is something concrete to change in how the agents work.
+Add the label `Improvement` only when there is something concrete to change in how the agents work.
 ```
 
-Then set `postmortem = "review"` on a team. The agent runs headless the way the routing agent does, with no tools: the plugin gives it the run's records on standard input (the issue, `conversation.md`, the workers' reports, and the agents' transcripts, long ones shortened in the middle), and it answers with the summary and the labels. The plugin keeps each answer in the run folder (`.state/postmortems/`) and posts it; labels outside the list are dropped. A comment reads `**Postmortem (interim)**, method `review` version `<12 hex digits>``, then the summary. Changing either file of the method changes the version, and offers a reload like any config change.
+Then list it in the routing: `postmortems = ["postmortem"]`. Each postmortem, interim or final, picks its profile when it is written: a list with one profile gives that profile; with several, the routing agent picks one from the run's issue, `conversation.md`, workers' reports, PRs and times (not the transcripts), and a failed pick gives the first. The picked profile runs headless the way the routing agent does, with no tools: the plugin gives it the run's records on standard input (the issue, `conversation.md`, the workers' reports, and the agents' transcripts, long ones shortened in the middle), and it answers with the summary and the labels. The plugin keeps each answer in the run folder (`.state/postmortems/`), posts the comment, and adds the labels that exist in Linear (it creates none). A comment reads `**Postmortem (interim)**, method `postmortem` version `<12 hex digits>``, then the summary; the version is a hash of the profile, so it changes when you edit the method.
 
 ### Finding user IDs
 
@@ -201,7 +203,7 @@ args = ["-s", "workspace-write"]
 description = "Changes across modules, bugs with an unknown cause"
 ```
 
-A profile's `config.toml` takes `kind`, `model`, `effort`, `args`, `description`, `base` and, for the routing agent only, `env`. Folders whose names start with `.` are skipped, other files inside a profile folder (a README, say) are left alone, and any other file directly in `profiles/` is refused. Profile names use letters, digits, `.`, `_` and `-`.
+A profile's `config.toml` takes `kind`, `model`, `effort`, `args`, `description`, `base` and, for routing and postmortem agents only, `env` and `timeout_seconds` (how long a call may take, 1 to 3600 seconds; the limits' default for the role when unset). Folders whose names start with `.` are skipped, other files inside a profile folder (a README, say) are left alone, and any other file directly in `profiles/` is refused. Profile names use letters, digits, `.`, `_` and `-`.
 
 **Profile inheritance.** `base = "<profile name>"` makes a profile start from another one, so shared settings live in one place and a profile keeps only what differs. A base may have a base of its own (`a` → `b` → `c`), but a profile has one base; a profile that only serves as a base is an ordinary profile. Over the chain, from the root to the profile:
 
@@ -292,7 +294,7 @@ For OpenCode, add an agent like this to your OpenCode config (for example `~/.co
 
 **Claude Code's trust dialog.** Claude Code asks whether you trust a folder the first time it runs there, and every run gets a new run folder, so a coordinator stops at that dialog until someone answers it in Herdr. With `claude.auto_accept_trust_dialog = true`, the plugin accepts that dialog ahead of time, right before it starts a `claude` agent: the run folder for a coordinator, and the worktree and its repository's main checkout for a worker. Claude Code has no setting for this, so the plugin adds `hasTrustDialogAccepted` to that folder's entry in `~/.claude.json` (`$CLAUDE_CONFIG_DIR/.claude.json` when set), which is where Claude Code records your own answers, and changes nothing else in the file. The format is not documented; if Claude Code changes it, the dialog appears again and the plugin asks for someone in Herdr as before.
 
-**Coordinator routing.** A routing agent picks each issue's coordinator profile from `routing.coordinators`. It gets the candidates' names and descriptions as its instructions, and the issue's title and description, with its estimate, labels and team when known, on standard input. It must answer `{"coordinator": "<name>"}` with a name from the candidates: the schema restricts it where the kind supports one, and the plugin checks the answer against the same schema either way. A timeout, an answer outside the schema, or a name outside the candidates gives `routing.default`. The Linear thought names the profile and whether the agent or the default chose it. `routing.agent` must be a profile of a kind listed below; any other kind is refused when the config loads.
+**Coordinator routing.** Each team names a routing (`routing = "<name>"`, required), a table `[routing.<name>]`. When an issue is picked up, its routing picks the coordinator profile from its `coordinators`; postmortem profiles are picked later, when each postmortem is written (see Postmortems). A list with one profile gives that profile and runs no routing agent. Otherwise the routing agent (`agent`, required only then) gets the candidates' names and descriptions as its instructions, and the issue's title and description, with its estimate, labels and team when known, on standard input, under `limits.routing_agent_timeout_seconds` or its profile's `timeout_seconds`. It must answer `{"coordinator": "<name>"}` (or `{"postmortem": "<name>"}` when picking a postmortem) with a name from the candidates: the schema restricts it where the kind supports one, and the plugin checks the answer against the same schema either way. A timeout, an answer outside the schema, or a name outside the candidates gives the first profile of the list. The Linear thought names the profile and how it was chosen. `agent` must be a profile of a kind listed below; any other kind is refused when the config loads.
 
 ### Routing agent kinds
 

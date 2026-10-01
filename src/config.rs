@@ -19,7 +19,6 @@ use crate::{agents, routing};
 
 pub const FILE_NAME: &str = "config.toml";
 const PROFILES_DIR: &str = "profiles";
-const POSTMORTEMS_DIR: &str = "postmortems";
 const INSTRUCTIONS_FILE: &str = "instructions.md";
 pub const DEFAULT_CALLBACK_PORT: u16 = 43871;
 
@@ -41,10 +40,8 @@ pub struct Config {
     /// Read from the profile folders, never from `config.toml`.
     #[serde(skip)]
     pub profiles: BTreeMap<String, Profile>,
-    /// Read from the postmortem folders, by name.
-    #[serde(skip)]
-    pub postmortems: BTreeMap<String, Postmortem>,
-    pub routing: Routing,
+    /// The routings teams use, by name.
+    pub routing: BTreeMap<String, Routing>,
 }
 
 /// One Linear workspace: its own OAuth application, token and app user.
@@ -78,40 +75,8 @@ pub struct Team {
     /// The workflow state an issue moves to on `finish`.
     #[serde(default = "default_review_state")]
     pub review_state: String,
-    /// The postmortem method of this team's runs, a folder under
-    /// `postmortems/`; none when unset.
-    #[serde(default)]
-    pub postmortem: Option<String>,
-}
-
-/// A postmortem method: `postmortems/<name>/config.toml` and the method in
-/// its `instructions.md`.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Postmortem {
-    /// The profile of the agent that writes it: a kind that can be a
-    /// routing agent, run the same way.
-    pub profile: String,
-    /// The labels it may add, `Label` or `Group/Label`.
-    pub labels: Vec<String>,
-    pub timeout_seconds: u64,
-    pub instructions: String,
-    /// The first 12 hex digits of a SHA-256 over the two files, told in each
-    /// comment, so summaries of one method can be told from another's.
-    pub version: String,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PostmortemFile {
-    profile: String,
-    #[serde(default)]
-    labels: Vec<String>,
-    #[serde(default = "default_postmortem_timeout")]
-    timeout_seconds: u64,
-}
-
-fn default_postmortem_timeout() -> u64 {
-    300
+    /// The routing of this team's issues: a table under `routing`.
+    pub routing: String,
 }
 
 impl Team {
@@ -151,7 +116,12 @@ pub struct Limits {
     pub max_runs: u32,
     pub max_workers_per_run: u32,
     pub max_agents: u32,
-    pub run_timeout_hours: u64,
+    /// After this many hours a run asks a person whether to continue.
+    pub ask_to_continue_after_hours: u64,
+    /// How long a routing agent may take, unless its profile says.
+    pub routing_agent_timeout_seconds: u64,
+    /// How long a postmortem agent may take, unless its profile says.
+    pub postmortem_agent_timeout_seconds: u64,
 }
 
 impl Default for Limits {
@@ -160,7 +130,9 @@ impl Default for Limits {
             max_runs: 2,
             max_workers_per_run: 4,
             max_agents: 8,
-            run_timeout_hours: 8,
+            ask_to_continue_after_hours: 8,
+            routing_agent_timeout_seconds: 120,
+            postmortem_agent_timeout_seconds: 300,
         }
     }
 }
@@ -218,6 +190,9 @@ pub struct Profile {
     /// coordinators and workers and cannot pass them any, so only the
     /// routing agent's profile may set this.
     pub env: BTreeMap<String, String>,
+    /// How long a call of this profile as a routing or postmortem agent may
+    /// take; the limits' default for that role when unset.
+    pub timeout_seconds: Option<u64>,
 }
 
 /// One layer of a profile's instructions: whose `instructions.md` it is.
@@ -239,25 +214,25 @@ struct ProfileFile {
     args: Option<Vec<String>>,
     description: Option<String>,
     env: Option<BTreeMap<String, String>>,
+    timeout_seconds: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Routing {
-    /// The profile of the routing agent that picks each issue's coordinator.
-    pub agent: String,
-    /// The coordinator profiles the routing agent may pick from.
+    /// The profile of the routing agent that picks an issue's coordinator
+    /// and postmortem; needed only when one of them has several candidates.
+    pub agent: Option<String>,
+    /// The coordinator profiles the routing agent picks from; the first one
+    /// when the agent gives no valid answer.
     pub coordinators: Vec<String>,
-    /// The coordinator when the routing agent gives no valid answer.
-    pub default: String,
-    #[serde(default = "default_routing_timeout")]
-    pub timeout_seconds: u64,
+    /// The profiles that write the runs' postmortems, picked like the
+    /// coordinator; none writes no postmortem.
+    #[serde(default)]
+    pub postmortems: Vec<String>,
+
     /// The profiles a coordinator may start workers with.
     pub workers: Vec<String>,
-}
-
-fn default_routing_timeout() -> u64 {
-    120
 }
 
 impl Config {
@@ -270,29 +245,25 @@ impl Config {
         let text = std::fs::read_to_string(&path)
             .with_context(|| format!("could not read {}", path.display()))?;
         let profiles = load_profiles(&config_dir.join(PROFILES_DIR))?;
-        let postmortems = load_postmortems(&config_dir.join(POSTMORTEMS_DIR))?;
-        Self::parse(&text, profiles, postmortems)
-            .with_context(|| format!("{} is not valid", path.display()))
+        Self::parse(&text, profiles).with_context(|| format!("{} is not valid", path.display()))
     }
 
     /// A SHA-256 over the files `load` reads, by sorted path and content:
-    /// `config.toml` and each profile and postmortem folder's `config.toml`
-    /// and `instructions.md`. Rewriting a file with the same content keeps it.
+    /// `config.toml` and each profile folder's `config.toml` and
+    /// `instructions.md`. Rewriting a file with the same content keeps it.
     pub fn fingerprint(config_dir: &Path) -> Result<[u8; 32]> {
         let path = Self::path(config_dir);
         let mut files = vec![path];
-        for dir in [PROFILES_DIR, POSTMORTEMS_DIR] {
-            for entry in std::fs::read_dir(config_dir.join(dir))
-                .into_iter()
-                .flatten()
-                .flatten()
-            {
-                if entry.file_name().to_string_lossy().starts_with('.') {
-                    continue;
-                }
-                files.push(entry.path().join(FILE_NAME));
-                files.push(entry.path().join(INSTRUCTIONS_FILE));
+        for entry in std::fs::read_dir(config_dir.join(PROFILES_DIR))
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            if entry.file_name().to_string_lossy().starts_with('.') {
+                continue;
             }
+            files.push(entry.path().join(FILE_NAME));
+            files.push(entry.path().join(INSTRUCTIONS_FILE));
         }
         files.sort();
         let mut hash = sha2::Sha256::new();
@@ -316,11 +287,7 @@ impl Config {
         Ok(hash.finalize().into())
     }
 
-    fn parse(
-        text: &str,
-        profiles: BTreeMap<String, Profile>,
-        postmortems: BTreeMap<String, Postmortem>,
-    ) -> Result<Config> {
+    fn parse(text: &str, profiles: BTreeMap<String, Profile>) -> Result<Config> {
         let table: toml::Table = toml::from_str(text)?;
         ensure!(
             !table.contains_key("profiles"),
@@ -328,7 +295,6 @@ impl Config {
         );
         let mut config: Config = table.try_into()?;
         config.profiles = profiles;
-        config.postmortems = postmortems;
         config.validate()?;
         Ok(config)
     }
@@ -381,9 +347,24 @@ impl Config {
             "limits must allow one run with one worker"
         );
         ensure!(
-            limits.run_timeout_hours >= 1,
-            "limits.run_timeout_hours must be at least 1"
+            limits.ask_to_continue_after_hours >= 1,
+            "limits.ask_to_continue_after_hours must be at least 1"
         );
+        for (key, seconds) in [
+            (
+                "routing_agent_timeout_seconds",
+                limits.routing_agent_timeout_seconds,
+            ),
+            (
+                "postmortem_agent_timeout_seconds",
+                limits.postmortem_agent_timeout_seconds,
+            ),
+        ] {
+            ensure!(
+                (1..=3600).contains(&seconds),
+                "limits.{key} must be between 1 and 3600"
+            );
+        }
 
         for (name, repo) in &self.repositories {
             ensure!(
@@ -417,7 +398,52 @@ impl Config {
             }
         }
 
-        let routing = &self.routing;
+        ensure!(!self.routing.is_empty(), "no routing is configured");
+        let headless = |at: &str, name: &str, what: &str| -> Result<()> {
+            let profile = self.profile(name).with_context(|| at.to_string())?;
+            ensure!(
+                routing::registered(&profile.kind),
+                "{at}: the `{}` kind cannot be {what}",
+                profile.kind
+            );
+            Ok(())
+        };
+        for (name, routing) in &self.routing {
+            let at = |key: &str| format!("routing.{name}.{key}");
+            ensure!(
+                !routing.coordinators.is_empty(),
+                "{} lists no profile",
+                at("coordinators")
+            );
+            for profile in &routing.coordinators {
+                self.profile(profile).with_context(|| at("coordinators"))?;
+            }
+            ensure!(
+                !routing.workers.is_empty(),
+                "{} lists no profile",
+                at("workers")
+            );
+            for profile in &routing.workers {
+                self.profile(profile).with_context(|| at("workers"))?;
+            }
+            for profile in &routing.postmortems {
+                headless(&at("postmortems"), profile, "a postmortem agent")?;
+                ensure!(
+                    !self.profiles[profile].instructions.is_empty(),
+                    "{}: profile `{profile}` has no {INSTRUCTIONS_FILE}, which holds the method",
+                    at("postmortems")
+                );
+            }
+            let several = routing.coordinators.len() > 1 || routing.postmortems.len() > 1;
+            match &routing.agent {
+                Some(agent) => headless(&at("agent"), agent, "a routing agent")?,
+                None => ensure!(
+                    !several,
+                    "{}: set it, since the coordinators or the postmortem profiles have several candidates",
+                    at("agent")
+                ),
+            }
+        }
         for (name, profile) in &self.profiles {
             for key in profile.env.keys() {
                 ensure!(
@@ -425,65 +451,33 @@ impl Config {
                     "profile `{name}`: env has an invalid variable name `{key}`"
                 );
             }
-            let used = routing.coordinators.contains(name) || routing.workers.contains(name);
+            let used = self
+                .routing
+                .values()
+                .any(|r| r.coordinators.contains(name) || r.workers.contains(name));
             ensure!(
                 profile.env.is_empty() || !used,
-                "profile `{name}`: env applies only to the routing agent, but `{name}` is also a coordinator or worker profile"
-            );
-        }
-        let agent = self.profile(&routing.agent).context("routing.agent")?;
-        ensure!(
-            routing::registered(&agent.kind),
-            "routing.agent: the `{}` kind cannot be a routing agent",
-            agent.kind
-        );
-        for (name, method) in &self.postmortems {
-            let at = format!("{POSTMORTEMS_DIR}/{name}");
-            let agent = self
-                .profile(&method.profile)
-                .with_context(|| format!("{at}: profile"))?;
-            ensure!(
-                routing::registered(&agent.kind),
-                "{at}: the `{}` kind cannot write a postmortem",
-                agent.kind
+                "profile `{name}`: env applies only to the routing and postmortem agents, but `{name}` is also a coordinator or worker profile"
             );
             ensure!(
-                (1..=3600).contains(&method.timeout_seconds),
-                "{at}: timeout_seconds must be between 1 and 3600"
+                profile.timeout_seconds.is_none() || !used,
+                "profile `{name}`: timeout_seconds applies only to the routing and postmortem agents, but `{name}` is also a coordinator or worker profile"
             );
-            ensure!(
-                !method.instructions.trim().is_empty(),
-                "{at}: {INSTRUCTIONS_FILE} is missing or blank"
-            );
+            if let Some(seconds) = profile.timeout_seconds {
+                ensure!(
+                    (1..=3600).contains(&seconds),
+                    "profile `{name}`: timeout_seconds must be between 1 and 3600"
+                );
+            }
         }
         for (name, workspace) in &self.workspaces {
             for (key, team) in &workspace.teams {
-                if let Some(method) = &team.postmortem {
-                    ensure!(
-                        self.postmortems.contains_key(method),
-                        "workspaces.{name}.teams.{key}.postmortem: there is no {POSTMORTEMS_DIR}/{method}"
-                    );
-                }
+                ensure!(
+                    self.routing.contains_key(&team.routing),
+                    "workspaces.{name}.teams.{key}.routing: there is no routing.{}",
+                    team.routing
+                );
             }
-        }
-        ensure!(
-            !routing.coordinators.is_empty(),
-            "routing.coordinators lists no profile"
-        );
-        for name in &routing.coordinators {
-            self.profile(name).context("routing.coordinators")?;
-        }
-        self.profile(&routing.default).context("routing.default")?;
-        ensure!(
-            routing.timeout_seconds >= 1,
-            "routing.timeout_seconds must be at least 1"
-        );
-        ensure!(
-            !routing.workers.is_empty(),
-            "routing.workers lists no profile"
-        );
-        for name in &routing.workers {
-            self.profile(name).context("routing.workers")?;
         }
         Ok(())
     }
@@ -494,12 +488,20 @@ impl Config {
         })
     }
 
-    /// A profile a coordinator may start a worker with.
-    pub fn worker_profile(&self, name: &str) -> Result<&Profile> {
-        if !self.routing.workers.iter().any(|w| w == name) {
+    /// The routing of a team's issues.
+    pub fn routing_of(&self, workspace: &str, team: &str) -> Result<&Routing> {
+        let name = &self.team(workspace, team)?.routing;
+        self.routing
+            .get(name)
+            .with_context(|| format!("there is no routing.{name}"))
+    }
+
+    /// A profile a coordinator may start a worker with under `routing`.
+    pub fn worker_profile<'a>(&'a self, routing: &Routing, name: &str) -> Result<&'a Profile> {
+        if !routing.workers.iter().any(|w| w == name) {
             bail!(
-                "`{name}` is not a worker profile; routing.workers lists {}",
-                self.routing.workers.join(", ")
+                "`{name}` is not a worker profile; the routing's workers are {}",
+                routing.workers.join(", ")
             );
         }
         self.profile(name)
@@ -574,58 +576,6 @@ fn load_profiles(dir: &Path) -> Result<BTreeMap<String, Profile>> {
         .collect()
 }
 
-/// Reads every postmortem folder under `dir`, named by the folder. A missing
-/// `dir` gives none.
-fn load_postmortems(dir: &Path) -> Result<BTreeMap<String, Postmortem>> {
-    let mut methods = BTreeMap::new();
-    let entries = match std::fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(methods),
-        Err(error) => {
-            return Err(error).with_context(|| format!("could not read {}", dir.display()));
-        }
-    };
-    for entry in entries {
-        let folder = entry
-            .with_context(|| format!("could not read {}", dir.display()))?
-            .path();
-        let name = folder
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .into_owned();
-        if name.starts_with('.') {
-            continue;
-        }
-        let read = |file: &str| {
-            let path = folder.join(file);
-            std::fs::read_to_string(&path)
-                .with_context(|| format!("could not read {}", path.display()))
-        };
-        let config = read(FILE_NAME)?;
-        let instructions = read(INSTRUCTIONS_FILE).unwrap_or_default();
-        let file: PostmortemFile = toml::from_str(&config)
-            .with_context(|| format!("{} is not valid", folder.join(FILE_NAME).display()))?;
-        let mut hash = sha2::Sha256::new();
-        hash.update(config.as_bytes());
-        hash.update([0]);
-        hash.update(instructions.as_bytes());
-        let digest: [u8; 32] = hash.finalize().into();
-        let version = digest.iter().take(6).map(|b| format!("{b:02x}")).collect();
-        methods.insert(
-            name,
-            Postmortem {
-                profile: file.profile,
-                labels: file.labels,
-                timeout_seconds: file.timeout_seconds,
-                instructions,
-                version,
-            },
-        );
-    }
-    Ok(methods)
-}
-
 /// A profile folder's `config.toml` and its `instructions.md`, `None` when
 /// that is missing or blank.
 fn read_profile(folder: &Path) -> Result<(ProfileFile, Option<String>)> {
@@ -668,6 +618,7 @@ fn resolve(name: &str, files: &BTreeMap<String, (ProfileFile, Option<String>)>) 
     }
     let mut kind: Option<(&str, &str)> = None;
     let (mut model, mut effort, mut args, mut env) = (None, None, Vec::new(), BTreeMap::new());
+    let mut timeout_seconds = None;
     let mut instructions = Vec::new();
     for layer in chain.iter().rev() {
         let (file, text) = &files[*layer];
@@ -684,6 +635,7 @@ fn resolve(name: &str, files: &BTreeMap<String, (ProfileFile, Option<String>)>) 
         effort = file.effort.clone().or(effort);
         args = file.args.clone().unwrap_or(args);
         env = file.env.clone().unwrap_or(env);
+        timeout_seconds = file.timeout_seconds.or(timeout_seconds);
         if let Some(text) = text {
             instructions.push(Instructions {
                 profile: layer.to_string(),
@@ -702,6 +654,7 @@ fn resolve(name: &str, files: &BTreeMap<String, (ProfileFile, Option<String>)>) 
         description: files[name].0.description.clone().unwrap_or_default(),
         instructions,
         env,
+        timeout_seconds,
     })
 }
 
@@ -726,6 +679,7 @@ client_id = "client-123"
 
 [workspaces.acme.teams.DATA]
 allowed_user_ids = ["user-1"]
+routing = "default"
 
 [herdr]
 session = "work"
@@ -739,11 +693,9 @@ description = "The API server"
 path = "/src/web"
 base = "develop"
 
-[routing]
+[routing.default]
 agent = "router"
 coordinators = ["coordinator", "coordinator-light"]
-default = "coordinator"
-timeout_seconds = 60
 workers = ["standard", "deep"]
 "#;
 
@@ -824,10 +776,8 @@ workers = ["standard", "deep"]
         );
         assert_eq!(config.limits, Limits::default());
         assert!(config.notifications.herdr);
-        assert_eq!(
-            config.routing.coordinators,
-            ["coordinator", "coordinator-light"]
-        );
+        let routing = config.routing_of("acme", "DATA").unwrap();
+        assert_eq!(routing.coordinators, ["coordinator", "coordinator-light"]);
         assert_eq!(
             config.profiles.keys().collect::<Vec<_>>(),
             [
@@ -846,8 +796,11 @@ workers = ["standard", "deep"]
             }]
         );
         assert_eq!(config.profile("coordinator").unwrap().instructions, []);
-        assert_eq!(config.worker_profile("deep").unwrap().kind, "codex");
-        assert!(config.worker_profile("coordinator").is_err());
+        assert_eq!(
+            config.worker_profile(routing, "deep").unwrap().kind,
+            "codex"
+        );
+        assert!(config.worker_profile(routing, "coordinator").is_err());
         assert!(
             config
                 .repository("nope")
@@ -874,7 +827,10 @@ workers = ["standard", "deep"]
             "[workspaces.acme.teams.DATA]",
             "[workspaces.acme.teams.DATA]\nreview_state = \"\"",
         );
-        bad("default = \"coordinator\"", "default = \"missing\"");
+        bad(
+            "workers = [\"standard\", \"deep\"]",
+            "workers = [\"standard\", \"deep\"]\ndefault = \"coordinator\"",
+        );
         bad(
             "workers = [\"standard\", \"deep\"]",
             "workers = [\"missing\"]",
@@ -889,11 +845,14 @@ workers = ["standard", "deep"]
             "coordinators = [\"coordinator\", \"coordinator-light\"]",
             "coordinators = []",
         );
-        bad("timeout_seconds = 60", "timeout_seconds = 0");
+        bad(
+            "[herdr]",
+            "[limits]\nrouting_agent_timeout_seconds = 0\n\n[herdr]",
+        );
         // The size-based routing is gone.
         bad(
-            "default = \"coordinator\"",
-            "default = \"coordinator\"\nsize_label_group = \"size\"",
+            "workers = [\"standard\", \"deep\"]",
+            "workers = [\"standard\", \"deep\"]\nsize_label_group = \"size\"",
         );
         bad("[herdr]", "[herdr]\nunknown = 1");
         assert!(
@@ -1028,7 +987,7 @@ workers = ["standard", "deep"]
         )
         .unwrap_err();
         assert!(error.ends_with(
-            "profile `standard`: env applies only to the routing agent, but `standard` is also a coordinator or worker profile"
+            "profile `standard`: env applies only to the routing and postmortem agents, but `standard` is also a coordinator or worker profile"
         ), "{error}");
     }
 
@@ -1135,7 +1094,7 @@ workers = ["standard", "deep"]
         std::fs::write(dir.path().join(FILE_NAME), SAMPLE).unwrap();
         assert!(
             format!("{:#}", Config::load(dir.path()).unwrap_err()).ends_with(
-                "routing.agent: no profile named `router`: add profiles/router/config.toml"
+                "routing.default.coordinators: no profile named `coordinator`: add profiles/coordinator/config.toml"
             )
         );
     }
@@ -1172,56 +1131,55 @@ workers = ["standard", "deep"]
     }
 
     #[test]
-    fn a_team_names_a_postmortem_method_whose_version_follows_its_files() {
-        let dir = tempfile::tempdir().unwrap();
-        let text = SAMPLE.replace(
-            "allowed_user_ids = [\"user-1\"]",
-            "allowed_user_ids = [\"user-1\"]\npostmortem = \"review\"",
-        );
-        write_sample(dir.path(), &text);
-        let error = format!("{:#}", Config::load(dir.path()).unwrap_err());
+    fn teams_pick_a_routing_whose_postmortems_are_profiles_with_a_method() {
+        let routing_b = "\n[routing.light]\ncoordinators = [\"coordinator-light\"]\npostmortems = [\"reviewer\"]\nworkers = [\"standard\"]\n";
+        let team = |text: &str| text.replace("routing = \"default\"", "routing = \"light\"");
+        let reviewer = ("reviewer", "kind = \"claude\"\nmodel = \"haiku\"\n");
+        let error = load_with(&team(SAMPLE), &[]).unwrap_err();
         assert!(
-            error
-                .ends_with("workspaces.acme.teams.DATA.postmortem: there is no postmortems/review"),
+            error.ends_with("workspaces.acme.teams.DATA.routing: there is no routing.light"),
             "{error}"
         );
-        let method = dir.path().join("postmortems/review");
-        std::fs::create_dir_all(&method).unwrap();
-        std::fs::write(
-            method.join(FILE_NAME),
-            "profile = \"router\"\nlabels = [\"Improvement\"]\n",
-        )
-        .unwrap();
-        let error = format!("{:#}", Config::load(dir.path()).unwrap_err());
+        let text = team(SAMPLE) + routing_b;
+        let error = load_with(&text, &[reviewer]).unwrap_err();
         assert!(
-            error.ends_with("postmortems/review: instructions.md is missing or blank"),
-            "{error}"
-        );
-        std::fs::write(method.join(INSTRUCTIONS_FILE), "Say what went well.\n").unwrap();
-        let before = Config::fingerprint(dir.path()).unwrap();
-        let config = Config::load(dir.path()).unwrap();
-        let review = &config.postmortems["review"];
-        assert_eq!(
-            (
-                review.profile.as_str(),
-                review.labels.as_slice(),
-                review.timeout_seconds
+            error.ends_with(
+                "routing.light.postmortems: profile `reviewer` has no instructions.md, which holds the method"
             ),
-            ("router", &["Improvement".to_string()][..], 300)
-        );
-        assert_eq!(review.version.len(), 12);
-        assert_eq!(
-            config.team("acme", "DATA").unwrap().postmortem.as_deref(),
-            Some("review")
+            "{error}"
         );
 
-        std::fs::write(method.join(INSTRUCTIONS_FILE), "Say what to change.\n").unwrap();
-        let changed = Config::load(dir.path()).unwrap();
-        assert_ne!(changed.postmortems["review"].version, review.version);
-        assert_ne!(
-            Config::fingerprint(dir.path()).unwrap(),
-            before,
-            "a reload is offered"
+        let dir = tempfile::tempdir().unwrap();
+        write_sample(dir.path(), &text);
+        let folder = dir.path().join(PROFILES_DIR).join("reviewer");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join(FILE_NAME), reviewer.1).unwrap();
+        std::fs::write(folder.join(INSTRUCTIONS_FILE), "Say what went well.\n").unwrap();
+        let config = Config::load(dir.path()).unwrap();
+        let routing = config.routing_of("acme", "DATA").unwrap();
+        assert_eq!(
+            (routing.agent.as_deref(), routing.postmortems.as_slice()),
+            (None, &["reviewer".to_string()][..]),
+            "one candidate each needs no routing agent"
+        );
+        assert_eq!(
+            (
+                config.limits.ask_to_continue_after_hours,
+                config.limits.routing_agent_timeout_seconds,
+                config.limits.postmortem_agent_timeout_seconds
+            ),
+            (8, 120, 300)
+        );
+
+        let two = text.replace(
+            "postmortems = [\"reviewer\"]",
+            "postmortems = [\"reviewer\", \"coordinator-light\"]",
+        );
+        std::fs::write(dir.path().join(FILE_NAME), &two).unwrap();
+        let error = format!("{:#}", Config::load(dir.path()).unwrap_err());
+        assert!(
+            error.ends_with("routing.light.agent: set it, since the coordinators or the postmortem profiles have several candidates"),
+            "{error}"
         );
     }
 
@@ -1245,7 +1203,7 @@ workers = ["standard", "deep"]
     #[test]
     fn workspaces_and_their_teams_have_their_own_settings() {
         let text = SAMPLE.to_string()
-            + "\n[workspaces.beta]\nclient_id = \"client-456\"\ncallback_port = 43872\n\n[workspaces.beta.teams.DATA]\nallowed_user_ids = [\"user-2\"]\nreview_state = \"Review\"\n\n[workspaces.beta.teams.OPS]\n";
+            + "\n[workspaces.beta]\nclient_id = \"client-456\"\ncallback_port = 43872\n\n[workspaces.beta.teams.DATA]\nallowed_user_ids = [\"user-2\"]\nreview_state = \"Review\"\nrouting = \"default\"\n\n[workspaces.beta.teams.OPS]\nrouting = \"default\"\n";
         let config = load_with(&text, &[]).unwrap();
         assert_eq!(
             config.workspaces.keys().collect::<Vec<_>>(),
@@ -1274,7 +1232,7 @@ workers = ["standard", "deep"]
         );
         let none = SAMPLE
             .replace(
-                "[workspaces.acme.teams.DATA]\nallowed_user_ids = [\"user-1\"]\n",
+                "[workspaces.acme.teams.DATA]\nallowed_user_ids = [\"user-1\"]\nrouting = \"default\"\n",
                 "",
             )
             .replace("[workspaces.acme]\nclient_id = \"client-123\"\n", "");
@@ -1282,6 +1240,32 @@ workers = ["standard", "deep"]
             load_with(&none, &[])
                 .unwrap_err()
                 .contains("missing field `workspaces`")
+        );
+    }
+
+    #[test]
+    fn a_profiles_timeout_is_for_routing_and_postmortem_agents_only() {
+        let config = load_with(
+            SAMPLE,
+            &[("router", "kind = \"claude\"\ntimeout_seconds = 30\n")],
+        )
+        .unwrap();
+        assert_eq!(config.profile("router").unwrap().timeout_seconds, Some(30));
+        assert_eq!(config.profile("standard").unwrap().timeout_seconds, None);
+        let worker = "kind = \"claude\"\ntimeout_seconds = 30\n";
+        let error = load_with(SAMPLE, &[("standard", worker)]).unwrap_err();
+        assert!(
+            error.ends_with("profile `standard`: timeout_seconds applies only to the routing and postmortem agents, but `standard` is also a coordinator or worker profile"),
+            "{error}"
+        );
+        let error = load_with(
+            SAMPLE,
+            &[("router", "kind = \"claude\"\ntimeout_seconds = 0\n")],
+        )
+        .unwrap_err();
+        assert!(
+            error.ends_with("profile `router`: timeout_seconds must be between 1 and 3600"),
+            "{error}"
         );
     }
 
@@ -1311,7 +1295,7 @@ workers = ["standard", "deep"]
             Some("/tmp/empty")
         );
         assert!(with_env("standard").unwrap_err().ends_with(
-            "profile `standard`: env applies only to the routing agent, but `standard` is also a coordinator or worker profile"
+            "profile `standard`: env applies only to the routing and postmortem agents, but `standard` is also a coordinator or worker profile"
         ));
     }
 
@@ -1320,7 +1304,7 @@ workers = ["standard", "deep"]
         assert!(
             load_with(SAMPLE, &[("router", "kind = \"gemini\"\n")])
                 .unwrap_err()
-                .ends_with("routing.agent: the `gemini` kind cannot be a routing agent")
+                .ends_with("routing.default.agent: the `gemini` kind cannot be a routing agent")
         );
     }
 }

@@ -682,7 +682,8 @@ impl Reconciler {
         if !self.writing.is_empty() {
             times.push(now + SignedDuration::from_secs(5));
         }
-        let hours = i64::try_from(d.config.limits.run_timeout_hours).unwrap_or(i64::MAX / 7200);
+        let hours =
+            i64::try_from(d.config.limits.ask_to_continue_after_hours).unwrap_or(i64::MAX / 7200);
         let timeout = SignedDuration::from_hours(hours);
         for run in Run::list(&d.ctx.runs_dir()) {
             let Ok(record) = run.record() else { continue };

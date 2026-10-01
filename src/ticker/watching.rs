@@ -390,7 +390,7 @@ impl Reconciler {
     }
 
     /// An ephemeral thought after 20 minutes without an activity keeps the
-    /// session from going stale; past `run_timeout_hours` a person is asked
+    /// session from going stale; past `ask_to_continue_after_hours` a person is asked
     /// whether to go on. Neither goes out without a session or while stopped.
     pub(super) async fn heartbeat<H: Herdr>(
         &mut self,
@@ -441,7 +441,7 @@ impl Reconciler {
             self.push(run, Op::Activity { activity }).await?;
             self.heartbeats.insert(run.key.clone(), now);
         }
-        let hours = d.config.limits.run_timeout_hours;
+        let hours = d.config.limits.ask_to_continue_after_hours;
         let limit = i64::try_from(hours.saturating_mul(3600)).unwrap_or(i64::MAX);
         if !record.timeout_asked && files::seconds_since(&record.timeout_since, now) >= limit {
             self.update_and_push(run, move |r| {
