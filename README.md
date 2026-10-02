@@ -368,6 +368,8 @@ Other kinds are not registered.
 
 When a pane needs a person (a permission or trust dialog), the ticker says so in the session with the pane to go to, and shows a Herdr notification.
 
+If an agent process exits while its Herdr pane remains open, the ticker confirms the pane is still empty for 30 seconds, then can resume that agent in the same pane and native session. It waits 15, 30 and 60 seconds before up to three automatic resume starts (in addition to the original launch); the attempt budget survives successful resumes and ticker restarts. A pane occupied by another agent is left alone. A missing native session or exhausted budget marks recovery stale; the coordinator receives an explicit `resume` action, and a worker's coordinator inbox gets a manual restart item.
+
 ## Actions
 
 | Action | What it does |

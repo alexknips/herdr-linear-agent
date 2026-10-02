@@ -176,11 +176,46 @@ pub struct AgentRecord {
     pub last_group: String,
     /// A "needs someone in the pane" elicitation was sent for the current episode.
     pub blocked_reported: bool,
+    /// Durable bounded resume state for an agent that disappears from a surviving pane.
+    pub recovery: Recovery,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum Recovery {
+    #[default]
+    None,
+    Suspected {
+        since: String,
+        session: String,
+        attempts: u8,
+    },
+    RetryWait {
+        attempt: u8,
+        due_at: String,
+        session: String,
+    },
+    Starting {
+        attempt: u8,
+        request_id: String,
+        since: String,
+        session: String,
+    },
+    Recovered {
+        attempts: u8,
+        session: String,
+    },
+    Stale {
+        attempts: u8,
+        reason: String,
+        reported: bool,
+    },
 }
 
 impl AgentRecord {
     /// Open in the pane Herdr placed it in, its launch prompt due.
     pub fn placed(&mut self, placed: &Placed) {
+        self.recovery = Recovery::None;
         self.status = AgentStatus::Open;
         self.error.clear();
         self.workspace_id = placed.workspace.0.clone();
@@ -194,6 +229,7 @@ impl AgentRecord {
 
     /// Pending again, to be placed anew and resumed when it has a session.
     pub fn repend(&mut self) {
+        self.recovery = Recovery::None;
         self.status = AgentStatus::Pending;
         self.resume = !self.agent_session.is_empty();
         self.launch_attempts = 0;
@@ -647,6 +683,20 @@ mod tests {
             (record.identifier.as_str(), record.routing_source.as_str()),
             ("DATA-1", "")
         );
+    }
+
+    #[test]
+    fn recovery_state_round_trips_and_old_records_default_to_none() {
+        let old: AgentRecord =
+            serde_json::from_str(r#"{"status":"open","agent_name":"coordinator"}"#).unwrap();
+        assert_eq!(old.recovery, Recovery::None);
+        let state = Recovery::RetryWait {
+            attempt: 2,
+            due_at: "2026-10-02T03:04:05Z".into(),
+            session: "session-id".into(),
+        };
+        let encoded = serde_json::to_string(&state).unwrap();
+        assert_eq!(serde_json::from_str::<Recovery>(&encoded).unwrap(), state);
     }
 
     #[test]

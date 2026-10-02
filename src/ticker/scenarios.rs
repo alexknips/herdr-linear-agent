@@ -11,7 +11,7 @@ use crate::herdr::PaneId;
 use crate::linear::api::fake::APP_USER;
 use crate::linear::api::{IssueStatus, RunUpdate};
 use crate::linear::task::{DECLINED, LinearEvent};
-use crate::run::{AgentStatus, Status, WaitReason};
+use crate::run::{AgentStatus, Recovery, Status, WaitReason};
 use crate::{inbox, worker};
 
 const KEY: &str = "acme/DATA-1";
@@ -68,6 +68,7 @@ fn mentions(texts: &[String], part: &str) -> bool {
 }
 
 const WAITING_TOO_LONG: i64 = 280;
+const CONTINUED: &str = "The previous agent process ended while work was in progress. Reread AGENTS.md and the issue/task context, inspect the current workspace and existing changes, then continue the same task from this session. Do not repeat completed work.";
 
 // ---------------------------------------------------------------- claiming
 
@@ -140,6 +141,361 @@ async fn a_delegated_issue_is_claimed_placed_started_and_prompted_once() {
         (1, 1),
         "claimed once"
     );
+}
+
+#[tokio::test]
+async fn a_crashed_coordinator_resumes_the_same_session_after_a_ticker_restart() {
+    let mut world = World::sample();
+    let pane = world.running_issue().await;
+    let session = world.record(KEY).coordinator.agent_session;
+    world.herdr.restart();
+    world.later(5);
+    world.settle().await;
+    assert!(matches!(
+        world.record(KEY).coordinator.recovery,
+        Recovery::Suspected { .. }
+    ));
+
+    world.later(30);
+    world.settle().await;
+    assert!(matches!(
+        world.record(KEY).coordinator.recovery,
+        Recovery::RetryWait { attempt: 1, .. }
+    ));
+    world.restart_ticker();
+    world.settle().await;
+    assert_eq!(
+        world.herdr.starts().len(),
+        1,
+        "the persisted delay has not elapsed"
+    );
+
+    world.later(15);
+    world.settle().await;
+    let starts = world.herdr.starts();
+    assert_eq!(starts.len(), 2, "one bounded resume start");
+    assert!(
+        ends_with(&starts[1].args, &["--resume", &session]),
+        "{:?}",
+        starts[1].args
+    );
+    assert!(to(&world, &pane).contains(&CONTINUED.to_string()));
+    assert!(matches!(
+        world.record(KEY).coordinator.recovery,
+        Recovery::Recovered { attempts: 1, .. }
+    ));
+}
+
+#[tokio::test]
+async fn a_recovered_native_session_is_kept_for_a_later_manual_resume() {
+    let mut world = World::sample();
+    world.running_issue().await;
+    let native_session = "opencode-discovered-session";
+    let due_at = world.now().to_string();
+    world
+        .run(KEY)
+        .update(|r| {
+            r.coordinator.agent_session.clear();
+            r.coordinator.recovery = Recovery::RetryWait {
+                attempt: 1,
+                due_at,
+                session: native_session.into(),
+            };
+        })
+        .unwrap();
+    world.herdr.report_no_sessions();
+    world.herdr.restart();
+    world.settle().await;
+    assert_eq!(world.record(KEY).coordinator.agent_session, native_session);
+    assert!(ends_with(&last_args(&world), &["--resume", native_session]));
+
+    world.herdr.restart();
+    world
+        .run(KEY)
+        .update(|r| {
+            r.coordinator.recovery = Recovery::Stale {
+                attempts: 3,
+                reason: "automatic limit reached".into(),
+                reported: true,
+            };
+            r.coordinator_lost = true;
+        })
+        .unwrap();
+    world.message(KEY, "user-1", "resume", None);
+    world.settle().await;
+    assert!(ends_with(&last_args(&world), &["--resume", native_session]));
+}
+
+#[tokio::test]
+async fn an_unknown_resume_answer_is_not_retried_when_the_agent_appears() {
+    let mut world = World::sample();
+    let pane = world.running_issue().await;
+    world.herdr.restart();
+    world.later(5);
+    world.settle().await;
+    world.later(30);
+    world.settle().await;
+    world.herdr.next_start_unknown();
+    world.later(15);
+    world.settle().await;
+    assert_eq!(world.herdr.starts().len(), 2);
+    assert!(matches!(
+        world.record(KEY).coordinator.recovery,
+        Recovery::Recovered { attempts: 1, .. }
+    ));
+    assert_eq!(count(&to(&world, &pane), CONTINUED), 1);
+    world.settle().await;
+    assert_eq!(
+        world.herdr.starts().len(),
+        2,
+        "unknown outcome never duplicates the start"
+    );
+}
+
+#[tokio::test]
+async fn a_resume_request_not_sent_consumes_one_attempt_and_uses_the_next_backoff() {
+    let mut world = World::sample();
+    world.running_issue().await;
+    world.herdr.restart();
+    world.later(5);
+    world.settle().await;
+    world.later(30);
+    world.settle().await;
+    world.herdr.next_start_not_sent();
+    world.later(15);
+    world.settle().await;
+    assert!(matches!(
+        world.record(KEY).coordinator.recovery,
+        Recovery::RetryWait { attempt: 2, .. }
+    ));
+    assert_eq!(
+        world.herdr.starts().len(),
+        1,
+        "NotSent did not start an agent"
+    );
+    world.later(30);
+    world.settle().await;
+    assert_eq!(
+        world.herdr.starts().len(),
+        2,
+        "the second attempt follows its backoff"
+    );
+}
+
+#[tokio::test]
+async fn stale_recovery_waits_for_an_existing_answer_before_asking_to_resume() {
+    let mut world = World::sample();
+    world.running_issue().await;
+    commands::ask(&world.ctx(), KEY, "Should I continue?", &[])
+        .await
+        .unwrap();
+    world.settle().await;
+    world
+        .run(KEY)
+        .update(|r| {
+            r.coordinator.recovery = Recovery::Stale {
+                attempts: 3,
+                reason: "test stale state".into(),
+                reported: false,
+            }
+        })
+        .unwrap();
+    world.settle().await;
+    let record = world.record(KEY);
+    assert_eq!(
+        record.awaiting_reply.as_ref().unwrap().reason,
+        WaitReason::CoordinatorQuestion
+    );
+    assert!(matches!(
+        record.coordinator.recovery,
+        Recovery::Stale {
+            reported: false,
+            ..
+        }
+    ));
+
+    world.message(KEY, "user-1", "Continue", None);
+    world.settle().await;
+    let record = world.record(KEY);
+    assert_eq!(
+        record.awaiting_reply.as_ref().unwrap().reason,
+        WaitReason::CoordinatorLost
+    );
+    assert!(matches!(
+        record.coordinator.recovery,
+        Recovery::Stale { reported: true, .. }
+    ));
+    assert!(mentions(
+        &world.bodies(KEY, "elicitation"),
+        "Reply `resume`"
+    ));
+}
+
+#[tokio::test]
+async fn a_crashed_worker_resumes_without_restarting_its_coordinator() {
+    let mut world = World::sample();
+    world.running_issue().await;
+    let worker = world.start_worker("api").await;
+    world.settle().await;
+    let session = worker::load(&world.run(KEY), "w1")
+        .unwrap()
+        .agent
+        .agent_session;
+    world.herdr.remove_agent("acme-data-1-w1");
+    world.later(5);
+    world.settle().await;
+    assert!(matches!(
+        worker::load(&world.run(KEY), "w1").unwrap().agent.recovery,
+        Recovery::Suspected { .. }
+    ));
+
+    world.later(30);
+    world.settle().await;
+    world.restart_ticker();
+    world.settle().await;
+    assert_eq!(
+        world.herdr.starts().len(),
+        2,
+        "only the original coordinator and worker starts"
+    );
+    world.later(15);
+    world.settle().await;
+    let starts = world.herdr.starts();
+    assert_eq!(starts.len(), 3);
+    assert_eq!(starts[2].name, "acme-data-1-w1");
+    assert!(
+        ends_with(&starts[2].args, &["--resume", &session]),
+        "{:?}",
+        starts[2].args
+    );
+    assert!(to(&world, &worker.agent.pane_id).contains(&CONTINUED.to_string()));
+    assert!(matches!(
+        worker::load(&world.run(KEY), "w1").unwrap().agent.recovery,
+        Recovery::Recovered { attempts: 1, .. }
+    ));
+
+    for (attempt, delay) in [(2, 30), (3, 60)] {
+        world.herdr.remove_agent("acme-data-1-w1");
+        world.later(5);
+        world.settle().await;
+        world.later(35);
+        world.settle().await;
+        let recovery = worker::load(&world.run(KEY), "w1").unwrap().agent.recovery;
+        assert!(
+            matches!(
+                recovery,
+                Recovery::RetryWait { attempt: found, .. } if found == attempt
+            ),
+            "{recovery:?}"
+        );
+        world.later(delay);
+        world.settle().await;
+        assert!(matches!(
+            worker::load(&world.run(KEY), "w1").unwrap().agent.recovery,
+            Recovery::Recovered { attempts: found, .. } if found == attempt
+        ));
+    }
+    let starts_before_stale = world.herdr.starts().len();
+    world.herdr.remove_agent("acme-data-1-w1");
+    world.later(5);
+    world.settle().await;
+    world.later(35);
+    world.settle().await;
+    assert!(matches!(
+        worker::load(&world.run(KEY), "w1").unwrap().agent.recovery,
+        Recovery::Stale {
+            attempts: 3,
+            reported: true,
+            ..
+        }
+    ));
+    assert_eq!(
+        world.herdr.starts().len(),
+        starts_before_stale,
+        "three resumes is the cap"
+    );
+}
+
+#[tokio::test]
+async fn a_stale_worker_recovery_is_written_to_the_coordinator_inbox_once() {
+    let mut world = World::sample();
+    world.running_issue().await;
+    world.start_worker("api").await;
+    worker::update(&world.run(KEY), "w1", |w| {
+        w.agent.recovery = Recovery::Stale {
+            attempts: 3,
+            reason: "test stale state".into(),
+            reported: false,
+        }
+    })
+    .unwrap();
+    world.settle().await;
+    let items = inbox::unhandled(&world.run(KEY));
+    assert_eq!(items.len(), 1);
+    assert!(
+        items[0]
+            .summary
+            .contains("Automatic resume stopped for worker w1 after 3 attempts")
+    );
+    assert!(matches!(
+        worker::load(&world.run(KEY), "w1").unwrap().agent.recovery,
+        Recovery::Stale { reported: true, .. }
+    ));
+}
+
+#[tokio::test]
+async fn a_worker_report_written_after_a_crash_suppresses_automatic_resume() {
+    let mut world = World::sample();
+    world.running_issue().await;
+    let worker = world.start_worker("api").await;
+    world.settle().await;
+    world.herdr.remove_agent("acme-data-1-w1");
+    world.later(5);
+    world.settle().await;
+    world.report(&worker, "## Report\n\nThe work is complete.\n");
+    world.later(35);
+    world.settle().await;
+    assert_eq!(
+        world.herdr.starts().len(),
+        2,
+        "do not restart a worker that reported"
+    );
+    assert!(worker::report_hash(&worker::load(&world.run(KEY), "w1").unwrap()).is_some());
+    assert!(matches!(
+        worker::load(&world.run(KEY), "w1").unwrap().agent.recovery,
+        Recovery::Suspected { .. }
+    ));
+}
+
+#[tokio::test]
+async fn stopped_finished_and_awaiting_runs_do_not_resume_a_missing_agent() {
+    for gate in ["stopped", "finished", "awaiting_reply"] {
+        let mut world = World::sample();
+        world.running_issue().await;
+        if gate == "awaiting_reply" {
+            commands::ask(&world.ctx(), KEY, "Should I continue?", &[])
+                .await
+                .unwrap();
+            world.settle().await;
+        } else {
+            world
+                .run(KEY)
+                .update(|r| match gate {
+                    "stopped" => r.stopped = true,
+                    _ => r.finished = true,
+                })
+                .unwrap();
+        }
+        world.herdr.restart();
+        world.later(5);
+        world.settle().await;
+        world.later(120);
+        world.settle().await;
+        assert_eq!(world.herdr.starts().len(), 1, "{gate} run was not resumed");
+        if gate == "stopped" {
+            assert_eq!(world.record(KEY).coordinator.recovery, Recovery::None);
+        }
+    }
 }
 
 /// A second workspace whose `DATA` team has its own allowed user and review

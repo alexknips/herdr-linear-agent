@@ -679,6 +679,7 @@ pub async fn worker_restart<H: Herdr>(
     // Before the old workspace closes, so a pass woken by the close finds
     // a worker the watcher leaves alone rather than one whose pane is gone.
     worker::update(&run, id, |w| {
+        w.agent.recovery = crate::run::Recovery::None;
         w.restarting = true;
         w.gone_reported = false;
         w.agent.status = AgentStatus::Open;

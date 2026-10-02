@@ -129,14 +129,15 @@ pub enum EffectDone {
     Started {
         key: AgentKey,
         pane: String,
+        recovery_id: Option<String>,
         result: Result<(), HerdrError>,
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum Effect {
     Place,
-    Start,
+    Start { request_id: Option<String> },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -329,6 +330,13 @@ pub(super) fn apply_tracked(target: &mut AgentRecord, before: &AgentRecord, afte
         last_state_change,
         blocked_reported
     );
+    if before.recovery != after.recovery
+        && target.recovery == before.recovery
+        && target.pane_id == before.pane_id
+        && target.started_at == before.started_at
+    {
+        target.recovery = after.recovery.clone();
+    }
 }
 
 impl Reconciler {
@@ -690,6 +698,18 @@ impl Reconciler {
             agents.extend(worker::list(&run).into_iter().map(|w| w.agent));
             for agent in &agents {
                 agent_deadlines(agent, &mut times);
+                match &agent.recovery {
+                    crate::run::Recovery::Suspected { since, .. } => {
+                        times.extend(after(since, PANE_GRACE))
+                    }
+                    crate::run::Recovery::RetryWait { due_at, .. } => {
+                        times.extend(due_at.parse::<Timestamp>().ok())
+                    }
+                    crate::run::Recovery::Starting { since, .. } => {
+                        times.extend(after(since, DETECTION_GRACE))
+                    }
+                    _ => {}
+                }
                 // A `Waiting for you` self-report stops counting after 5 min.
                 if agent.status == AgentStatus::Open
                     && let Some(report) =

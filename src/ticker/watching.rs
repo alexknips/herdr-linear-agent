@@ -11,7 +11,7 @@ use crate::agents;
 use crate::herdr::{Herdr, PaneId, Snapshot};
 use crate::linear::api::{Activity, Content, ExternalUrl};
 use crate::outbox::{self, Op};
-use crate::run::{AgentRecord, AgentStatus, Run, WaitReason};
+use crate::run::{AgentRecord, AgentStatus, Recovery, Run, WaitReason};
 use crate::worker::{self, Group, Live, Worker};
 use crate::{coordinator, files, inbox, transcript};
 
@@ -43,10 +43,27 @@ impl Reconciler {
         &mut self,
         d: &Deps<'_, H>,
         snapshot: &Snapshot,
+        run: &Run,
+        key: &super::reconcile::AgentKey,
         record: &AgentRecord,
         now: Timestamp,
     ) -> (AgentRecord, Live) {
         let seen = self.live(d, snapshot, record, now);
+        let may_resume = run.record().is_ok_and(|r| {
+            r.status == crate::run::Status::Active
+                && !r.stopped
+                && !r.finished
+                && r.awaiting_reply.is_none()
+        }) && match &key.worker {
+            None => !worker::needs_person(record, &seen),
+            Some(id) => worker::load(run, id).is_ok_and(|w| {
+                !w.restarting
+                    && w.report_hash.is_empty()
+                    && worker::report_hash(&w).is_none()
+                    && w.agent.last_group != "waiting_on_you"
+                    && seen.self_report.as_ref().is_none_or(|r| !r.waiting())
+            }),
+        };
         let mut next = record.clone();
         if let Some((workspace, tab, pane)) = &seen.moved_to {
             next.workspace_id = workspace.clone();
@@ -54,6 +71,32 @@ impl Reconciler {
             next.pane_id = pane.clone();
         }
         if let Some(agent) = &seen.agent {
+            if may_resume
+                && let Recovery::Starting {
+                    attempt, session, ..
+                } = &record.recovery
+                && agent.interactive_ready
+                && agent.status.is_idle()
+            {
+                let prompt = "The previous agent process ended while work was in progress. Reread AGENTS.md and the issue/task context, inspect the current workspace and existing changes, then continue the same task from this session. Do not repeat completed work.";
+                let still_current = run.record().is_ok_and(|r| {
+                    r.status == crate::run::Status::Active
+                        && !r.stopped
+                        && !r.finished
+                        && r.awaiting_reply.is_none()
+                }) && self.agent_record(run, key).is_ok_and(|current| {
+                    current.recovery == record.recovery && current.pane_id == record.pane_id
+                });
+                if still_current
+                    && super::launch::delivered(d.herdr.agent_prompt(&agent.pane, prompt).await)
+                        .is_ok()
+                {
+                    next.recovery = Recovery::Recovered {
+                        attempts: *attempt,
+                        session: session.clone(),
+                    };
+                }
+            }
             if agent.name.as_deref().is_none_or(str::is_empty) && !record.agent_name.is_empty() {
                 let _ = d.herdr.agent_rename(&agent.pane, &record.agent_name).await;
             }
@@ -108,10 +151,76 @@ impl Reconciler {
         let label = coordinator::workspace_label(&record);
         let c = &record.coordinator;
         if c.status == AgentStatus::Open && self.judged(d, snapshot, c, now) {
-            let (mut next, live) = self.track(d, snapshot, c, now).await;
+            let (mut next, live) = self
+                .track(
+                    d,
+                    snapshot,
+                    run,
+                    &super::reconcile::AgentKey::coordinator(&run.key),
+                    c,
+                    now,
+                )
+                .await;
             let needs = worker::needs_person(&next, &live);
+            next.recovery = self
+                .recovery_state(
+                    d,
+                    &next,
+                    &live,
+                    !record.stopped
+                        && !record.finished
+                        && record.awaiting_reply.is_none()
+                        && !needs,
+                    now,
+                )
+                .await;
+            if record.stopped || record.finished || record.status != crate::run::Status::Active {
+                next.recovery = Recovery::None;
+            }
+            let mut stale_notice = None;
+            if let Recovery::Stale {
+                attempts,
+                reason,
+                reported: false,
+            } = next.recovery.clone()
+            {
+                let expected = next.recovery.clone();
+                let body = format!(
+                    "Automatic resume stopped after {attempts} attempts. {reason}. Reply `resume` when ready."
+                );
+                let reported = self
+                    .update_and_push(run, move |r| {
+                        if r.status != crate::run::Status::Active
+                            || r.stopped
+                            || r.finished
+                            || r.awaiting_reply.is_some()
+                            || r.coordinator.recovery != expected
+                        {
+                            return Vec::new();
+                        }
+                        r.coordinator.recovery = Recovery::Stale {
+                            attempts,
+                            reason,
+                            reported: true,
+                        };
+                        r.coordinator_lost = true;
+                        vec![Op::awaiting_reply(
+                            body,
+                            &[("Resume", "resume")],
+                            WaitReason::CoordinatorLost,
+                        )]
+                    })
+                    .await?;
+                if let Recovery::Stale { reported: true, .. } = reported.coordinator.recovery {
+                    next.recovery = reported.coordinator.recovery;
+                    stale_notice = Some(format!("{} coordinator recovery stopped", run.key));
+                }
+            }
             let mut ops = Vec::new();
             let mut notices = Vec::new();
+            if let Some(notice) = stale_notice {
+                notices.push((notice, "Reply `resume` to continue the run.".into()));
+            }
             if needs && !next.blocked_reported {
                 let (op, notice) = Self::person_needed(d, run, &label, "The coordinator", &next);
                 ops.push(op);
@@ -161,12 +270,19 @@ impl Reconciler {
                 self.report_pane(d, snapshot, &next.pane_id, &display, state, now)
                     .await;
             }
-            let back = live.pane_exists && record.coordinator_lost;
+            let back = live.pane_exists
+                && live.agent.is_some()
+                && record.coordinator_lost
+                && !matches!(next.recovery, Recovery::Stale { .. });
             if next != *c || lost || ask_to_resume || back {
                 let before = c.clone();
+                let recovery_stale = matches!(&next.recovery, Recovery::Stale { .. });
                 self.update_and_push(run, move |r| {
                     apply_tracked(&mut r.coordinator, &before, &next);
                     r.coordinator_lost = (r.coordinator_lost || lost) && !back;
+                    if recovery_stale {
+                        r.coordinator_lost = true;
+                    }
                     if back
                         && r.awaiting_reply
                             .as_ref()
@@ -253,12 +369,100 @@ impl Reconciler {
         w: &Worker,
         now: Timestamp,
     ) -> Result<()> {
-        let (tracked, live) = self.track(d, snapshot, &w.agent, now).await;
+        let run_record = run.record()?;
+        let (tracked, live) = self
+            .track(
+                d,
+                snapshot,
+                run,
+                &super::reconcile::AgentKey::worker(&run.key, &w.id),
+                &w.agent,
+                now,
+            )
+            .await;
         let mut next = w.clone();
         next.agent = tracked;
+        let group_before = worker::group(w, &live);
+        next.agent.recovery = self
+            .recovery_state(
+                d,
+                &next.agent,
+                &live,
+                !w.restarting
+                    && w.report_hash.is_empty()
+                    && worker::report_hash(w).is_none()
+                    && group_before != Group::WaitingOnYou
+                    && live.self_report.as_ref().is_none_or(|r| !r.waiting()),
+                now,
+            )
+            .await;
+        if run_record.stopped
+            || run_record.finished
+            || run_record.status != crate::run::Status::Active
+        {
+            next.agent.recovery = Recovery::None;
+        }
+        let mut notices = Vec::new();
+        if let Recovery::Stale {
+            attempts,
+            reason,
+            reported: false,
+        } = next.agent.recovery.clone()
+        {
+            let id = w.id.clone();
+            let expected = next.agent.recovery.clone();
+            let summary = format!(
+                "Automatic resume stopped for worker {} after {attempts} attempts. {reason}. Restart it manually to continue.",
+                w.id
+            );
+            let inbox_summary = summary.clone();
+            let report_reason = reason.clone();
+            let (state_dir, socket) = (d.ctx.state_dir(), d.socket.to_string());
+            let applied = self
+                .guarded(run, move |run, lock| {
+                    let record = run.record()?;
+                    if record.status != crate::run::Status::Active
+                        || record.stopped
+                        || record.finished
+                        || record.awaiting_reply.is_some()
+                    {
+                        return Ok((false, Vec::new()));
+                    }
+                    let current = worker::load(run, &id)?;
+                    if current.agent.recovery != expected
+                        || current.restarting
+                        || !current.report_hash.is_empty()
+                        || worker::report_hash(&current).is_some()
+                        || crate::progress::load(&state_dir, &socket, &current.agent.pane_id)
+                            .is_some_and(|r| r.waiting())
+                    {
+                        return Ok((false, Vec::new()));
+                    }
+                    worker::update_held(run, lock, &id, |w| {
+                        w.agent.recovery = Recovery::Stale {
+                            attempts,
+                            reason: report_reason,
+                            reported: true,
+                        }
+                    })?;
+                    inbox::write_held(run, lock, "worker", &id, &inbox_summary)?;
+                    Ok((true, vec![error_activity(summary)]))
+                })
+                .await?;
+            if applied {
+                next.agent.recovery = Recovery::Stale {
+                    attempts,
+                    reason,
+                    reported: true,
+                };
+                notices.push((
+                    format!("{} worker {} recovery stopped", run.key, w.id),
+                    "See the coordinator inbox for the manual restart instruction.".into(),
+                ));
+            }
+        }
         let mut pull_request = None;
         let mut ops = Vec::new();
-        let mut notices = Vec::new();
 
         // A report written in this pass counts for the group at once.
         if let Some(hash) = worker::report_hash(w).filter(|h| *h != w.report_hash) {
@@ -351,7 +555,6 @@ impl Reconciler {
         for (title, body) in notices {
             d.notify(&title, &body).await;
         }
-
         let group = worker::group(&next, &live);
         let mut milestones = Vec::new();
         if group.token() != w.agent.last_group {
@@ -437,6 +640,122 @@ impl Reconciler {
             .await?;
         }
         Ok(())
+    }
+
+    async fn recovery_state<H: Herdr>(
+        &self,
+        d: &Deps<'_, H>,
+        agent: &AgentRecord,
+        live: &Live,
+        eligible: bool,
+        now: Timestamp,
+    ) -> Recovery {
+        if !self.trusted
+            || !eligible
+            || agent.status != AgentStatus::Open
+            || agent.prompt_pending
+            || agent.prompted_at.is_empty()
+            || !live.pane_exists
+            || live.agent.is_some()
+        {
+            if live.agent.is_some()
+                && let Recovery::Suspected {
+                    session, attempts, ..
+                } = &agent.recovery
+            {
+                return Recovery::Recovered {
+                    attempts: *attempts,
+                    session: if session.is_empty() {
+                        agent.agent_session.clone()
+                    } else {
+                        session.clone()
+                    },
+                };
+            }
+            return agent.recovery.clone();
+        }
+        let (since, session, attempts) = match &agent.recovery {
+            Recovery::None => (now, agent.agent_session.clone(), 0),
+            Recovery::Recovered { attempts, session } => (now, session.clone(), *attempts),
+            Recovery::Suspected {
+                since,
+                session,
+                attempts,
+            } => (since.parse().unwrap_or(now), session.clone(), *attempts),
+            Recovery::Starting {
+                attempt,
+                session,
+                since,
+                ..
+            } => {
+                let at = since.parse::<Timestamp>().unwrap_or(now);
+                if now.duration_since(at) < super::reconcile::DETECTION_GRACE {
+                    return agent.recovery.clone();
+                }
+                if *attempt >= 3 {
+                    return Recovery::Stale {
+                        attempts: *attempt,
+                        reason: "resume did not appear in Herdr".into(),
+                        reported: false,
+                    };
+                }
+                return Recovery::RetryWait {
+                    attempt: *attempt + 1,
+                    due_at: (now
+                        + jiff::SignedDuration::from_secs(if *attempt == 1 { 30 } else { 60 }))
+                    .to_string(),
+                    session: session.clone(),
+                };
+            }
+            _ => return agent.recovery.clone(),
+        };
+        let confirmed = !matches!(agent.recovery, Recovery::None | Recovery::Recovered { .. })
+            && now.duration_since(since) >= PANE_GRACE;
+        if !confirmed {
+            return Recovery::Suspected {
+                since: since.to_string(),
+                session,
+                attempts,
+            };
+        }
+        let found = if !session.is_empty() {
+            Some(session)
+        } else if let Ok(at) = agent.started_at.parse::<Timestamp>() {
+            let roots = transcript::Roots::from_env(d.ctx.env);
+            let (kind, cwd) = (agent.kind.clone(), agent.cwd.clone());
+            tokio::task::spawn_blocking(move || transcript::session_since(&roots, &kind, &cwd, at))
+                .await
+                .ok()
+                .flatten()
+        } else {
+            None
+        };
+        let Some(session) = found.filter(|s| agents::resume_args(&agent.kind, s).is_some()) else {
+            return Recovery::Stale {
+                attempts,
+                reason: "native session could not be found".into(),
+                reported: false,
+            };
+        };
+        if attempts >= 3 {
+            return Recovery::Stale {
+                attempts,
+                reason: "automatic resume limit reached".into(),
+                reported: false,
+            };
+        }
+        let attempt = attempts + 1;
+        Recovery::RetryWait {
+            attempt,
+            due_at: (now
+                + jiff::SignedDuration::from_secs(match attempt {
+                    1 => 15,
+                    2 => 30,
+                    _ => 60,
+                }))
+            .to_string(),
+            session,
+        }
     }
 
     /// An ephemeral thought after 10 minutes without an activity says what

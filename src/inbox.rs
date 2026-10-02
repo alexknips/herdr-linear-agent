@@ -103,6 +103,16 @@ fn parse(text: &str) -> Option<Item> {
 /// Writes an item and returns its id, `<time>-<kind>-<subject>-<n>`.
 pub fn write(run: &Run, kind: &str, subject: &str, summary: &str) -> Result<String> {
     let _lock = run.lock()?;
+    write_held(run, &_lock, kind, subject, summary)
+}
+
+pub fn write_held(
+    run: &Run,
+    _lock: &crate::run::RunLock,
+    kind: &str,
+    subject: &str,
+    summary: &str,
+) -> Result<String> {
     let n = files::read_json::<u64>(&counter_path(run)).unwrap_or(0) + 1;
     files::write_json(&counter_path(run), &n)?;
     let created = files::now();

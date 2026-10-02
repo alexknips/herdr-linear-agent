@@ -349,6 +349,9 @@ impl Reconciler {
                     r.reply_generation = r.reply_generation.saturating_add(1);
                     r.stopped = false;
                     r.finished = false;
+                    if resume {
+                        r.coordinator.recovery = crate::run::Recovery::None;
+                    }
                     if let Some(wait) = r.awaiting_reply.take() {
                         if wait.reason == WaitReason::RunTimeout {
                             r.timeout_since = restart_window.clone();

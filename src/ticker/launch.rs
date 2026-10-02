@@ -105,14 +105,40 @@ impl Reconciler {
         let key = match &done {
             EffectDone::Placed { key, .. } | EffectDone::Started { key, .. } => key.clone(),
         };
-        self.in_flight.remove(&key);
         let Ok(run) = Run::load(&d.ctx.runs_dir(), &key.run) else {
             return;
         };
+        let effect_matches = match &done {
+            EffectDone::Placed { .. } => matches!(self.in_flight.get(&key), Some(Effect::Place)),
+            EffectDone::Started { recovery_id, .. } => matches!(
+                self.in_flight.get(&key),
+                Some(Effect::Start { request_id }) if request_id == recovery_id
+            ),
+        };
+        if !effect_matches {
+            return;
+        }
+        self.in_flight.remove(&key);
+        if let EffectDone::Started {
+            recovery_id: Some(id),
+            ..
+        } = &done
+        {
+            let current = self.agent_record(&run, &key).is_ok_and(|a| matches!(a.recovery, crate::run::Recovery::Starting { request_id, .. } if request_id == *id));
+            if !current {
+                return;
+            }
+        }
         let result = match done {
             EffectDone::Placed { result, .. } => self.placed(d, &run, &key, result, now).await,
-            EffectDone::Started { pane, result, .. } => {
-                self.started(&run, &key, pane, result, now).await
+            EffectDone::Started {
+                pane,
+                recovery_id,
+                result,
+                ..
+            } => {
+                self.started(d, &run, &key, (pane, recovery_id, result), now)
+                    .await
             }
         };
         if let Err(error) = result {
@@ -173,20 +199,65 @@ impl Reconciler {
         }
     }
 
-    async fn started(
+    async fn started<H: Herdr>(
         &mut self,
+        d: &Deps<'_, H>,
         run: &Run,
         key: &AgentKey,
-        pane: String,
-        result: Result<(), HerdrError>,
+        (pane, recovery_id, result): (String, Option<String>, Result<(), HerdrError>),
         now: Timestamp,
     ) -> Result<()> {
         // A result for a pane the agent left (a restart, a close) is dropped.
         let current = self
             .agent_record(run, key)
             .is_ok_and(|a| a.status == AgentStatus::Open && a.pane_id == pane)
-            && run.record().is_ok_and(|r| r.status == Status::Active);
+            && run.record().is_ok_and(|r| {
+                r.status == Status::Active
+                    && !r.stopped
+                    && !r.finished
+                    && r.awaiting_reply.is_none()
+            });
         if !current {
+            return Ok(());
+        }
+        if let Some(id) = recovery_id {
+            let expected = self.agent_record(run, key)?.recovery;
+            if !matches!(&expected, crate::run::Recovery::Starting { request_id, .. } if *request_id == id)
+            {
+                return Ok(());
+            }
+            let (failed, reason) = match result {
+                Ok(()) | Err(HerdrError::OutcomeUnknown(_)) => return Ok(()),
+                Err(HerdrError::NotSent(_)) => {
+                    (true, "Herdr did not send the resume request".to_string())
+                }
+                Err(error) => (true, error.to_string()),
+            };
+            if failed {
+                let mut stale = None;
+                let mut due = None;
+                if let crate::run::Recovery::Starting {
+                    attempt, session, ..
+                } = self.agent_record(run, key)?.recovery
+                {
+                    if attempt >= 3 {
+                        stale = Some(attempt);
+                    } else {
+                        let next = attempt + 1;
+                        due = Some((
+                            next,
+                            now + jiff::SignedDuration::from_secs(if next == 2 { 30 } else { 60 }),
+                            session,
+                        ));
+                    }
+                }
+                if let Some(attempts) = stale {
+                    self.mark_stale(d, key, expected, attempts, reason).await?;
+                } else if let Some((attempt, due, session)) = due {
+                    self.retry_failed_start(run, key, expected, attempt, due, session)
+                        .await?;
+                }
+            }
             return Ok(());
         }
         match result {
@@ -284,17 +355,379 @@ impl Reconciler {
         Ok(())
     }
 
-    fn agent_record(&self, run: &Run, key: &AgentKey) -> Result<AgentRecord> {
+    pub(super) fn agent_record(&self, run: &Run, key: &AgentKey) -> Result<AgentRecord> {
         Ok(match &key.worker {
             None => run.record()?.coordinator,
             Some(id) => worker::load(run, id)?.agent,
         })
     }
 
+    async fn retry_failed_start(
+        &mut self,
+        run: &Run,
+        key: &AgentKey,
+        expected: crate::run::Recovery,
+        attempt: u8,
+        due: Timestamp,
+        session: String,
+    ) -> Result<()> {
+        let worker_id = key.worker.clone();
+        self.guarded(run, move |run, lock| {
+            let record = run.record()?;
+            if record.status != Status::Active
+                || record.stopped
+                || record.finished
+                || record.awaiting_reply.is_some()
+            {
+                return Ok((false, Vec::new()));
+            }
+            let matches = match &worker_id {
+                None => {
+                    record.coordinator.recovery == expected
+                        && record.coordinator.status == AgentStatus::Open
+                }
+                Some(id) => {
+                    let w = worker::load(run, id)?;
+                    w.agent.recovery == expected
+                        && w.agent.status == AgentStatus::Open
+                        && !w.restarting
+                        && w.report_hash.is_empty()
+                        && worker::report_hash(&w).is_none()
+                }
+            };
+            if !matches {
+                return Ok((false, Vec::new()));
+            }
+            let change = |a: &mut AgentRecord| {
+                a.recovery = crate::run::Recovery::RetryWait {
+                    attempt,
+                    due_at: due.to_string(),
+                    session,
+                }
+            };
+            match worker_id {
+                None => {
+                    run.update_held(lock, |r| change(&mut r.coordinator))?;
+                }
+                Some(id) => {
+                    worker::update_held(run, lock, &id, |w| change(&mut w.agent))?;
+                }
+            }
+            Ok((true, Vec::new()))
+        })
+        .await?;
+        Ok(())
+    }
+
+    async fn start_recovery<H: Herdr + Clone + 'static>(
+        &mut self,
+        d: &Deps<'_, H>,
+        snapshot: &Snapshot,
+        key: &AgentKey,
+        agent: &AgentRecord,
+        trusted: &[String],
+        now: Timestamp,
+    ) -> Result<()> {
+        let crate::run::Recovery::RetryWait {
+            attempt,
+            due_at,
+            session,
+        } = &agent.recovery
+        else {
+            return Ok(());
+        };
+        if agent.status != AgentStatus::Open
+            || agent.prompt_pending
+            || self.in_flight.contains_key(key)
+            || !pane_is_empty(snapshot, &agent.pane_id)
+            || self.waits(key, agent, now)
+            || now
+                < due_at
+                    .parse::<Timestamp>()
+                    .unwrap_or(now + jiff::SignedDuration::from_secs(3600))
+        {
+            return Ok(());
+        }
+        let current_run = Run::load(&d.ctx.runs_dir(), &key.run)?;
+        let run_state = current_run.record()?;
+        if run_state.status != Status::Active
+            || run_state.stopped
+            || run_state.finished
+            || run_state.awaiting_reply.is_some()
+        {
+            return Ok(());
+        }
+        if let Some(id) = &key.worker {
+            let w = worker::load(&current_run, id)?;
+            if w.restarting
+                || !w.report_hash.is_empty()
+                || worker::report_hash(&w).is_some()
+                || w.agent.last_group == "waiting_on_you"
+                || crate::progress::load(&d.ctx.state_dir(), d.socket, &w.agent.pane_id)
+                    .is_some_and(|r| r.waiting())
+            {
+                return Ok(());
+            }
+        }
+        if agents::resume_args(&agent.kind, session).is_none() {
+            self.mark_stale(
+                d,
+                key,
+                agent.recovery.clone(),
+                *attempt,
+                "native session cannot be resumed".into(),
+            )
+            .await?;
+            return Ok(());
+        }
+        let mut resumed = agent.clone();
+        resumed.resume = true;
+        resumed.agent_session = session.clone();
+        let args = start_args(d.config, &resumed, session)?;
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let (session, pane, at) = (session.clone(), agent.pane_id.clone(), now.to_string());
+        let count = *attempt;
+        let expected = agent.recovery.clone();
+        let reserve_key = key.clone();
+        let reserve_pane = pane.clone();
+        let reserve_id = request_id.clone();
+        let reserve_at = at.clone();
+        let reserve_session = session.clone();
+        let reserve_id_worker = reserve_id.clone();
+        let reserve_at_worker = reserve_at.clone();
+        let reserve_session_worker = reserve_session.clone();
+        let reserve_socket = d.socket.to_string();
+        let reserve_state_dir = d.ctx.state_dir();
+        let run = Run::load(&d.ctx.runs_dir(), &key.run)?;
+        let reserved = self
+            .guarded(&run, move |run, lock| {
+                let record = run.record()?;
+                if record.status != Status::Active
+                    || record.stopped
+                    || record.finished
+                    || record.awaiting_reply.is_some()
+                {
+                    return Ok((false, Vec::new()));
+                }
+                let ok = match &reserve_key.worker {
+                    None => {
+                        let a = &record.coordinator;
+                        if record.coordinator_lost
+                            || a.status != AgentStatus::Open
+                            || a.pane_id != reserve_pane
+                            || a.recovery != expected
+                        {
+                            false
+                        } else {
+                            run.update_held(lock, |r| {
+                                r.coordinator.recovery = crate::run::Recovery::Starting {
+                                    attempt: count,
+                                    request_id: reserve_id,
+                                    since: reserve_at,
+                                    session: reserve_session.clone(),
+                                };
+                                r.coordinator.resume = true;
+                                r.coordinator.agent_session = reserve_session.clone();
+                            })?;
+                            true
+                        }
+                    }
+                    Some(id) => {
+                        let w = worker::load(run, id)?;
+                        if w.restarting
+                            || !w.report_hash.is_empty()
+                            || worker::report_hash(&w).is_some()
+                            || w.agent.last_group == "waiting_on_you"
+                            || crate::progress::load(
+                                &reserve_state_dir,
+                                &reserve_socket,
+                                &w.agent.pane_id,
+                            )
+                            .is_some_and(|r| r.waiting())
+                            || w.agent.status != AgentStatus::Open
+                            || w.agent.pane_id != reserve_pane
+                            || w.agent.recovery != expected
+                        {
+                            false
+                        } else {
+                            worker::update_held(run, lock, id, |w| {
+                                w.agent.recovery = crate::run::Recovery::Starting {
+                                    attempt: count,
+                                    request_id: reserve_id_worker,
+                                    since: reserve_at_worker,
+                                    session: reserve_session_worker.clone(),
+                                };
+                                w.agent.resume = true;
+                                w.agent.agent_session = reserve_session_worker.clone();
+                            })?;
+                            true
+                        }
+                    }
+                };
+                Ok((ok, Vec::new()))
+            })
+            .await?;
+        if !reserved {
+            return Ok(());
+        }
+        if d.config.claude.auto_accept_trust_dialog && agent.kind == "claude" {
+            let dirs: Vec<&str> = trusted.iter().map(String::as_str).collect();
+            if let Err(error) = claude_trust::trust(d.ctx.env, &dirs) {
+                d.fail(&key.run, &error);
+            }
+        }
+        // Trust setup can take time. A stop, manual restart or report may
+        // have invalidated the reservation before the native request starts.
+        let run = Run::load(&d.ctx.runs_dir(), &key.run)?;
+        let expected_start = crate::run::Recovery::Starting {
+            attempt: count,
+            request_id: request_id.clone(),
+            since: at.clone(),
+            session: session.clone(),
+        };
+        let worker_id = key.worker.clone();
+        let pane_check = pane.clone();
+        let (state_dir, socket) = (d.ctx.state_dir(), d.socket.to_string());
+        let still_eligible = self
+            .guarded(&run, move |run, _lock| {
+                let record = run.record()?;
+                if record.status != Status::Active
+                    || record.stopped
+                    || record.finished
+                    || record.awaiting_reply.is_some()
+                {
+                    return Ok((false, Vec::new()));
+                }
+                let matches = match worker_id {
+                    None => {
+                        !record.coordinator_lost
+                            && record.coordinator.status == AgentStatus::Open
+                            && record.coordinator.pane_id == pane_check
+                            && record.coordinator.recovery == expected_start
+                    }
+                    Some(id) => {
+                        let w = worker::load(run, &id)?;
+                        w.agent.status == AgentStatus::Open
+                            && w.agent.pane_id == pane_check
+                            && w.agent.recovery == expected_start
+                            && !w.restarting
+                            && w.report_hash.is_empty()
+                            && worker::report_hash(&w).is_none()
+                            && w.agent.last_group != "waiting_on_you"
+                            && !crate::progress::load(&state_dir, &socket, &w.agent.pane_id)
+                                .is_some_and(|r| r.waiting())
+                    }
+                };
+                Ok((matches, Vec::new()))
+            })
+            .await?;
+        if !still_eligible {
+            return Ok(());
+        }
+        self.in_flight.insert(
+            key.clone(),
+            Effect::Start {
+                request_id: Some(request_id.clone()),
+            },
+        );
+        let (herdr, done) = (d.herdr.clone(), self.effects.clone());
+        let (key, name, kind, recovery_id) = (
+            key.clone(),
+            agent.agent_name.clone(),
+            agent.kind.clone(),
+            request_id,
+        );
+        tokio::spawn(async move {
+            let result = herdr
+                .agent_start(&name, &kind, &PaneId(pane.clone()), &args)
+                .await;
+            let _ = done
+                .send(EffectDone::Started {
+                    key,
+                    pane,
+                    recovery_id: Some(recovery_id),
+                    result,
+                })
+                .await;
+        });
+        Ok(())
+    }
+
+    async fn mark_stale<H: Herdr>(
+        &mut self,
+        d: &Deps<'_, H>,
+        key: &AgentKey,
+        expected: crate::run::Recovery,
+        attempts: u8,
+        reason: String,
+    ) -> Result<()> {
+        let worker_id = key.worker.clone();
+        let (state_dir, socket) = (d.ctx.state_dir(), d.socket.to_string());
+        self.guarded(
+            &Run::load(&d.ctx.runs_dir(), &key.run)?,
+            move |run, lock| {
+                let current = match &worker_id {
+                    None => run.record()?.coordinator.recovery,
+                    Some(id) => worker::load(run, id)?.agent.recovery,
+                };
+                let run_record = run.record()?;
+                if run_record.status != Status::Active
+                    || run_record.stopped
+                    || run_record.finished
+                    || run_record.awaiting_reply.is_some()
+                {
+                    return Ok((false, Vec::new()));
+                }
+                if current != expected
+                    || matches!(
+                        current,
+                        crate::run::Recovery::Stale { .. }
+                            | crate::run::Recovery::None
+                            | crate::run::Recovery::Recovered { .. }
+                    )
+                {
+                    return Ok((false, Vec::new()));
+                }
+                let eligible = match &worker_id {
+                    None => run.record()?.coordinator.status == AgentStatus::Open,
+                    Some(id) => {
+                        let worker = worker::load(run, id)?;
+                        worker.agent.status == AgentStatus::Open
+                            && !worker.restarting
+                            && worker.report_hash.is_empty()
+                            && worker::report_hash(&worker).is_none()
+                            && worker.agent.last_group != "waiting_on_you"
+                            && !crate::progress::load(&state_dir, &socket, &worker.agent.pane_id)
+                                .is_some_and(|r| r.waiting())
+                    }
+                };
+                if !eligible {
+                    return Ok((false, Vec::new()));
+                }
+                let stale = crate::run::Recovery::Stale {
+                    attempts,
+                    reason,
+                    reported: false,
+                };
+                match worker_id.clone() {
+                    None => {
+                        run.update_held(lock, |r| r.coordinator.recovery = stale)?;
+                    }
+                    Some(id) => {
+                        worker::update_held(run, lock, &id, |w| w.agent.recovery = stale)?;
+                    }
+                }
+                Ok((true, Vec::new()))
+            },
+        )
+        .await?;
+        Ok(())
+    }
+
     fn start_in_flight(&self, run: &str) -> bool {
         self.in_flight
             .iter()
-            .any(|(key, effect)| key.run == run && *effect == Effect::Start)
+            .any(|(key, effect)| key.run == run && matches!(effect, Effect::Start { .. }))
     }
 
     pub(super) async fn launch<H: Herdr + Clone + 'static>(
@@ -340,6 +773,11 @@ impl Reconciler {
         }));
         if trusted && !self.start_in_flight(&run.key) {
             for (key, agent, trusted) in &candidates {
+                self.start_recovery(d, snapshot, key, agent, trusted, now)
+                    .await?;
+                if self.in_flight.contains_key(key) {
+                    break;
+                }
                 if self.start(d, snapshot, key, agent, trusted, now)? {
                     break;
                 }
@@ -442,7 +880,8 @@ impl Reconciler {
         }
         self.launched.remove(key);
         self.not_sent.remove(key);
-        self.in_flight.insert(key.clone(), Effect::Start);
+        self.in_flight
+            .insert(key.clone(), Effect::Start { request_id: None });
         let (herdr, done) = (d.herdr.clone(), self.effects.clone());
         let (key, name, kind, pane) = (
             key.clone(),
@@ -454,7 +893,14 @@ impl Reconciler {
             let result = herdr
                 .agent_start(&name, &kind, &PaneId(pane.clone()), &args)
                 .await;
-            let _ = done.send(EffectDone::Started { key, pane, result }).await;
+            let _ = done
+                .send(EffectDone::Started {
+                    key,
+                    pane,
+                    recovery_id: None,
+                    result,
+                })
+                .await;
         });
         Ok(true)
     }

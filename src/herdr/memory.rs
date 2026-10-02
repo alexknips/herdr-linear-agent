@@ -69,6 +69,8 @@ struct Model {
     prompt_unknown: bool,
     /// The next `agent.start` fails as `NotSent` without doing anything.
     start_not_sent: bool,
+    /// The next `agent.start` takes effect, then loses its answer.
+    start_unknown: bool,
     /// Every request fails as `NotSent`.
     down: bool,
     /// The next snapshot is built, then answered only after the test let
@@ -301,6 +303,10 @@ impl FakeHerdr {
         self.model().start_not_sent = true;
     }
 
+    pub fn next_start_unknown(&self) {
+        self.model().start_unknown = true;
+    }
+
     /// Holds the next snapshot's answer: the first receiver fires once it
     /// is built, and the answer goes out when the sender is used.
     pub fn hold_next_snapshot(&self) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
@@ -375,6 +381,13 @@ impl FakeHerdr {
     /// Herdr restarted: panes stay, agents are gone.
     pub fn restart(&self) {
         self.model().agents.clear();
+    }
+
+    /// One agent process ends while its pane and other agents survive.
+    pub fn remove_agent(&self, name: &str) {
+        self.model()
+            .agents
+            .retain(|_, found| found.agent.name.as_deref() != Some(name));
     }
 }
 
@@ -479,6 +492,7 @@ impl Herdr for FakeHerdr {
             agent.interactive_ready = false;
         }
         let hidden_for = model.detection_lag;
+        let unknown = std::mem::take(&mut model.start_unknown);
         model
             .agents
             .insert(pane.clone(), FakeAgent { agent, hidden_for });
@@ -487,6 +501,9 @@ impl Herdr for FakeHerdr {
                 code,
                 message: "startup failed".into(),
             }),
+            None if unknown => Err(HerdrError::OutcomeUnknown(
+                "the fake Herdr lost the start response".into(),
+            )),
             None => Ok(()),
         }
     }
