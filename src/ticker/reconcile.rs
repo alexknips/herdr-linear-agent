@@ -268,15 +268,11 @@ pub(super) async fn inbox_item(
 }
 
 pub(super) fn thought(body: impl Into<String>) -> Op {
-    Op::Activity {
-        activity: Activity::new(Content::Thought { body: body.into() }),
-    }
+    Op::activity(Activity::new(Content::Thought { body: body.into() }))
 }
 
 pub(super) fn error_activity(body: impl Into<String>) -> Op {
-    Op::Activity {
-        activity: Activity::new(Content::Error { body: body.into() }),
-    }
+    Op::activity(Activity::new(Content::Error { body: body.into() }))
 }
 
 pub(super) fn since(timestamp: &str, now: Timestamp) -> Option<SignedDuration> {
@@ -450,11 +446,11 @@ impl Reconciler {
         std::mem::take(&mut self.queued)
     }
 
-    pub(super) async fn push(&mut self, run: &Run, op: Op) -> Result<()> {
+    pub(super) async fn push(&mut self, run: &Run, op: Op) -> Result<bool> {
         let run = run.clone();
-        blocking(move || outbox::push(&run, op).map(|_| ())).await?;
-        self.queued = true;
-        Ok(())
+        let queued = blocking(move || outbox::push(&run, op).map(|id| id.is_some())).await?;
+        self.queued |= queued;
+        Ok(queued)
     }
 
     /// One critical section under the run lock: `work` writes the fields
@@ -470,9 +466,9 @@ impl Reconciler {
         let (value, queued) = blocking(move || {
             let lock = run.lock()?;
             let (value, ops) = work(&run, &lock)?;
-            let queued = !ops.is_empty();
+            let mut queued = false;
             for op in ops {
-                outbox::push_held(&run, &lock, op)?;
+                queued |= outbox::push_held(&run, &lock, op)?.is_some();
             }
             Ok((value, queued))
         })
@@ -713,7 +709,7 @@ impl Reconciler {
             }
             if !record.session_id.is_empty() && !record.stopped {
                 times.extend(after(&record.last_activity, HEARTBEAT));
-                if !record.timeout_asked {
+                if record.awaiting_reply.is_none() {
                     times.extend(after(&record.timeout_since, timeout));
                 }
             }

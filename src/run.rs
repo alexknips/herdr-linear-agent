@@ -106,6 +106,21 @@ pub enum Status {
     Closed,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WaitReason {
+    CoordinatorQuestion,
+    RunTimeout,
+    CoordinatorLost,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AwaitingReply {
+    pub activity_id: String,
+    pub asked_at: String,
+    pub reason: WaitReason,
+}
+
 /// Where an agent (coordinator or worker) is in its life.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
@@ -230,7 +245,17 @@ pub struct RunRecord {
     /// When the run timeout was last reset (the start, or a reply to the timeout question).
     pub timeout_since: String,
     /// The run timeout question was asked and not answered yet.
+    /// Compatibility input for records written before `awaiting_reply`.
     pub timeout_asked: bool,
+    /// The one Linear-native question whose answer can resume the run.
+    pub awaiting_reply: Option<AwaitingReply>,
+    /// Prevents a cleared, still-queued question from being restored after a
+    /// restart while its unknown Linear write is being reconciled.
+    #[serde(default)]
+    pub cleared_wait_id: String,
+    /// Advances only for a newly accepted allowed prompt; it distinguishes
+    /// a pending question from one answered while its write was uncertain.
+    pub reply_generation: u64,
     /// The coordinator's pane is gone and a resume question was asked.
     pub coordinator_lost: bool,
     /// A person pressed stop: no prompt or heartbeat goes out until they
@@ -364,7 +389,65 @@ impl Run {
         let path = self.record_path();
         let text = std::fs::read_to_string(&path)
             .with_context(|| format!("could not read {}", path.display()))?;
-        serde_json::from_str(&text).with_context(|| format!("{} does not parse", path.display()))
+        let mut record: RunRecord = serde_json::from_str(&text)
+            .with_context(|| format!("{} does not parse", path.display()))?;
+        if record.awaiting_reply.is_none() {
+            if record.timeout_asked {
+                record.awaiting_reply = Some(AwaitingReply {
+                    activity_id: String::new(),
+                    asked_at: record.timeout_since.clone(),
+                    reason: WaitReason::RunTimeout,
+                });
+                record.timeout_asked = false;
+            } else if record.status == Status::Active && !record.stopped && !record.finished {
+                record.awaiting_reply = self
+                    .queued_wait(record.reply_generation)?
+                    .filter(|wait| wait.activity_id != record.cleared_wait_id);
+            }
+        }
+        Ok(record)
+    }
+
+    fn queued_wait(&self, reply_generation: u64) -> Result<Option<AwaitingReply>> {
+        let dir = self.state_dir().join("outbox");
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return Ok(None);
+        };
+        let mut paths: Vec<_> = entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+            .collect();
+        paths.sort();
+        for path in paths.into_iter().rev() {
+            let Ok(text) = std::fs::read_to_string(path) else {
+                continue;
+            };
+            let Ok(request) = serde_json::from_str::<serde_json::Value>(&text) else {
+                continue;
+            };
+            let (Some(activity_id), Some(asked_at), Some(reason)) = (
+                request["id"].as_str(),
+                request["created"].as_str(),
+                request["wait_reason"].as_str(),
+            ) else {
+                continue;
+            };
+            let generation = request["wait_generation"].as_u64().unwrap_or_default();
+            let Ok(reason) = serde_json::from_value(serde_json::Value::String(reason.into()))
+            else {
+                continue;
+            };
+            if generation != reply_generation {
+                continue;
+            }
+            return Ok(Some(AwaitingReply {
+                activity_id: activity_id.into(),
+                asked_at: asked_at.into(),
+                reason,
+            }));
+        }
+        Ok(None)
     }
 
     /// Read-modify-write of the record under the lock: `change` touches only

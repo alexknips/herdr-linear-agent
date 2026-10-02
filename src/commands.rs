@@ -141,14 +141,16 @@ pub async fn plan_set(ctx: &Ctx<'_>, key: &str, text: &str) -> Result<()> {
 pub async fn say(ctx: &Ctx<'_>, key: &str, text: &str) -> Result<()> {
     non_empty(text, "text")?;
     let (_, run, _) = load_active(ctx, key).await?;
-    outbox::push(
+    if outbox::push(
         &run,
-        Op::Activity {
-            activity: Activity::new(Content::Thought {
-                body: text.trim().to_string(),
-            }),
-        },
-    )?;
+        Op::activity(Activity::new(Content::Thought {
+            body: text.trim().to_string(),
+        })),
+    )?
+    .is_none()
+    {
+        bail!("run {key} is awaiting a reply or has stopped");
+    }
     ticker::poke(&ctx.state_dir());
     println!("queued for the Linear session");
     Ok(())
@@ -171,7 +173,9 @@ pub async fn ask(ctx: &Ctx<'_>, key: &str, text: &str, options: &[(String, Strin
         .iter()
         .map(|(label, value)| (label.as_str(), value.as_str()))
         .collect();
-    outbox::push(&run, Op::elicitation(text.trim(), &options))?;
+    if outbox::push(&run, Op::elicitation(text.trim(), &options))?.is_none() {
+        bail!("run {key} is already awaiting a reply or has stopped");
+    }
     ticker::poke(&ctx.state_dir());
     println!(
         "the question is queued for the Linear session; end your turn, the answer arrives in your inbox"
@@ -213,21 +217,25 @@ pub async fn finish<H: Herdr>(
             blocking.join(", ")
         );
     }
-    outbox::push(
+    let lock = run.lock()?;
+    outbox::push_held(
         &run,
-        Op::Activity {
-            activity: Activity::new(Content::Response {
-                body: text.trim().to_string(),
-            }),
-        },
+        &lock,
+        Op::activity(Activity::new(Content::Response {
+            body: text.trim().to_string(),
+        })),
     )?;
-    outbox::push(
+    outbox::push_held(
         &run,
+        &lock,
         Op::IssueState {
             target: StateTarget::Review,
         },
     )?;
-    run.update(|r| {
+    run.update_held(&lock, |r| {
+        if let Some(wait) = r.awaiting_reply.take() {
+            r.cleared_wait_id = wait.activity_id;
+        }
         r.finished = true;
         r.postmortem_due
             .get_or_insert(crate::postmortem::Stage::Interim);
@@ -1366,11 +1374,9 @@ mod tests {
         assert_eq!(
             ops,
             [
-                Op::Activity {
-                    activity: Activity::new(Content::Response {
-                        body: "Opened the PR.".into()
-                    })
-                },
+                Op::activity(Activity::new(Content::Response {
+                    body: "Opened the PR.".into()
+                })),
                 Op::IssueState {
                     target: StateTarget::Review
                 }

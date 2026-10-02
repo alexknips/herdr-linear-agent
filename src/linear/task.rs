@@ -858,9 +858,7 @@ mod tests {
     }
 
     fn thought(body: &str) -> Op {
-        Op::Activity {
-            activity: Activity::new(Content::Thought { body: body.into() }),
-        }
+        Op::activity(Activity::new(Content::Thought { body: body.into() }))
     }
 
     struct Setup {
@@ -1021,7 +1019,9 @@ mod tests {
         let mut task = task();
         step(&mut task, &s.linear, &queries, at(0)).await;
 
-        let refused = outbox::push(&s.runs[0], thought("refused")).unwrap();
+        let refused = outbox::push(&s.runs[0], thought("refused"))
+            .unwrap()
+            .unwrap();
         s.fake().fail_next = Some(ApiError::Graphql("Entity not found".into()));
         assert_eq!(step(&mut task, &s.linear, &queries, at(1)).await, []);
         assert!(outbox::pending(&s.runs[0]).is_empty());

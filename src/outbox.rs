@@ -16,7 +16,7 @@ use crate::files;
 use crate::linear::ApiError;
 use crate::linear::api::{Activity, Content, ExternalUrl, IssueDetail};
 use crate::linear::client::LinearApi;
-use crate::run::{Run, RunLock};
+use crate::run::{AwaitingReply, Run, RunLock, WaitReason};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -34,6 +34,8 @@ pub enum StateTarget {
 pub enum Op {
     Activity {
         activity: Activity,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        wait_reason: Option<WaitReason>,
     },
     Plan {
         plan: Value,
@@ -57,6 +59,14 @@ pub enum Op {
 impl Op {
     /// A question; with options, Linear shows them as a select.
     pub fn elicitation(body: impl Into<String>, options: &[(&str, &str)]) -> Op {
+        Self::awaiting_reply(body, options, WaitReason::CoordinatorQuestion)
+    }
+
+    pub fn awaiting_reply(
+        body: impl Into<String>,
+        options: &[(&str, &str)],
+        reason: WaitReason,
+    ) -> Op {
         let mut activity = Activity::new(Content::Elicitation { body: body.into() });
         if !options.is_empty() {
             activity.signal = Some("select".into());
@@ -66,7 +76,17 @@ impl Op {
                 .collect();
             activity.signal_metadata = Some(json!({ "options": options }));
         }
-        Op::Activity { activity }
+        Op::Activity {
+            activity,
+            wait_reason: Some(reason),
+        }
+    }
+
+    pub fn activity(activity: Activity) -> Op {
+        Op::Activity {
+            activity,
+            wait_reason: None,
+        }
     }
 }
 
@@ -78,6 +98,10 @@ pub struct Request {
     /// A send was started; its outcome is checked by a read before any resend.
     #[serde(default)]
     pub attempted: bool,
+    /// Accepted-prompt generation when the question was queued. This uses a
+    /// local monotonic token, not a comparison between server and local time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait_generation: Option<u64>,
     #[serde(flatten)]
     pub op: Op,
 }
@@ -88,14 +112,36 @@ fn outbox_dir(run: &Run) -> PathBuf {
 
 /// Queues one request. File names carry a counter allocated under the run
 /// lock, so requests are sent in the order they were written.
-pub fn push(run: &Run, op: Op) -> Result<String> {
+pub fn push(run: &Run, op: Op) -> Result<Option<String>> {
     let lock = run.lock()?;
     push_held(run, &lock, op)
 }
 
 /// `push` for a caller that holds the run lock, so a request is queued in
 /// the same critical section as the record field that guards it.
-pub fn push_held(run: &Run, _lock: &RunLock, op: Op) -> Result<String> {
+pub fn push_held(run: &Run, lock: &RunLock, op: Op) -> Result<Option<String>> {
+    let mut record = run.record()?;
+    let wait_reason = match &op {
+        Op::Activity {
+            activity,
+            wait_reason,
+        } => {
+            let terminal = matches!(activity.content, Content::Response { .. });
+            if !terminal
+                && (record.status != crate::run::Status::Active
+                    || record.stopped
+                    || record.finished
+                    || record.awaiting_reply.is_some())
+            {
+                if wait_reason.is_some() {
+                    return Ok(None);
+                }
+                return Ok(None);
+            }
+            *wait_reason
+        }
+        _ => None,
+    };
     let counter_path = run.state_dir().join("outbox-counter.json");
     let n: u64 = files::read_json::<u64>(&counter_path).unwrap_or(0) + 1;
     files::write_json(&counter_path, &n)?;
@@ -103,10 +149,20 @@ pub fn push_held(run: &Run, _lock: &RunLock, op: Op) -> Result<String> {
         id: uuid::Uuid::new_v4().to_string(),
         created: files::now(),
         attempted: false,
+        wait_generation: wait_reason.map(|_| record.reply_generation),
         op,
     };
     files::write_json(&outbox_dir(run).join(format!("{n:010}.json")), &request)?;
-    Ok(request.id)
+    if let Some(reason) = wait_reason {
+        record.awaiting_reply = Some(AwaitingReply {
+            activity_id: request.id.clone(),
+            asked_at: request.created.clone(),
+            reason,
+        });
+        record.timeout_asked = false;
+        run.update_held(lock, |current| *current = record)?;
+    }
+    Ok(Some(request.id))
 }
 
 fn queued_paths(run: &Run) -> Vec<PathBuf> {
@@ -194,6 +250,7 @@ pub async fn send(
         let outcome = send_one(
             &path,
             &mut request,
+            run,
             session_id,
             issue_id,
             review_state,
@@ -201,13 +258,40 @@ pub async fn send(
         )
         .await;
         match outcome {
-            Ok(()) => {
+            Ok(activity_confirmed) => {
                 let _ = std::fs::remove_file(&path);
                 sent.count += 1;
-                sent.activity_sent |= matches!(request.op, Op::Activity { .. });
+                sent.activity_sent |=
+                    activity_confirmed && matches!(request.op, Op::Activity { .. });
             }
             Err(error) if definitive(&error) => {
+                let is_wait = matches!(
+                    request.op,
+                    Op::Activity {
+                        wait_reason: Some(_),
+                        ..
+                    }
+                );
+                let refused_wait = if is_wait {
+                    match clear_refused_wait(run, &request.id) {
+                        Ok(cleared) => cleared,
+                        Err(failure) => {
+                            sent.blocked = Some(failure);
+                            break;
+                        }
+                    }
+                } else {
+                    false
+                };
                 set_aside(&path);
+                if refused_wait {
+                    let _ = crate::inbox::write(
+                        run,
+                        "linear",
+                        "question",
+                        "Linear refused a question from this run. The coordinator may continue; see the ticker log for the error.",
+                    );
+                }
                 sent.refused.push((request, error));
             }
             Err(error) => {
@@ -222,11 +306,19 @@ pub async fn send(
 async fn send_one(
     path: &Path,
     request: &mut Request,
+    run: &Run,
     session_id: &str,
     issue_id: &str,
     review_state: &str,
     linear: &impl LinearApi,
-) -> Result<(), ApiError> {
+) -> Result<bool, ApiError> {
+    let is_wait = matches!(
+        &request.op,
+        Op::Activity {
+            wait_reason: Some(_),
+            ..
+        }
+    );
     let checked = match &request.op {
         Op::Activity { .. } if request.attempted => {
             linear.activity_exists(session_id, &request.id).await?
@@ -237,12 +329,18 @@ async fn send_one(
         _ => false,
     };
     if checked {
-        return Ok(());
+        return Ok(true);
     }
-    request.attempted = true;
-    files::write_json(path, request).map_err(|_| ApiError::Configuration)?;
-    match &request.op {
-        Op::Activity { activity } => {
+    if is_wait {
+        if !mark_wait_attempt_if_current(path, request, run)? {
+            return Ok(false);
+        }
+    } else {
+        request.attempted = true;
+        files::write_json(path, request).map_err(|_| ApiError::Configuration)?;
+    }
+    let outcome = match &request.op {
+        Op::Activity { activity, .. } => {
             linear
                 .create_activity(session_id, &request.id, activity)
                 .await
@@ -254,7 +352,7 @@ async fn send_one(
         Op::IssueState { target } => {
             let issue = linear.issue(issue_id).await?;
             let Some(state_id) = target_state(&issue, *target, review_state)? else {
-                return Ok(());
+                return Ok(true);
             };
             linear.set_issue_state(issue_id, &state_id).await?;
             // The write is confirmed by reading the issue again.
@@ -263,7 +361,48 @@ async fn send_one(
             }
             Ok(())
         }
+    };
+    outcome?;
+    Ok(true)
+}
+
+fn mark_wait_attempt_if_current(
+    path: &Path,
+    request: &mut Request,
+    run: &Run,
+) -> Result<bool, ApiError> {
+    let _lock = run.lock().map_err(|_| ApiError::Configuration)?;
+    let record = run.record().map_err(|_| ApiError::Configuration)?;
+    if record.status != crate::run::Status::Active
+        || record.stopped
+        || record.finished
+        || !record
+            .awaiting_reply
+            .is_some_and(|wait| wait.activity_id == request.id)
+    {
+        return Ok(false);
     }
+    request.attempted = true;
+    files::write_json(path, request).map_err(|_| ApiError::Configuration)?;
+    Ok(true)
+}
+
+fn clear_refused_wait(run: &Run, activity_id: &str) -> Result<bool, ApiError> {
+    let lock = run.lock().map_err(|_| ApiError::Configuration)?;
+    let record = run.record().map_err(|_| ApiError::Configuration)?;
+    if !record
+        .awaiting_reply
+        .is_some_and(|wait| wait.activity_id == activity_id)
+    {
+        return Ok(false);
+    }
+    run.update_held(&lock, |record| {
+        if let Some(wait) = record.awaiting_reply.take() {
+            record.cleared_wait_id = wait.activity_id;
+        }
+    })
+    .map_err(|_| ApiError::Configuration)?;
+    Ok(true)
 }
 
 /// The state to move the issue to, or `None` when it should stay where it is.
@@ -356,9 +495,7 @@ mod tests {
     use crate::run::RunRecord;
 
     fn thought(body: &str) -> Op {
-        Op::Activity {
-            activity: Activity::new(Content::Thought { body: body.into() }),
-        }
+        Op::activity(Activity::new(Content::Thought { body: body.into() }))
     }
 
     fn setup() -> (tempfile::TempDir, Run, Mutex<FakeLinear>, String, String) {
@@ -432,6 +569,111 @@ mod tests {
         let fake = linear.lock().unwrap();
         assert_eq!(fake.sessions[0].sent("thought").len(), 1);
         assert_eq!(fake.count("HerdrLinearAgentActivityFind"), 1);
+    }
+
+    #[tokio::test]
+    async fn a_cleared_wait_with_an_unknown_write_is_read_back_but_never_resent() {
+        let (_dir, run, linear, session, issue) = setup();
+        let id = push(&run, Op::elicitation("Proceed?", &[]))
+            .unwrap()
+            .unwrap();
+        linear.lock().unwrap().lose_next_response = true;
+        let sent = send(&run, &session, &issue, "In Review", &linear).await;
+        assert_eq!(sent.blocked, Some(ApiError::RequestFailed));
+        run.update(|r| r.awaiting_reply = None).unwrap();
+
+        let sent = send(&run, &session, &issue, "In Review", &linear).await;
+        assert_eq!(sent.count, 1, "the existing Linear activity is reconciled");
+        assert!(pending(&run).is_empty());
+        let fake = linear.lock().unwrap();
+        assert_eq!(fake.sessions[0].sent("elicitation").len(), 1);
+        assert_eq!(fake.count("HerdrLinearAgentActivityFind"), 1);
+        assert_ne!(id, "");
+    }
+
+    #[test]
+    fn a_queued_question_repairs_a_crash_but_not_a_question_cleared_by_a_reply() {
+        let (_dir, run, _linear, _session, _issue) = setup();
+        let id = push(&run, Op::elicitation("Proceed?", &[]))
+            .unwrap()
+            .unwrap();
+        run.update(|r| r.awaiting_reply = None).unwrap();
+        assert_eq!(
+            run.record().unwrap().awaiting_reply.unwrap().activity_id,
+            id
+        );
+
+        run.update(|r| {
+            r.awaiting_reply = None;
+            r.cleared_wait_id = id.clone();
+            r.reply_generation += 1;
+        })
+        .unwrap();
+        let runs_dir = run.dir.parent().unwrap().parent().unwrap();
+        let restarted = Run::load(runs_dir, &run.key).unwrap();
+        assert!(restarted.record().unwrap().awaiting_reply.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_definitive_question_refusal_clears_only_its_matching_wait() {
+        let (_dir, run, linear, session, issue) = setup();
+        let id = push(&run, Op::elicitation("Proceed?", &[]))
+            .unwrap()
+            .unwrap();
+        linear.lock().unwrap().fail_next = Some(ApiError::Graphql("invalid activity".into()));
+        let sent = send(&run, &session, &issue, "In Review", &linear).await;
+        assert_eq!(sent.refused.len(), 1);
+        assert!(run.record().unwrap().awaiting_reply.is_none());
+        assert!(
+            crate::inbox::unhandled(&run)
+                .iter()
+                .any(|item| item.summary.contains("refused a question"))
+        );
+
+        let next = push(&run, Op::elicitation("Another question?", &[]))
+            .unwrap()
+            .unwrap();
+        assert_ne!(id, next);
+        assert_eq!(
+            run.record().unwrap().awaiting_reply.unwrap().activity_id,
+            next
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_question_outcomes_keep_the_wait_and_rate_limited_questions_stay_queued() {
+        let (_dir, run, linear, session, issue) = setup();
+        push(&run, Op::elicitation("Proceed?", &[])).unwrap();
+        linear.lock().unwrap().fail_next = Some(ApiError::RateLimited);
+        let sent = send(&run, &session, &issue, "In Review", &linear).await;
+        assert_eq!(sent.blocked, Some(ApiError::RateLimited));
+        assert!(run.record().unwrap().awaiting_reply.is_some());
+        assert_eq!(pending(&run).len(), 1);
+
+        linear.lock().unwrap().fail_next = Some(ApiError::RequestFailed);
+        let sent = send(&run, &session, &issue, "In Review", &linear).await;
+        assert_eq!(sent.blocked, Some(ApiError::RequestFailed));
+        assert!(run.record().unwrap().awaiting_reply.is_some());
+        assert_eq!(pending(&run).len(), 1);
+    }
+
+    #[test]
+    fn stopped_and_inactive_runs_hold_progress_but_still_allow_terminal_responses() {
+        let (_dir, run, _linear, _session, _issue) = setup();
+        run.update(|r| r.status = crate::run::Status::Detached)
+            .unwrap();
+        assert!(push(&run, thought("progress")).unwrap().is_none());
+        assert!(
+            push(
+                &run,
+                Op::activity(Activity::new(Content::Response {
+                    body: "Stopped.".into(),
+                }))
+            )
+            .unwrap()
+            .is_some()
+        );
+        assert_eq!(pending(&run).len(), 1);
     }
 
     #[tokio::test]

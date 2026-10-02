@@ -11,7 +11,7 @@ use crate::agents;
 use crate::herdr::{Herdr, PaneId, Snapshot};
 use crate::linear::api::{Activity, Content, ExternalUrl};
 use crate::outbox::{self, Op};
-use crate::run::{AgentRecord, AgentStatus, Run};
+use crate::run::{AgentRecord, AgentStatus, Run, WaitReason};
 use crate::worker::{self, Group, Live, Worker};
 use crate::{coordinator, files, inbox, transcript};
 
@@ -94,7 +94,7 @@ impl Reconciler {
             d.config.herdr.session.as_deref().unwrap_or("default")
         );
         let notice = (format!("{} needs you", run.key), body.clone());
-        (Op::elicitation(body, &[]), notice)
+        (super::reconcile::thought(body), notice)
     }
 
     pub(super) async fn watch<H: Herdr>(
@@ -119,6 +119,8 @@ impl Reconciler {
                 next.blocked_reported = true;
             }
             let lost = !live.pane_exists && !record.coordinator_lost;
+            let ask_to_resume = !live.pane_exists
+                && (lost || (record.coordinator_lost && record.awaiting_reply.is_none()));
             // A kind that picks its own session id is looked up once it is
             // needed: when the pane is gone, a resume can continue it.
             if lost
@@ -135,7 +137,7 @@ impl Reconciler {
                     next.agent_session = found;
                 }
             }
-            if lost {
+            if ask_to_resume {
                 let resumable = !next.agent_session.is_empty()
                     && agents::resume_args(&next.kind, &next.agent_session).is_some();
                 let how = if resumable {
@@ -143,9 +145,10 @@ impl Reconciler {
                 } else {
                     "Reply `resume` to start a new coordinator."
                 };
-                ops.push(Op::elicitation(
+                ops.push(Op::awaiting_reply(
                     format!("The coordinator's pane for {} is gone. {how}", run.key),
                     &[("Resume", "resume")],
+                    WaitReason::CoordinatorLost,
                 ));
                 notices.push((format!("{} coordinator is gone", run.key), how.to_string()));
             } else if live.pane_exists {
@@ -159,11 +162,19 @@ impl Reconciler {
                     .await;
             }
             let back = live.pane_exists && record.coordinator_lost;
-            if next != *c || lost || back {
+            if next != *c || lost || ask_to_resume || back {
                 let before = c.clone();
                 self.update_and_push(run, move |r| {
                     apply_tracked(&mut r.coordinator, &before, &next);
                     r.coordinator_lost = (r.coordinator_lost || lost) && !back;
+                    if back
+                        && r.awaiting_reply
+                            .as_ref()
+                            .is_some_and(|wait| wait.reason == WaitReason::CoordinatorLost)
+                        && let Some(wait) = r.awaiting_reply.take()
+                    {
+                        r.cleared_wait_id = wait.activity_id;
+                    }
                     ops
                 })
                 .await?;
@@ -256,13 +267,11 @@ impl Reconciler {
             let report =
                 std::fs::read_to_string(worker::home_report_path(run, &w.id)).unwrap_or_default();
             if let Some(url) = worker::pr_line(&report).filter(|url| *url != w.pr_url) {
-                ops.push(Op::Activity {
-                    activity: Activity::new(Content::Action {
-                        action: "Pull request".into(),
-                        parameter: format!("{url} (worker {}, repo {})", w.id, w.repo),
-                        result: None,
-                    }),
-                });
+                ops.push(Op::activity(Activity::new(Content::Action {
+                    action: "Pull request".into(),
+                    parameter: format!("{url} (worker {}, repo {})", w.id, w.repo),
+                    result: None,
+                })));
                 pull_request = Some(ExternalUrl {
                     label: format!("{} {} PR", w.id, w.repo),
                     url: url.clone(),
@@ -300,7 +309,7 @@ impl Reconciler {
                 body: format!("{} ({}): {}", w.id, w.repo, report.activity),
             });
             activity.ephemeral = true;
-            ops.push(Op::Activity { activity });
+            ops.push(Op::activity(activity));
             next.activity = report.activity.clone();
             next.activity_since = now.to_string();
         }
@@ -351,13 +360,11 @@ impl Reconciler {
                     let reason = waiting_reason(&next, &live);
                     // A dialog already asked for a person in the session.
                     if !worker::needs_person(&next.agent, &live) {
-                        milestones.push(Op::Activity {
-                            activity: Activity::new(Content::Action {
-                                action: "Worker waiting".into(),
-                                parameter: format!("{} ({}): {reason}", w.id, w.repo),
-                                result: None,
-                            }),
-                        });
+                        milestones.push(Op::activity(Activity::new(Content::Action {
+                            action: "Worker waiting".into(),
+                            parameter: format!("{} ({}): {reason}", w.id, w.repo),
+                            result: None,
+                        })));
                     }
                     Some(format!(
                         "{} ({}) is Waiting on you: {reason}.",
@@ -396,9 +403,7 @@ impl Reconciler {
             } else {
                 format!("{} ({}) reported:\n\n{section}", w.id, w.repo)
             };
-            milestones.push(Op::Activity {
-                activity: Activity::new(Content::Thought { body }),
-            });
+            milestones.push(Op::activity(Activity::new(Content::Thought { body })));
             next.announced_report_hash = next.report_hash.clone();
         }
         if live.pane_exists {
@@ -445,9 +450,16 @@ impl Reconciler {
         now: Timestamp,
     ) -> Result<()> {
         let record = run.record()?;
-        if record.session_id.is_empty() || record.stopped {
+        if record.session_id.is_empty()
+            || record.stopped
+            || record.finished
+            || record.awaiting_reply.is_some()
+        {
             return Ok(());
         }
+        let hours = d.config.limits.ask_to_continue_after_hours;
+        let limit = i64::try_from(hours.saturating_mul(3600)).unwrap_or(i64::MAX);
+        let timeout_due = files::seconds_since(&record.timeout_since, now) >= limit;
         let quiet = since(&record.last_activity, now).is_some_and(|d| d >= HEARTBEAT);
         // A heartbeat already flushed whose `ActivitySent` has not arrived
         // must not be followed by a second one.
@@ -455,7 +467,7 @@ impl Reconciler {
             .heartbeats
             .get(&run.key)
             .is_some_and(|at| now.duration_since(*at) < HEARTBEAT);
-        if quiet && !recent && outbox::is_empty(run) {
+        if !timeout_due && quiet && !recent && outbox::is_empty(run) {
             let mut parts = Vec::new();
             for w in worker::list(run)
                 .iter()
@@ -483,21 +495,21 @@ impl Reconciler {
             };
             let mut activity = Activity::new(Content::Thought { body });
             activity.ephemeral = true;
-            self.push(run, Op::Activity { activity }).await?;
-            self.heartbeats.insert(run.key.clone(), now);
+            if self.push(run, Op::activity(activity)).await? {
+                self.heartbeats.insert(run.key.clone(), now);
+            }
         }
-        let hours = d.config.limits.ask_to_continue_after_hours;
-        let limit = i64::try_from(hours.saturating_mul(3600)).unwrap_or(i64::MAX);
-        if !record.timeout_asked && files::seconds_since(&record.timeout_since, now) >= limit {
+        if timeout_due {
             self.update_and_push(run, move |r| {
-                    if std::mem::replace(&mut r.timeout_asked, true) {
+                    if r.awaiting_reply.is_some() || r.stopped || r.finished {
                         return Vec::new();
                     }
-                    vec![Op::elicitation(
+                    vec![Op::awaiting_reply(
                         format!(
                             "This run has been going for {hours} hours. Reply to let it continue; until then the coordinator gets no prompts."
                         ),
                         &[("Continue", "continue")],
+                        WaitReason::RunTimeout,
                     )]
                 })
                 .await?;
@@ -525,7 +537,8 @@ impl Reconciler {
             || record.coordinator_lost
             || c.prompt_pending
             || record.stopped
-            || record.timeout_asked
+            || record.awaiting_reply.is_some()
+            || record.finished
         {
             return Ok(());
         }

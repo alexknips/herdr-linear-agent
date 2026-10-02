@@ -214,7 +214,10 @@ Run record (`run.json`), every field defaulted when missing:
 | `finished` | `finish` was accepted |
 | `external_urls` | list of `{label, url}` |
 | `timeout_since` | start of the run timeout window |
-| `timeout_asked` | the timeout question is open |
+| `timeout_asked` | compatibility field for old records; new timeout waits use `awaiting_reply` |
+| `awaiting_reply` | optional `{activity_id, asked_at, reason}` for the one Linear question currently waiting on a person (`coordinator_question`, `run_timeout`, or `coordinator_lost`) |
+| `cleared_wait_id` | the last cleared question id; prevents a refused request still awaiting archival from restoring its wait after a crash |
+| `reply_generation` | local counter incremented only for a newly accepted allowed prompt; queued questions carry its value so restart recovery cannot reopen an answered question, without comparing Linear and local clocks |
 | `coordinator_lost` | the coordinator's pane is gone and the resume question was asked |
 | `stopped` | a person pressed stop; no prompt or heartbeat goes out until they reply |
 | `interrupt` | `stop` or `detach`: Escape keys still owed to the run's agents, sent by the first pass with a snapshot |
@@ -265,7 +268,7 @@ Issue snapshot `issue.md` (`issue_markdown`):
 
 `issue_hash` is the SHA-256 hex of `title \n description \n label names joined by "," \n comments`, each comment as `author \n createdAt \n body`, comments joined by newline. The state is not part of it.
 
-`conversation.md` starts with `# Conversation\n\nReplies from allowed users in the issue's Agent Session, oldest first.\n` and gets one block per reply: `\n## <createdAt> (user <user id>)\n\n<trimmed body>\n`. `ignored-prompts.md` gets the same block without a header. `src/run.rs:runs_are_created_listed_and_updated_under_the_lock`, `tests/scenarios:replies_are_relayed_only_from_allowed_users_and_stop_interrupts`
+`conversation.md` starts with `# Conversation\n\nReplies from allowed users in the issue's Agent Session, oldest first.\n` and gets one block per reply: `\n## <createdAt> (user <user id>)\n\n<trimmed body>\n`. `ignored-prompts.md` gets the same block without a header. A new allowed reply after the question clears the matching wait and resumes coordinator prompts; a fresh reply whose timestamp predates the question is still recorded and advances the cursor, but leaves the newer question open. Disallowed or duplicate prompts do not clear a wait. `src/run.rs:runs_are_created_listed_and_updated_under_the_lock`, `tests/scenarios:replies_are_relayed_only_from_allowed_users_and_stop_interrupts`
 
 ## Names, agent kinds and profile arguments
 
@@ -815,11 +818,12 @@ While the run is `stopped` or `timeout_asked`, no prompt goes to the coordinator
 
 ## Heartbeat and run timeout
 
-Skipped entirely while the run has no session or is `stopped`.
+Skipped entirely while the run has no session, is `stopped` or `finished`, or has an outstanding `awaiting_reply`.
 
 - Heartbeat: when `last_activity` is at least 10 minutes old, the outbox is empty, and no heartbeat was queued for the run in the last 10 minutes without an `ActivitySent` at or after it (the reconciler remembers this in memory; a flush and its event may be a pass apart), queue an ephemeral thought: `Still on it: no workers.` without `open` workers, else `Still on it. <parts>.` with one part per `open` worker joined by `; `: `<id> (<repo>): <activity>, for <n> min` when it is Working and has a stored `activity` (`<n>` the whole minutes since `activity_since`, at least 1), else `<id> (<repo>): <group label in lower case>` (for example `Still on it. w1 (api): Running tests, for 12 min; w2 (web): waiting on you.`). Linear marks a session `stale` after 30 minutes without an activity.
-- Run timeout: when not `timeout_asked` and `timeout_since` is at least `ask_to_continue_after_hours * 3600` s old, queue the elicitation `This run has been going for <h> hours. Reply to let it continue; until then the coordinator gets no prompts.` with option `Continue`=`continue`, set `timeout_asked`, and show the notification `<KEY> ran <h> hours` with body `Reply in the Linear session to let it continue.`
-- A reply clears `timeout_asked` and restarts the window. `tests/scenarios:quiet_runs_get_a_heartbeat_and_long_runs_ask_to_continue`
+- Run timeout: when no question is already open and `timeout_since` is at least `ask_to_continue_after_hours * 3600` s old, queue the elicitation `This run has been going for <h> hours. Reply to let it continue; until then the coordinator gets no prompts.` with option `Continue`=`continue`, record its request id, timestamp and reason as `awaiting_reply`, and show the notification `<KEY> ran <h> hours` with body `Reply in the Linear session to let it continue.`
+- Every queued Linear activity is checked under the run lock against stopped, finished and awaiting-reply state. While a question is open, progress activities are suppressed while local reports and inbox entries are retained. Suppressed activities are not replayed, and no later thought/action activity or coordinator prompt replaces Linear's native awaiting-input state. Pane-only Herdr dialogs are reported as thoughts, since their answer must be entered in Herdr rather than Linear.
+- A newly observed allowed reply clears the open wait and resumes coordinator prompts; a reply to a timeout also restarts the timeout window. Freshness is based on the server-side prompt cursor, never by comparing Linear timestamps to the local question time. A definitive Linear refusal clears only the matching wait and creates an inbox notice; rate limits and unknown write outcomes keep it queued. On restart, a pending question repairs a missing wait slot only when its saved reply generation still matches the run. An attempted write is read back before retry; if it is absent and the wait has since been cleared, that stale question is discarded. `tests/scenarios:quiet_runs_get_a_heartbeat_and_long_runs_ask_to_continue`, `outbox::tests:a_cleared_wait_with_an_unknown_write_is_read_back_but_never_resent`
 
 ## Outbox and flush
 
@@ -827,8 +831,8 @@ The kept module `src/outbox.rs` defines the queue.
 
 ### Requests
 
-- `push(run, op)`: under the run lock, increase `.state/outbox-counter.json`, write `.state/outbox/<counter as 10 digits>.json` with `{id: UUIDv4, created, attempted: false, op...}`, return the id. Requests are sent in the order written.
-- Ops (`op` tag): `activity {activity}`, `plan {plan}`, `external_urls {urls}`, `issue_state {target: "started" | "review"}`.
+- `push(run, op)`: under the run lock, increase `.state/outbox-counter.json`, write `.state/outbox/<counter as 10 digits>.json` with `{id: UUIDv4, created, attempted: false, wait_generation?, op...}`, return the id or no id when an activity is suppressed by an inactive, stopped, finished or awaiting-reply run. A question stores its wait slot in the same lock; if the process stops between queueing and updating the record, the next record read repairs the slot from the queued request when its reply generation still matches. Requests are sent in the order written.
+- Ops (`op` tag): `activity {activity, wait_reason?}`, `plan {plan}`, `external_urls {urls}`, `issue_state {target: "started" | "review"}`. Only elicitation requests carry a `wait_reason`; terminal responses remain sendable while stopped, finished or awaiting a reply.
 - `pending(run)`: queued requests oldest first; a file that does not parse is moved to `outbox/failed/`. Only the Linear task calls it: it alone moves, rewrites or removes outbox files. The reconciler lists them read-only (`queued`, the requests that parse; `is_empty`, any file). `tests/scenarios:the_reconciler_leaves_an_unreadable_outbox_file_to_the_linear_task`
 
 ### Send
@@ -836,9 +840,9 @@ The kept module `src/outbox.rs` defines the queue.
 `send(run, session, issue, review_state)` handles requests in order:
 
 1. When `attempted` is set, check first: an activity is looked up by its id (`activity_exists`) and skipped when found; plan, URL and state requests are not checked (they are idempotent or read before writing).
-2. Set `attempted`, save it, and apply.
+2. For a question, recheck its matching wait under the run lock and persist `attempted` before releasing the lock and sending. For other writes, persist `attempted`, then apply. If an attempted question is absent on read-back and its wait was cleared meanwhile, discard it instead of sending a stale question.
 3. Success: remove the file.
-4. A definitive refusal (`Graphql`, `Configuration`, HTTP 400 to 428 or 430 to 499): move the file to `outbox/failed/` and go on. HTTP 429 and `RATELIMITED` are not definitive (see above).
+4. A definitive refusal (`Graphql`, `Configuration`, HTTP 400 to 428 or 430 to 499): clear only the matching wait, move the file to `outbox/failed/` and add an inbox notice; then go on. Clearing first ensures a crash before moving the file cannot leave the run blocked, since a later flush discards the stale request. HTTP 429 and `RATELIMITED` are not definitive (see above).
 5. Any other error: stop the queue; the rest waits for the next flush.
 
 - The Linear task hands each event to the reconciler as soon as it happened (an `ActivitySent` right after that run's flush) and publishes the level after the step's events. A run whose outbox was failing and that leaves the queries is reported with `WritesRecovered`. `src/linear/task.rs:a_failing_run_that_leaves_the_queries_is_reported_recovered`, `tests/scenarios:a_pass_between_a_flush_and_its_sent_event_queues_no_second_heartbeat`
@@ -1005,8 +1009,8 @@ All take `<KEY>`. `plan set`, `say`, `ask`, `finish` and the worker commands req
 | `context <KEY>` | `ticker start`; prints the digest; marks the shown inbox ids seen; the run need not be active | the digest |
 | `inbox done <KEY> [ids] [--all]` | moves the named items, and with `--all` the items the last `context` showed, to done; error `name the inbox item ids, or pass --all` with neither | `<n> item(s) handled`, plus `; <m> new item(s) since your last context, run context` when unseen items remain |
 | `plan set <KEY> --file` | parses the checklist, queues the plan | `the plan is queued for Linear` |
-| `say <KEY> --text-file` | queues a thought with the trimmed text; empty: `the text is empty` | `queued for the Linear session` |
-| `ask <KEY> --text-file [--option label=value]...` | queues an elicitation; options add `select`; empty: `the question is empty` | `the question is queued for the Linear session; end your turn, the answer arrives in your inbox` |
+| `say <KEY> --text-file` | queues a thought with the trimmed text unless progress is suppressed by an open question or stopped/finished run; empty: `the text is empty` | `queued for the Linear session` |
+| `ask <KEY> --text-file [--option label=value]...` | queues an elicitation and opens the one reply wait; options add `select`; empty: `the question is empty` | `the question is queued for the Linear session; end your turn, the answer arrives in your inbox` |
 | `finish <KEY> --text-file` | see below; empty: `the summary is empty` | ``the summary is queued; the issue moves to `<review_state>` `` with the run team's review state (`In Review` when the team is no longer configured) |
 
 - `parse_option`: `label=value`, or a bare label used as its own value; both trimmed and non-empty, else ``an option looks like `label=value`; got `<text>` ``. `tests/commands:options_parse_as_label_and_value`
@@ -1201,7 +1205,7 @@ The inputs did not pin these. Each line is the rule the rewrite follows. A rule 
 10. Only workers that are not `stopped` count for one worker per repository and for `max_workers_per_run`.
 11. A `Waiting for you` self-report counts only while Herdr does not show the agent `working`, and only while the report is younger than 5 minutes.
 12. Herdr's `done` is the same as `idle` for groups, nudges and prompt readiness.
-13. While a run is `stopped`, every prompt the ticker would send is held, both to the coordinator and to workers. `timeout_asked` holds only the coordinator's nudges.
+13. While a run is `stopped`, every prompt the ticker would send is held, both to the coordinator and to workers. `awaiting_reply` defers only the coordinator's nudges.
 14. For `codex`, the resume words `resume <id>` come first and the profile flags follow them.
 15. `extend_path` appends these folders when they exist and are not already on `PATH`, in this order: `~/.local/bin`, `~/.cargo/bin`, `~/.local/share/mise/shims`, `/opt/homebrew/bin`, `/usr/local/bin`, `/home/linuxbrew/.linuxbrew/bin`.
 16. `shell_quote` leaves a word made only of ASCII letters, digits and `/._-` bare, and single-quotes everything else. An empty word becomes `''`.

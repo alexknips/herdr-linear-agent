@@ -345,8 +345,7 @@ impl Reconciler {
                 }
             }
         }
-        self.prompt_coordinator(d, snapshot, run, &record, now)
-            .await?;
+        self.prompt_coordinator(d, snapshot, run, now).await?;
         for w in &workers {
             self.prompt_worker(d, snapshot, run, &record, w, now)
                 .await?;
@@ -465,14 +464,16 @@ impl Reconciler {
         d: &Deps<'_, H>,
         snapshot: &Snapshot,
         run: &Run,
-        record: &RunRecord,
         now: Timestamp,
     ) -> Result<()> {
-        let c = &record.coordinator;
+        let current = run.record()?;
+        let c = &current.coordinator;
         if c.status != AgentStatus::Open
             || !c.prompt_pending
-            || record.stopped
-            || record.timeout_asked
+            || current.status != crate::run::Status::Active
+            || current.stopped
+            || current.finished
+            || current.awaiting_reply.is_some()
         {
             return Ok(());
         }

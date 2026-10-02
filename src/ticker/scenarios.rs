@@ -11,7 +11,7 @@ use crate::herdr::PaneId;
 use crate::linear::api::fake::APP_USER;
 use crate::linear::api::{IssueStatus, RunUpdate};
 use crate::linear::task::{DECLINED, LinearEvent};
-use crate::run::{AgentStatus, Status};
+use crate::run::{AgentStatus, Status, WaitReason};
 use crate::{inbox, worker};
 
 const KEY: &str = "acme/DATA-1";
@@ -720,7 +720,7 @@ async fn a_stop_holds_every_prompt_until_the_next_reply() {
 async fn quiet_runs_get_a_heartbeat_and_long_ones_ask_to_go_on() {
     let mut world = World::with(limit("ask_to_continue_after_hours", 1));
     let pane = world.running_issue().await;
-    world.later(2 * 3600);
+    world.later(10 * 60);
     world.settle().await;
     let ephemeral: Vec<Value> = world
         .sent(KEY, "thought")
@@ -728,6 +728,13 @@ async fn quiet_runs_get_a_heartbeat_and_long_ones_ask_to_go_on() {
         .filter(|a| a["ephemeral"] == json!(true))
         .collect();
     assert_eq!(ephemeral.len(), 1, "one heartbeat");
+    world.later(2 * 3600);
+    world.settle().await;
+    assert_eq!(
+        world.record(KEY).awaiting_reply.as_ref().map(|w| w.reason),
+        Some(WaitReason::RunTimeout)
+    );
+    assert_eq!(world.fake().session("DATA-1").status, "awaitingInput");
     assert!(mentions(
         &world.bodies(KEY, "elicitation"),
         "going for 1 hours"
@@ -744,6 +751,199 @@ async fn quiet_runs_get_a_heartbeat_and_long_ones_ask_to_go_on() {
     world.message(KEY, "user-1", "Continue", None);
     world.settle().await;
     assert!(!world.record(KEY).timeout_asked);
+}
+
+#[tokio::test]
+async fn an_explicit_question_stays_the_latest_activity_past_the_heartbeat_deadline() {
+    let mut world = World::sample();
+    world.running_issue().await;
+    commands::ask(&world.ctx(), KEY, "Should I proceed?", &[])
+        .await
+        .unwrap();
+    world.settle().await;
+    assert_eq!(
+        world.sent(KEY, "elicitation").last().unwrap()["content"]["body"],
+        "Should I proceed?"
+    );
+
+    world.later(10 * 60);
+    world.settle().await;
+
+    assert_eq!(
+        world
+            .fake()
+            .session("DATA-1")
+            .sent_types()
+            .last()
+            .map(String::as_str),
+        Some("elicitation"),
+        "no heartbeat or worker activity should replace the outstanding question"
+    );
+    assert_eq!(world.fake().session("DATA-1").status, "awaitingInput");
+}
+
+#[tokio::test]
+async fn a_worker_report_is_saved_locally_while_linear_waits_for_an_answer() {
+    let mut world = World::sample();
+    world.running_issue().await;
+    let worker = world.start_worker("api").await;
+    world.settle().await;
+    commands::ask(&world.ctx(), KEY, "Should I proceed?", &[])
+        .await
+        .unwrap();
+    world.settle().await;
+
+    world.report(&worker, "## Report\n\nThe tests pass.\n");
+    world.settle().await;
+
+    assert!(crate::worker::home_report_path(&world.run(KEY), "w1").is_file());
+    assert_eq!(
+        world
+            .fake()
+            .session("DATA-1")
+            .sent_types()
+            .last()
+            .map(String::as_str),
+        Some("elicitation"),
+        "saving the worker report must not publish progress over the question"
+    );
+    assert_eq!(world.fake().session("DATA-1").status, "awaitingInput");
+}
+
+#[tokio::test]
+async fn a_new_allowed_reply_clears_the_wait_once_and_resumes_progress() {
+    let mut world = World::sample();
+    let pane = world.running_issue().await;
+    commands::ask(&world.ctx(), KEY, "Should I proceed?", &[])
+        .await
+        .unwrap();
+    world.settle().await;
+    let wait = world.record(KEY).awaiting_reply.unwrap();
+    let reloaded = crate::run::Run::load(&world.ctx().runs_dir(), KEY).unwrap();
+    assert_eq!(
+        reloaded.record().unwrap().awaiting_reply,
+        Some(wait.clone())
+    );
+
+    world.message(KEY, "user-1", "Proceed", None);
+    world.settle().await;
+    world.later(120);
+    world.settle().await;
+    assert!(world.record(KEY).awaiting_reply.is_none());
+    assert_eq!(world.fake().session("DATA-1").status, "active");
+    assert_eq!(
+        std::fs::read_to_string(world.run(KEY).conversation_md())
+            .unwrap()
+            .matches("Proceed")
+            .count(),
+        1
+    );
+    assert!(wait.asked_at < world.record(KEY).prompt_cursor);
+
+    commands::say(&world.ctx(), KEY, "Continuing now.")
+        .await
+        .unwrap();
+    world.settle().await;
+    assert_eq!(world.fake().session("DATA-1").status, "active");
+    assert_eq!(
+        world
+            .fake()
+            .session("DATA-1")
+            .sent_types()
+            .last()
+            .map(String::as_str),
+        Some("thought")
+    );
+    assert_eq!(
+        to(&world, &pane).last().map(String::as_str),
+        Some(NUDGE_REPLY)
+    );
+}
+
+#[tokio::test]
+async fn a_fresh_reply_is_accepted_even_when_its_server_time_predates_local_question_time() {
+    let mut world = World::sample();
+    world.running_issue().await;
+    commands::ask(&world.ctx(), KEY, "Should I proceed?", &[])
+        .await
+        .unwrap();
+    world.settle().await;
+    let wait = world.record(KEY).awaiting_reply.unwrap();
+    let future = (world.now() + jiff::SignedDuration::from_secs(60)).to_string();
+    world
+        .run(KEY)
+        .update(|r| r.awaiting_reply.as_mut().unwrap().asked_at = future.clone())
+        .unwrap();
+
+    world.message(KEY, "user-1", "Context before the question", None);
+    world.settle().await;
+    let record = world.record(KEY);
+    assert!(record.awaiting_reply.is_none());
+    assert_eq!(record.cleared_wait_id, wait.activity_id);
+    let conversation = std::fs::read_to_string(world.run(KEY).conversation_md()).unwrap();
+    assert!(conversation.contains("Context before the question"));
+    assert!(
+        record.prompt_cursor < future,
+        "the test models local/server clock skew"
+    );
+    assert_eq!(world.fake().session("DATA-1").status, "active");
+}
+
+#[tokio::test]
+async fn a_disallowed_reply_does_not_clear_a_linear_wait() {
+    let mut world = World::sample();
+    world.running_issue().await;
+    commands::ask(&world.ctx(), KEY, "Should I proceed?", &[])
+        .await
+        .unwrap();
+    world.settle().await;
+    let wait = world.record(KEY).awaiting_reply.unwrap();
+
+    world.message(KEY, "unapproved-user", "Proceed", None);
+    world.settle().await;
+    world.later(120);
+    world.settle().await;
+
+    assert_eq!(world.record(KEY).awaiting_reply, Some(wait));
+    assert!(
+        !world
+            .text(KEY, "conversation.md")
+            .contains("unapproved-user")
+    );
+    assert!(
+        world
+            .text(KEY, ".state/ignored-prompts.md")
+            .contains("unapproved-user")
+    );
+}
+
+#[tokio::test]
+async fn a_lost_coordinator_asks_for_resume_after_an_existing_question_is_answered() {
+    let mut world = World::sample();
+    world.running_issue().await;
+    commands::ask(&world.ctx(), KEY, "Should I proceed?", &[])
+        .await
+        .unwrap();
+    world.settle().await;
+    let workspace = world.record(KEY).coordinator.workspace_id;
+    world.herdr.remove_workspace(&workspace);
+    world.settle().await;
+    assert!(world.record(KEY).coordinator_lost);
+    assert_eq!(world.bodies(KEY, "elicitation").len(), 1);
+    assert_eq!(
+        world.record(KEY).awaiting_reply.unwrap().reason,
+        WaitReason::CoordinatorQuestion
+    );
+
+    world.message(KEY, "user-1", "I will look at it; keep going.", None);
+    world.settle().await;
+    world.later(120);
+    world.settle().await;
+    assert_eq!(world.bodies(KEY, "elicitation").len(), 2);
+    assert_eq!(
+        world.record(KEY).awaiting_reply.unwrap().reason,
+        WaitReason::CoordinatorLost
+    );
 }
 
 #[tokio::test]
@@ -814,7 +1014,7 @@ async fn a_removed_delegation_detaches_the_run_and_keeps_its_workspaces() {
 // ---------------------------------------------------------------- people in Herdr
 
 #[tokio::test]
-async fn a_dialog_is_reported_once_and_a_gone_coordinator_resumes_on_request() {
+async fn a_dialog_is_reported_in_progress_and_a_gone_coordinator_asks_for_resume() {
     let mut world = World::sample();
     world.running_issue().await;
     let w = world.start_worker("api").await;
@@ -826,8 +1026,11 @@ async fn a_dialog_is_reported_once_and_a_gone_coordinator_resumes_on_request() {
     world.later(5);
     world.settle().await;
     let questions = world.bodies(KEY, "elicitation");
-    assert_eq!(questions.len(), 1, "{questions:?}");
-    assert!(questions[0].contains(&w.agent.pane_id), "{questions:?}");
+    assert!(
+        questions.is_empty(),
+        "pane-only dialogs do not ask in Linear"
+    );
+    assert!(mentions(&world.bodies(KEY, "thought"), &w.agent.pane_id));
     assert_eq!(world.herdr.notifications()[0].0, "acme/DATA-1 needs you");
     assert!(mentions(&world.inbox(KEY), "Waiting on you"));
 
@@ -836,7 +1039,7 @@ async fn a_dialog_is_reported_once_and_a_gone_coordinator_resumes_on_request() {
     world.herdr.remove_workspace(&workspace);
     world.settle().await;
     assert!(world.record(KEY).coordinator_lost);
-    assert_eq!(world.bodies(KEY, "elicitation").len(), 2);
+    assert_eq!(world.bodies(KEY, "elicitation").len(), 1);
 
     world.message(KEY, "user-1", "resume", None);
     world.settle().await;
@@ -1452,7 +1655,8 @@ async fn a_blocked_episode_missed_between_passes_is_still_a_new_episode() {
     );
     world.later(30);
     world.settle().await;
-    assert_eq!(world.bodies(KEY, "elicitation").len(), 1);
+    assert!(world.bodies(KEY, "elicitation").is_empty());
+    assert!(mentions(&world.bodies(KEY, "thought"), "Worker w1"));
     assert!(!world.actions(KEY).iter().any(|a| a == "Worker waiting"));
 
     // Answered and blocked again with no pass in between: the snapshot
@@ -1461,10 +1665,17 @@ async fn a_blocked_episode_missed_between_passes_is_still_a_new_episode() {
     world.herdr.set_status("acme-data-1-w1", "blocked");
     world.later(5);
     world.settle().await;
-    assert_eq!(world.bodies(KEY, "elicitation").len(), 1, "not 30 s yet");
+    assert!(
+        world.bodies(KEY, "elicitation").is_empty(),
+        "pane-only waiting never opens a Linear question"
+    );
+    assert!(mentions(&world.bodies(KEY, "thought"), "Worker w1"));
     world.later(30);
     world.settle().await;
-    assert_eq!(world.bodies(KEY, "elicitation").len(), 2, "a new episode");
+    assert!(
+        world.bodies(KEY, "elicitation").is_empty(),
+        "a repeated pane dialog remains a local instruction"
+    );
 }
 
 #[tokio::test]

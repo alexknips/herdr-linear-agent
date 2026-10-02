@@ -13,7 +13,7 @@ use crate::herdr::{Herdr, Snapshot, WorkspaceId};
 use crate::linear::api::{Activity, Content, IssueDetail, IssueRef, Prompt, RunUpdate};
 use crate::linear::task::{Decline, Levels, LinearEvent, LinearLevel};
 use crate::outbox::{self, Op, StateTarget};
-use crate::run::{AgentRecord, AgentStatus, Interrupt, Run, RunRecord, Status};
+use crate::run::{AgentRecord, AgentStatus, Interrupt, Run, RunRecord, Status, WaitReason};
 use crate::{coordinator, files, routing, worker};
 
 /// Whether a prompt created at `created` is newer than the cursor. Both are
@@ -313,7 +313,11 @@ impl Reconciler {
                 update_run(run, move |r| {
                     if after_cursor(&created, &r.prompt_cursor) {
                         r.prompt_cursor = created;
+                        r.reply_generation = r.reply_generation.saturating_add(1);
                         r.stopped = true;
+                        if let Some(wait) = r.awaiting_reply.take() {
+                            r.cleared_wait_id = wait.activity_id;
+                        }
                         r.interrupt = Some(Interrupt::Stop);
                     }
                 })
@@ -335,13 +339,22 @@ impl Reconciler {
             let resume = prompt.body.trim().eq_ignore_ascii_case("resume");
             let restart_window = now.to_string();
             self.guarded(run, move |run, lock| {
-                if !after_cursor(&created, &run.record()?.prompt_cursor) {
-                    return Ok(((), Vec::new()));
+                let current = run.record()?;
+                if !after_cursor(&created, &current.prompt_cursor) {
+                    return Ok((false, Vec::new()));
                 }
                 run.append_conversation_held(lock, &created, &user, &body)?;
                 run.update_held(lock, move |r| {
                     r.prompt_cursor = created;
+                    r.reply_generation = r.reply_generation.saturating_add(1);
                     r.stopped = false;
+                    r.finished = false;
+                    if let Some(wait) = r.awaiting_reply.take() {
+                        if wait.reason == WaitReason::RunTimeout {
+                            r.timeout_since = restart_window.clone();
+                        }
+                        r.cleared_wait_id = wait.activity_id;
+                    }
                     if r.timeout_asked {
                         r.timeout_asked = false;
                         r.timeout_since = restart_window;
@@ -351,7 +364,7 @@ impl Reconciler {
                         r.coordinator.repend();
                     }
                 })?;
-                Ok(((), Vec::new()))
+                Ok((true, Vec::new()))
             })
             .await?;
         }
@@ -372,13 +385,11 @@ impl Reconciler {
             let stopped = self.interrupt_agents(d, Some(snapshot), &run).await;
             let result = self
                 .update_and_push(&run, move |r| match r.interrupt.take() {
-                    Some(Interrupt::Stop) => vec![Op::Activity {
-                        activity: Activity::new(Content::Response {
+                    Some(Interrupt::Stop) => vec![Op::activity(Activity::new(Content::Response {
                             body: format!(
                                 "Stopped {stopped} agent(s) as asked. Their worktrees are kept; reply here to continue."
                             ),
-                        }),
-                    }],
+                        }))],
                     _ => Vec::new(),
                 })
                 .await;
@@ -476,12 +487,13 @@ impl Reconciler {
             r.closed_state = closed_state;
             r.coordinator.status = AgentStatus::Stopped;
             r.postmortem_due = Some(crate::postmortem::Stage::Final);
+            if let Some(wait) = r.awaiting_reply.take() {
+                r.cleared_wait_id = wait.activity_id;
+            }
             if r.session_id.is_empty() {
                 return Vec::new();
             }
-            vec![Op::Activity {
-                activity: Activity::new(Content::Response { body }),
-            }]
+            vec![Op::activity(Activity::new(Content::Response { body }))]
         })
         .await?;
         d.log

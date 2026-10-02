@@ -212,13 +212,11 @@ pub fn launch_prompt(key: &str, id: &str) -> String {
 /// The `Start worker` action, queued when the worker's launch prompt is
 /// delivered.
 pub fn start_action(worker: &Worker) -> Op {
-    Op::Activity {
-        activity: Activity::new(Content::Action {
-            action: "Start worker".into(),
-            parameter: format!("{} {}: {}", worker.id, worker.repo, worker.title),
-            result: None,
-        }),
-    }
+    Op::activity(Activity::new(Content::Action {
+        action: "Start worker".into(),
+        parameter: format!("{} {}: {}", worker.id, worker.repo, worker.title),
+        result: None,
+    }))
 }
 
 /// Adds the text as a follow-up to the worker's task file.
@@ -770,7 +768,7 @@ mod tests {
             "Read .herdr-linear-agent/acme-DATA-1-w2/brief.md and do what it says."
         );
 
-        let Op::Activity { activity } = start_action(&api_worker(AgentStatus::Open, "", true))
+        let Op::Activity { activity, .. } = start_action(&api_worker(AgentStatus::Open, "", true))
         else {
             panic!("Start worker is an activity");
         };
