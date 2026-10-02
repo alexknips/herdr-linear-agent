@@ -49,6 +49,10 @@ pub struct Worker {
     pub pr_url: String,
     /// The "lost its pane before a report" error was sent.
     pub gone_reported: bool,
+    /// The activity of the worker's own progress record last sent to
+    /// Linear, and when it was first seen.
+    pub activity: String,
+    pub activity_since: String,
     /// `worker restart` is moving it to a new pane: the watcher leaves it
     /// alone until a snapshot shows the recorded pane.
     pub restarting: bool,
@@ -255,6 +259,27 @@ pub fn copy_report_home(run: &Run, worker: &Worker) -> Result<Option<String>> {
     };
     write_atomic(&home_report_path(run, &worker.id), &bytes)?;
     Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
+}
+
+/// The report's `## Report` section as written, without its heading, in
+/// whole lines of at most 1,500 characters together; empty when there is
+/// none.
+pub fn report_section(report: &str) -> String {
+    let mut text = String::new();
+    for line in report
+        .lines()
+        .skip_while(|l| l.trim() != "## Report")
+        .skip(1)
+        .take_while(|l| !l.starts_with("## "))
+    {
+        if text.chars().count() + line.chars().count() > 1500 {
+            text.push_str("…\n");
+            break;
+        }
+        text.push_str(line.trim_end());
+        text.push('\n');
+    }
+    text.trim_matches('\n').to_string()
 }
 
 /// The pull request of the report's first `PR:` line, when it names one.
@@ -902,6 +927,24 @@ mod tests {
         ];
         for (report, expected) in table {
             assert_eq!(pr_line(report).as_deref(), expected, "{report:?}");
+        }
+    }
+
+    #[test]
+    fn the_report_section_keeps_its_lines_and_stops_at_the_next_heading() {
+        let long = format!("## Report\n- {}\n- {}\n", "a".repeat(900), "b".repeat(900));
+        let table = [
+            (
+                "PR: x\n## Report\n\n- Changed the login.\n  - and its test\n\nCI passed.  \n## Next\n- Review\n",
+                "- Changed the login.\n  - and its test\n\nCI passed.".to_string(),
+            ),
+            ("## Report\nDone.\n## Next\n- Review\n", "Done.".into()),
+            ("## Report\n## Next\n- Review\n", String::new()),
+            ("No sections.", String::new()),
+            (&long, format!("- {}\n…", "a".repeat(900))),
+        ];
+        for (report, expected) in table {
+            assert_eq!(report_section(report), expected, "{report:?}");
         }
     }
 

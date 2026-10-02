@@ -431,7 +431,7 @@ Wakes: a Herdr event; a Linear event; the Linear level only when the app user or
 
 Once per pass the reconciler drops what its in-memory maps (launched starts, NotSent retries, nudges, heartbeats, seen and missing panes, reported tokens, status changes) hold for runs that are no longer active and, with a whole snapshot, for panes that are gone and no active agent records. A run's status change is kept until a delegated list read after it was handled, since only an older read or list could undo it. `tests/scenarios:the_reconciler_forgets_what_ended_runs_and_gone_panes_left`
 
-**Timing change:** passes are driven by events and timers, not by a 15 second loop. After a pass the reconciler sleeps until the earliest future time a rule may become due, at most 150 s. Time rules read an injected `now`; nothing in a pass reads the wall clock. Time-based rules (30 s blocked, 60 s launch dialog, 60 s idle nudge, 20 min heartbeat, run timeout, routing timeout, 10 min write failure) must be re-evaluated by timers at least as often as they would have been at 15 s.
+**Timing change:** passes are driven by events and timers, not by a 15 second loop. After a pass the reconciler sleeps until the earliest future time a rule may become due, at most 150 s. Time rules read an injected `now`; nothing in a pass reads the wall clock. Time-based rules (30 s blocked, 60 s launch dialog, 60 s idle nudge, 10 min heartbeat, run timeout, routing timeout, 10 min write failure) must be re-evaluated by timers at least as often as they would have been at 15 s.
 
 ### Log lines
 
@@ -728,17 +728,18 @@ For every worker that is `open` or `failed`, except an `open` worker without a p
 
 1. Track it.
 2. Report: when `report_hash` of the report file differs from the stored one, copy the report home, store the new hash, and read the home copy. When it has a PR line different from `pr_url`: queue the action `Pull request` with parameter `<url> (worker <id>, repo <repo>)` and no result; add `{label: "<id> <repo> PR", url}` to the run's `external_urls` once; queue the full URL list; store `pr_url`. A report written in this pass counts for the group at once.
-3. Group: when its token differs from `last_group`, write an inbox item (kind `worker`, subject `<id>`) and store the token:
-   - Waiting on you: `<id> (<repo>) is Waiting on you: <reason>.` with `<reason>` the first that holds: `failed: <error>`; `its pane closed before it wrote a report`; `it asked a question in its report`; `it waits on a dialog in pane <pane id>`; the agent status; `no agent`.
+3. Activity: when its own progress record is recent, not `Waiting for you` and not blank, and its activity differs from the stored `activity`: queue an ephemeral thought `<id> (<repo>): <activity>` and store `activity` and `activity_since` (now) in the same critical section. Linear replaces an ephemeral activity with the next one, so the session shows what the worker does now. `tests/scenarios:a_workers_activity_goes_to_linear_once_and_the_heartbeat_says_how_long`
+4. Group: when its token differs from `last_group`, write an inbox item (kind `worker`, subject `<id>`) and store the token:
+   - Waiting on you: `<id> (<repo>) is Waiting on you: <reason>.` with `<reason>` the first that holds: `failed: <error>`; `its pane closed before it wrote a report`; `it asked a question in its report`; `it waits on a dialog in pane <pane id>`; the agent status; `no agent`. Unless it waits on a dialog, which step 6 already asks a person about, also queue the action `Worker waiting` with parameter `<id> (<repo>): <reason>`.
    - Idle: `<id> (<repo>) is idle without a report; check its pane <pane id>.`
    - Reported and Working write nothing.
-4. When the group is Reported and the report hash differs from `announced_report_hash`: write `<id> (<repo>) has a new report: workers/<id>.md` and store the hash.
-5. When it needs a person and was not reported: ask for a person (`Worker <id> (<repo>)`), set `blocked_reported`.
-6. When it is `open`, its pane is gone, no report exists and this was not reported: queue the error activity `Worker <id> (<repo>) lost its pane before it wrote a report.` and set `gone_reported`.
-7. When the pane exists: report pane metadata with display `<KEY> · <id> <title>` and state the group label.
-8. Save the record when it changed, keeping its `created` and `updated`.
+5. When the group is Reported and the report hash differs from `announced_report_hash`: write `<id> (<repo>) has a new report: workers/<id>.md`, queue the thought `<id> (<repo>) reported:` followed by a blank line and the report's `## Report` section as written (its lines up to the next `## ` heading, in whole lines of at most 1,500 characters together, then `…`), or `<id> (<repo>) wrote a report.` when the section is missing or empty, and store the hash. It is a thought because Linear renders a thought's body as Markdown and an action's result as code. The activities of steps 4 and 5 are queued in the critical section that stores `last_group` and `announced_report_hash`. `src/worker.rs:the_report_section_keeps_its_lines_and_stops_at_the_next_heading`
+6. When it needs a person and was not reported: ask for a person (`Worker <id> (<repo>)`), set `blocked_reported`.
+7. When it is `open`, its pane is gone, no report exists and this was not reported: queue the error activity `Worker <id> (<repo>) lost its pane before it wrote a report.` and set `gone_reported`.
+8. When the pane exists: report pane metadata with display `<KEY> · <id> <title>` and state the group label.
+9. Save the record when it changed, keeping its `created` and `updated`.
 
-Pinned: the report with a PR gives the inbox summary containing `w1 (api) has a new report`, the home copy `workers/w1.md`, the actions `Start worker` then `Pull request`, the external URL `https://github.com/acme/api/pull/7`. `tests/scenarios:a_worker_runs_in_a_worktree_and_its_report_and_pr_reach_linear`. A blocked worker gives one elicitation containing its pane id, a Herdr notification, and an inbox item containing `Waiting on you`. `tests/scenarios:a_dialog_in_a_pane_is_reported_once_and_a_lost_coordinator_can_be_resumed`
+Pinned: the report with a PR gives the inbox summary containing `w1 (api) has a new report`, the home copy `workers/w1.md`, the actions `Start worker` then `Pull request`, the thought `w1 (api) reported:` with `Done.`, the external URL `https://github.com/acme/api/pull/7`. `tests/scenarios:a_worker_runs_in_a_worktree_and_its_report_and_pr_reach_linear`. A blocked worker gives one elicitation containing its pane id, a Herdr notification, and an inbox item containing `Waiting on you`. `tests/scenarios:a_dialog_in_a_pane_is_reported_once_and_a_lost_coordinator_can_be_resumed`
 
 ### Pane metadata tokens
 
@@ -816,7 +817,7 @@ While the run is `stopped` or `timeout_asked`, no prompt goes to the coordinator
 
 Skipped entirely while the run has no session or is `stopped`.
 
-- Heartbeat: when `last_activity` is at least 20 minutes old, the outbox is empty, and no heartbeat was queued for the run in the last 20 minutes without an `ActivitySent` at or after it (the reconciler remembers this in memory; a flush and its event may be a pass apart), queue an ephemeral thought `Still on it: <summary>.` `<summary>` is `no workers`, or the counts of `open` workers by group in the order waiting on you, working, idle, reported, as `<n> <label in lower case>` joined by `, ` (for example `1 waiting on you, 1 working`). Linear marks a session `stale` after 30 minutes without an activity.
+- Heartbeat: when `last_activity` is at least 10 minutes old, the outbox is empty, and no heartbeat was queued for the run in the last 10 minutes without an `ActivitySent` at or after it (the reconciler remembers this in memory; a flush and its event may be a pass apart), queue an ephemeral thought: `Still on it: no workers.` without `open` workers, else `Still on it. <parts>.` with one part per `open` worker joined by `; `: `<id> (<repo>): <activity>, for <n> min` when it is Working and has a stored `activity` (`<n>` the whole minutes since `activity_since`, at least 1), else `<id> (<repo>): <group label in lower case>` (for example `Still on it. w1 (api): Running tests, for 12 min; w2 (web): waiting on you.`). Linear marks a session `stale` after 30 minutes without an activity.
 - Run timeout: when not `timeout_asked` and `timeout_since` is at least `ask_to_continue_after_hours * 3600` s old, queue the elicitation `This run has been going for <h> hours. Reply to let it continue; until then the coordinator gets no prompts.` with option `Continue`=`continue`, set `timeout_asked`, and show the notification `<KEY> ran <h> hours` with body `Reply in the Linear session to let it continue.`
 - A reply clears `timeout_asked` and restarts the window. `tests/scenarios:quiet_runs_get_a_heartbeat_and_long_runs_ask_to_continue`
 
@@ -883,11 +884,14 @@ After the runs, the task answers each decline it has not answered yet with a `re
 | `ask` | elicitation, with `select` options when given |
 | worker started | action `Start worker` |
 | PR in a report | action `Pull request` and the URL list |
+| worker's own activity changed | ephemeral thought `<id> (<repo>): <activity>` |
+| worker Waiting on you | action `Worker waiting` |
+| worker's new report | thought with the report's `## Report` section |
 | dialog in a pane | elicitation (and notification) |
 | coordinator pane gone | elicitation with `Resume` |
 | worker pane gone before a report | error activity |
 | launch failed 3 times | error activity |
-| 20 minutes quiet | ephemeral thought |
+| 10 minutes quiet | ephemeral thought naming what each worker does |
 | run timeout | elicitation with `Continue` |
 | stop | response `Stopped <n> agent(s) ...` |
 | `finish` | response and issue state `review` |

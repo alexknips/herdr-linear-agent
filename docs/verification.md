@@ -332,3 +332,18 @@ With a build of the branch in the default Herdr session, THLA-27 asked for one w
 | Postmortems | the routing agent picked `review` both times; both comments were posted |
 
 The worker's first start failed: `git fetch` in the testing repository needed the 1Password SSH agent, which was locked. The coordinator asked in the Agent Session, and started the worker after the reply.
+
+## Progress in Linear (2026-10-02)
+
+With a build of the branch in the default Herdr session, THLA-29 asked for one worker on the testing repository. It finished in 8 minutes with civitaspo/testing-herdr-linear-agent#15.
+
+| Step | Result |
+| --- | --- |
+| Coordinator notes | following the new sheet, it posted the approach and why (`Plan: one worker in `testing` (opencode-luna, since this is a small change)…`), and before it ended its turn `Started w1 in `testing`. Waiting for its PR and CI result.` Both were seen in the session |
+| Worker activities | the worker reported `Inspecting repository`, `Implementation tested`, `Preparing pull request`, `Pushing branch`, `Opening pull request`, `PR opened`, `Waiting for PR checks` and `CI passed`; the worker record kept `activity = "CI passed"`, and the run's 28 queued Linear writes all went out (the outbox was empty) |
+| Report | the `Worker report` action was in the session after `Pull request`, but Linear showed its result as code and the bullets joined into one line were hard to read. The report is now a thought with the `## Report` section as written, which Linear renders as Markdown |
+| Heartbeat | not seen: the run never had 10 quiet minutes. `a_workers_activity_goes_to_linear_once_and_the_heartbeat_says_how_long` covers it |
+
+After the fix, THLA-30 had one worker list the testing repository's files without a change. Its report reached the session as the thought `w1 (testing) reported:` with the `## Report` section, and Linear rendered its lines and bullets as Markdown.
+
+The first attempt, THLA-28, was picked up by the installed release build, whose startup hook had replaced the branch's ticker, and its catalog had no `testing` repository; it was canceled.

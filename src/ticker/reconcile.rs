@@ -43,7 +43,7 @@ const BLOCKED: SignedDuration = SignedDuration::from_secs(worker::BLOCKED_SECS);
 const LAUNCH_DIALOG: SignedDuration = SignedDuration::from_secs(worker::LAUNCH_DIALOG_SECS);
 /// An idle coordinator is nudged about unseen inbox items after this long.
 pub(super) const COORDINATOR_IDLE: SignedDuration = SignedDuration::from_secs(60);
-pub(super) const HEARTBEAT: SignedDuration = SignedDuration::from_secs(20 * 60);
+pub(super) const HEARTBEAT: SignedDuration = SignedDuration::from_secs(10 * 60);
 const WRITE_FAILURE_NOTICE: SignedDuration = SignedDuration::from_secs(10 * 60);
 /// Half the pane token TTL: a token is refreshed at least this often.
 pub(super) const METADATA_REFRESH: SignedDuration = SignedDuration::from_secs(150);

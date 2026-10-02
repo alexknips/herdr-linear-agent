@@ -1,7 +1,5 @@
 //! Watching coordinators and workers from a snapshot, and the heartbeat.
 
-use std::collections::BTreeMap;
-
 use anyhow::Result;
 use jiff::Timestamp;
 
@@ -290,6 +288,22 @@ impl Reconciler {
             )));
             next.gone_reported = true;
         }
+        // What the worker says it is doing, while it does it: a new activity
+        // replaces the last one in the session.
+        if let Some(report) = live
+            .self_report
+            .as_ref()
+            .filter(|r| !r.waiting() && !r.activity.trim().is_empty())
+            && report.activity != w.activity
+        {
+            let mut activity = Activity::new(Content::Thought {
+                body: format!("{} ({}): {}", w.id, w.repo, report.activity),
+            });
+            activity.ephemeral = true;
+            ops.push(Op::Activity { activity });
+            next.activity = report.activity.clone();
+            next.activity_since = now.to_string();
+        }
         let guarded = next.clone();
         if guarded != *w {
             let before = w.clone();
@@ -307,6 +321,8 @@ impl Reconciler {
                     changed!(report_hash);
                     changed!(pr_url);
                     changed!(gone_reported);
+                    changed!(activity);
+                    changed!(activity_since);
                 })?;
                 if let Some(added) = pull_request {
                     let urls = run
@@ -328,14 +344,26 @@ impl Reconciler {
         }
 
         let group = worker::group(&next, &live);
+        let mut milestones = Vec::new();
         if group.token() != w.agent.last_group {
             let summary = match group {
-                Group::WaitingOnYou => Some(format!(
-                    "{} ({}) is Waiting on you: {}.",
-                    w.id,
-                    w.repo,
-                    waiting_reason(&next, &live)
-                )),
+                Group::WaitingOnYou => {
+                    let reason = waiting_reason(&next, &live);
+                    // A dialog already asked for a person in the session.
+                    if !worker::needs_person(&next.agent, &live) {
+                        milestones.push(Op::Activity {
+                            activity: Activity::new(Content::Action {
+                                action: "Worker waiting".into(),
+                                parameter: format!("{} ({}): {reason}", w.id, w.repo),
+                                result: None,
+                            }),
+                        });
+                    }
+                    Some(format!(
+                        "{} ({}) is Waiting on you: {reason}.",
+                        w.id, w.repo
+                    ))
+                }
                 Group::Idle => Some(format!(
                     "{} ({}) is idle without a report; check its pane {}.",
                     w.id, w.repo, next.agent.pane_id
@@ -358,6 +386,19 @@ impl Reconciler {
                 ),
             )
             .await?;
+            let report =
+                std::fs::read_to_string(worker::home_report_path(run, &w.id)).unwrap_or_default();
+            // A thought, since Linear renders its body as Markdown and an
+            // action's result as code.
+            let section = worker::report_section(&report);
+            let body = if section.is_empty() {
+                format!("{} ({}) wrote a report.", w.id, w.repo)
+            } else {
+                format!("{} ({}) reported:\n\n{section}", w.id, w.repo)
+            };
+            milestones.push(Op::Activity {
+                activity: Activity::new(Content::Thought { body }),
+            });
             next.announced_report_hash = next.report_hash.clone();
         }
         if live.pane_exists {
@@ -376,21 +417,25 @@ impl Reconciler {
         if next.agent.last_group != before.agent.last_group
             || next.announced_report_hash != before.announced_report_hash
         {
-            update_worker(run, &w.id, move |r| {
-                if before.agent.last_group != next.agent.last_group {
-                    r.agent.last_group = next.agent.last_group.clone();
-                }
-                if before.announced_report_hash != next.announced_report_hash {
-                    r.announced_report_hash = next.announced_report_hash.clone();
-                }
+            let id = w.id.clone();
+            self.guarded(run, move |run, lock| {
+                worker::update_held(run, lock, &id, |r| {
+                    if before.agent.last_group != next.agent.last_group {
+                        r.agent.last_group = next.agent.last_group.clone();
+                    }
+                    if before.announced_report_hash != next.announced_report_hash {
+                        r.announced_report_hash = next.announced_report_hash.clone();
+                    }
+                })?;
+                Ok(((), milestones))
             })
             .await?;
         }
         Ok(())
     }
 
-    /// An ephemeral thought after 20 minutes without an activity keeps the
-    /// session from going stale; past `ask_to_continue_after_hours` a person is asked
+    /// An ephemeral thought after 10 minutes without an activity says what
+    /// each open worker is doing, and for how long; past `ask_to_continue_after_hours` a person is asked
     /// whether to go on. Neither goes out without a session or while stopped.
     pub(super) async fn heartbeat<H: Herdr>(
         &mut self,
@@ -411,7 +456,7 @@ impl Reconciler {
             .get(&run.key)
             .is_some_and(|at| now.duration_since(*at) < HEARTBEAT);
         if quiet && !recent && outbox::is_empty(run) {
-            let mut counts: BTreeMap<Group, usize> = BTreeMap::new();
+            let mut parts = Vec::new();
             for w in worker::list(run)
                 .iter()
                 .filter(|w| w.agent.status == AgentStatus::Open)
@@ -423,20 +468,20 @@ impl Reconciler {
                     None => Group::from_token(&w.agent.last_group),
                 };
                 let Some(group) = group else { continue };
-                *counts.entry(group).or_default() += 1;
+                let doing = match since(&w.activity_since, now) {
+                    Some(lasted) if group == Group::Working && !w.activity.is_empty() => {
+                        format!("{}, for {} min", w.activity, (lasted.as_secs() / 60).max(1))
+                    }
+                    _ => group.label().to_lowercase(),
+                };
+                parts.push(format!("{} ({}): {doing}", w.id, w.repo));
             }
-            let summary = if counts.is_empty() {
-                "no workers".to_string()
+            let body = if parts.is_empty() {
+                "Still on it: no workers.".to_string()
             } else {
-                counts
-                    .iter()
-                    .map(|(g, n)| format!("{n} {}", g.label().to_lowercase()))
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                format!("Still on it. {}.", parts.join("; "))
             };
-            let mut activity = Activity::new(Content::Thought {
-                body: format!("Still on it: {summary}."),
-            });
+            let mut activity = Activity::new(Content::Thought { body });
             activity.ephemeral = true;
             self.push(run, Op::Activity { activity }).await?;
             self.heartbeats.insert(run.key.clone(), now);

@@ -491,6 +491,10 @@ async fn a_worker_report_with_a_pr_reaches_the_inbox_and_linear() {
     assert!(mentions(&items, "w1 (api) has a new report"), "{items:?}");
     assert!(worker::home_report_path(&world.run(KEY), "w1").is_file());
     assert_eq!(world.actions(KEY), ["Start worker", "Pull request"]);
+    assert_eq!(
+        count(&world.bodies(KEY, "thought"), "w1 (api) reported:\n\nDone."),
+        1
+    );
     {
         let linear = world.fake();
         let session = linear.session("DATA-1");
@@ -1427,6 +1431,10 @@ async fn every_pass_repeated_at_once_changes_nothing() {
     assert_eq!(to(&world, &w.agent.pane_id).len(), 1);
     assert_eq!(count(&to(&world, &coordinator), NUDGE_INBOX), 1);
     assert_eq!(world.actions(KEY), ["Start worker", "Pull request"]);
+    assert_eq!(
+        count(&world.bodies(KEY, "thought"), "w1 (api) wrote a report."),
+        1
+    );
 }
 
 #[tokio::test]
@@ -1445,6 +1453,7 @@ async fn a_blocked_episode_missed_between_passes_is_still_a_new_episode() {
     world.later(30);
     world.settle().await;
     assert_eq!(world.bodies(KEY, "elicitation").len(), 1);
+    assert!(!world.actions(KEY).iter().any(|a| a == "Worker waiting"));
 
     // Answered and blocked again with no pass in between: the snapshot
     // shows the same status with a newer sequence.
@@ -1565,6 +1574,10 @@ async fn a_pull_request_goes_out_once_while_a_later_write_of_the_pass_fails() {
     std::fs::set_permissions(&inbox, std::fs::Permissions::from_mode(0o755)).unwrap();
     world.settle().await;
     assert_eq!(world.actions(KEY), ["Start worker", "Pull request"]);
+    assert_eq!(
+        count(&world.bodies(KEY, "thought"), "w1 (api) reported:\n\nDone."),
+        1
+    );
     assert!(mentions(&world.inbox(KEY), "w1 (api) has a new report"));
 }
 
@@ -1877,17 +1890,7 @@ async fn panes_left_out_of_a_partly_parsed_snapshot_are_not_judged() {
     let w = world.start_worker("api").await;
     world.settle().await;
     let state = world.ctx().state_dir();
-    crate::progress::save(
-        &state,
-        &crate::progress::Record {
-            socket: super::world::SOCKET.into(),
-            pane_id: w.agent.pane_id.clone(),
-            activity: "Reading".into(),
-            reported_at: world.now().as_second(),
-            ..crate::progress::Record::default()
-        },
-    )
-    .unwrap();
+    self_report(&world, &w, "Reading");
     world.herdr.unparsed(&pane, true);
     world.herdr.unparsed(&w.agent.pane_id, true);
     world.later(5);
@@ -1938,6 +1941,69 @@ async fn an_agent_whose_entry_does_not_parse_is_not_started_again() {
     world.settle().await;
     assert_eq!(starts(&world), 1);
     assert_eq!(to(&world, &w.agent.pane_id).len(), 1);
+}
+
+fn self_report(world: &World, w: &worker::Worker, activity: &str) {
+    crate::progress::save(
+        &world.ctx().state_dir(),
+        &crate::progress::Record {
+            socket: super::world::SOCKET.into(),
+            pane_id: w.agent.pane_id.clone(),
+            // The fake's pane `w<n>:p1` runs terminal `term-<n>`.
+            terminal_id: w.agent.pane_id.replace(":p1", "").replace('w', "term-"),
+            activity: activity.into(),
+            reported_at: world.now().as_second(),
+            ..crate::progress::Record::default()
+        },
+    )
+    .unwrap();
+}
+
+fn ephemeral_thoughts(world: &World) -> Vec<String> {
+    world
+        .sent(KEY, "thought")
+        .iter()
+        .filter(|a| a["ephemeral"] == true)
+        .map(|a| a["content"]["body"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+#[tokio::test]
+async fn a_workers_activity_goes_to_linear_once_and_the_heartbeat_says_how_long() {
+    let mut world = World::sample();
+    world.running_issue().await;
+    let w = world.start_worker("api").await;
+    world.settle().await;
+    world.herdr.set_status("acme-data-1-w1", "working");
+    self_report(&world, &w, "Running tests");
+    world.settle().await;
+    world.later(30);
+    world.settle().await;
+    assert_eq!(ephemeral_thoughts(&world), ["w1 (api): Running tests"]);
+
+    world.later(12 * 60);
+    world.settle().await;
+    assert_eq!(
+        ephemeral_thoughts(&world),
+        [
+            "w1 (api): Running tests",
+            "Still on it. w1 (api): Running tests, for 12 min."
+        ]
+    );
+
+    self_report(&world, &w, crate::progress::WAITING);
+    world.herdr.set_status("acme-data-1-w1", "idle");
+    world.settle().await;
+    assert_eq!(
+        ephemeral_thoughts(&world).len(),
+        2,
+        "no activity for a question"
+    );
+    assert_eq!(
+        world.sent(KEY, "action").last().unwrap()["content"]["parameter"],
+        "w1 (api): it asked a question in its report"
+    );
+    assert_eq!(world.actions(KEY), ["Start worker", "Worker waiting"]);
 }
 
 #[tokio::test]
@@ -2048,6 +2114,10 @@ async fn a_run_under_every_lag_knob_writes_each_fact_once() {
     assert_eq!(count(&to(&world, &coordinator), LAUNCH), 1);
     assert_eq!(to(&world, &w.agent.pane_id).len(), 1);
     assert_eq!(world.actions(KEY), ["Start worker", "Pull request"]);
+    assert_eq!(
+        count(&world.bodies(KEY, "thought"), "w1 (api) wrote a report."),
+        1
+    );
     assert_eq!(count(&world.bodies(KEY, "thought"), "Picked up DATA-1."), 1);
     let relayed = world.text(KEY, "conversation.md");
     assert_eq!(relayed.matches("Thanks.").count(), 1);
