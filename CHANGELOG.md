@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0] - 2026-10-02
+
+
+### Bug Fixes
+
+- resume crashed agents with a persistent retry limit (#92)
+- preserve native Linear input while agents report progress (#91)
+- protect persisted state and recover failed worker launches (#86)
+
+
+### Features
+
+- show worker progress and the coordinator's reasoning in Linear (#90)
+
+
+### Maintenance
+
+- update rust crate libc to v0.2.190 (#93)
+- update dependency jdx/mise to v2026.10.0 (#89)
+- update dependency rust to v1.99.0 (#88)
+
 ## [0.6.0] - 2026-10-01
 
 
