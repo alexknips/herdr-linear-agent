@@ -436,6 +436,23 @@ mise run test
 mise run build
 ```
 
+**Local macOS development only:** if you rebuild and run the plugin against
+your Linear workspaces, use an Apple Development signing identity to avoid
+repeated Keychain authorization after rebuilds. Follow
+[the development signing guide](docs/development-signing.md) to create the
+certificate, check its private key and intermediate certificate, and verify
+access across rebuilds. Users installing published releases do not need Xcode,
+a signing certificate, or this task; ordinary Keychain access prompts still
+apply. Running lint or tests alone does not need a signing identity either.
+
+```bash
+export HLA_SIGN_IDENTITY="Apple Development: YOUR_ACCOUNT (IDENTITY_SUFFIX)"
+mise run build-dev
+```
+
+This builds and signs `target/release/herdr-linear-agent`, the path used by the
+plugin manifest. Use it after each source change in your development checkout.
+
 ## License
 
 herdr-linear-agent is licensed under the MIT License. See [LICENSE](LICENSE).

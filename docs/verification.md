@@ -22,6 +22,34 @@ The first integration test ran on 2026-09-26 and 2026-09-27 with Herdr 0.9.1 and
 | 12 | Does Linear report the granted scope with commas or spaces? | **Checked.** Spaces: `"app:assignable read write"`. |
 | 13 | Does the Secret Service store work on a Linux desktop and in a headless session (for example over SSH, where no keyring runs)? | Not checked yet. |
 
+## Local macOS signing checked on 2026-10-03
+
+An Apple Development identity initially appeared under matching identities but
+not valid identities. Adding Apple's official WWDR G3 intermediate certificate
+to the login Keychain made it valid without changing trust overrides.
+
+The first signing operation and the first credential reads required the user
+to choose **Always Allow**. After that, `mise run build-dev` signed a release
+binary, and `action doctor` read both configured workspaces' credentials and
+queried their Linear viewer budgets without another authorization prompt.
+Touching `build.rs` and running the task again generated a different build ID
+and code hash while retaining the Team ID. Both signing and the subsequent
+doctor check completed without another authorization prompt.
+
+The check was then repeated twice more with the user explicitly asked to leave
+any Keychain dialogs unanswered. Each rebuild changed the code hash, retained
+the Team ID and designated requirement, and completed signing and both
+workspaces' doctor checks. The consecutive code hashes were
+`202a9b84bad936bdcaff412e91301a3dab09cf32`,
+`b3455fe894a4ee24e4aeb157036fdbeed5f43de7`, and
+`2addbf84044f331b80061479f4b0cdcd527b8a2a`.
+
+The live ticker was not replaced: it ran version 0.7.0 while this checkout built
+0.6.0, and one run was active. Doctor reported that version mismatch; its
+credential and Linear checks passed. Ticker restart, reboot, and certificate
+renewal were not tested. Repository lint, test, and build checks passed
+(365 tests passed and one was ignored).
+
 ## Flows checked end to end
 
 | Flow | Issues | Result |

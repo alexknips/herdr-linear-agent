@@ -23,3 +23,13 @@ run = "cargo test --workspace --locked"
 [tasks.build]
 description = "Build the Rust workspace"
 run = "cargo build --workspace --locked"
+
+[tasks.build-dev]
+description = "Build and sign the release binary for local macOS development"
+run = """
+set -eu
+: "${HLA_SIGN_IDENTITY:?Set HLA_SIGN_IDENTITY to your Apple Development signing identity}"
+cargo build --release --workspace --locked
+codesign --force --sign "$HLA_SIGN_IDENTITY" --identifier dev.herdr-linear-agent --timestamp=none target/release/herdr-linear-agent
+codesign --verify --strict target/release/herdr-linear-agent
+"""
