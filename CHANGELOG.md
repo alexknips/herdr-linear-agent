@@ -12,6 +12,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - document repository development workflow (#101)
 
+
+### Maintenance
+
+- update dependency jdx/mise to v2026.10.2 (#103)
+
 ## [0.7.1] - 2026-10-04
 
 
