@@ -848,6 +848,10 @@ async fn a_worker_report_with_a_pr_reaches_the_inbox_and_linear() {
     assert!(worker::home_report_path(&world.run(KEY), "w1").is_file());
     assert_eq!(world.actions(KEY), ["Start worker", "Pull request"]);
     assert_eq!(
+        world.sent(KEY, "action")[1]["content"]["parameter"],
+        "https://linear.review/acme/api/pull/7 (worker w1, repo api)"
+    );
+    assert_eq!(
         count(&world.bodies(KEY, "thought"), "w1 (api) reported:\n\nDone."),
         1
     );
@@ -859,7 +863,7 @@ async fn a_worker_report_with_a_pr_reaches_the_inbox_and_linear() {
             .iter()
             .map(|u| u.url.as_str())
             .collect();
-        assert_eq!(urls, [PR]);
+        assert_eq!(urls, ["https://linear.review/acme/api/pull/7"]);
         assert_eq!(
             session.plan.clone().unwrap_or_default()[0]["status"],
             "inProgress"

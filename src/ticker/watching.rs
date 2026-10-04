@@ -471,14 +471,15 @@ impl Reconciler {
             let report =
                 std::fs::read_to_string(worker::home_report_path(run, &w.id)).unwrap_or_default();
             if let Some(url) = worker::pr_line(&report).filter(|url| *url != w.pr_url) {
+                let review_url = url.replacen("https://github.com/", "https://linear.review/", 1);
                 ops.push(Op::activity(Activity::new(Content::Action {
                     action: "Pull request".into(),
-                    parameter: format!("{url} (worker {}, repo {})", w.id, w.repo),
+                    parameter: format!("{review_url} (worker {}, repo {})", w.id, w.repo),
                     result: None,
                 })));
                 pull_request = Some(ExternalUrl {
                     label: format!("{} {} PR", w.id, w.repo),
-                    url: url.clone(),
+                    url: review_url,
                 });
                 next.pr_url = url;
             }
