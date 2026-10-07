@@ -6,7 +6,9 @@
 # not match is never installed.
 set -eu
 
-repo="civitaspo/herdr-linear-agent"
+# Aytza fork: this branch carries changes upstream's release binaries lack, and the fork
+# publishes no releases, so the download below fails and the binary is built from source.
+repo="alexknips/herdr-linear-agent"
 cd "$(dirname "$0")/.."
 dest="target/release/herdr-linear-agent"
 
