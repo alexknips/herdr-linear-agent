@@ -72,11 +72,27 @@ pub struct Team {
     /// when unset.
     #[serde(default)]
     pub allowed_delegator_ids: Option<Vec<String>>,
+    /// What the ticker does with a delegation by someone outside the
+    /// delegators: decline it (the default) or leave it alone.
+    #[serde(default)]
+    pub foreign_delegations: ForeignDelegations,
     /// The workflow state an issue moves to on `finish`.
     #[serde(default = "default_review_state")]
     pub review_state: String,
     /// The routing of this team's issues: a table under `routing`.
     pub routing: String,
+}
+
+/// A team's answer to a delegation by someone outside its delegators.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ForeignDelegations {
+    /// Answer the session with the decline response, which ends it.
+    #[default]
+    Decline,
+    /// Leave the session alone, so another ticker that shares the app (one
+    /// per person, say) can take it. Logged once, never answered.
+    Ignore,
 }
 
 impl Team {
@@ -837,6 +853,10 @@ workers = ["standard", "deep"]
         );
         bad("path = \"/src/api\"", "path = \"src/api\"");
         bad("agent = \"router\"", "agent = \"deep-x\"");
+        bad(
+            "[workspaces.acme.teams.DATA]",
+            "[workspaces.acme.teams.DATA]\nforeign_delegations = \"skip\"",
+        );
         bad(
             "coordinators = [\"coordinator\", \"coordinator-light\"]",
             "coordinators = [\"coordinator\", \"missing\"]",

@@ -70,20 +70,41 @@ fn open_session(issue: &IssueRef) -> Option<String> {
         .map(|session| session.id.clone())
 }
 
-/// Logs and notifies a delegation the ticker does not take, with the
-/// delegator's ID for the team's `allowed_delegator_ids`.
-async fn tell_declined<H: Herdr>(d: &Deps<'_, H>, key: &str, issue: &IssueRef) {
-    let why = match issue.delegator.as_ref().map(|d| &d.user) {
+/// Why a delegation is not taken, with the delegator's ID for the team's
+/// `allowed_delegator_ids`.
+fn why_not_taken(issue: &IssueRef) -> String {
+    match issue.delegator.as_ref().map(|d| &d.user) {
         None => "Linear does not tell who delegated it".to_string(),
         Some(None) => "no person delegated it (automation or an agent did)".to_string(),
         Some(Some(user)) => format!(
             "delegated by {} ({}), who is not in allowed_delegator_ids of team {}",
             user.name, user.id, issue.team
         ),
-    };
+    }
+}
+
+/// Logs and notifies a delegation the ticker declines.
+async fn tell_declined<H: Herdr>(d: &Deps<'_, H>, key: &str, issue: &IssueRef) {
+    let why = why_not_taken(issue);
     d.log.line(&format!("{key}: not picked up: {why}"));
     d.notify(&format!("{key} not picked up"), &format!("{why}."))
         .await;
+}
+
+/// Logs a delegation the ticker leaves alone (`foreign_delegations =
+/// "ignore"`): another ticker sharing the app may take it, so no
+/// notification.
+fn tell_ignored<H: Herdr>(d: &Deps<'_, H>, key: &str, issue: &IssueRef) {
+    let why = why_not_taken(issue);
+    d.log.line(&format!("{key}: left alone: {why}"));
+}
+
+/// What marks one delegation of an issue, so each is logged once.
+fn delegation_mark(issue: &IssueRef) -> String {
+    issue.delegator.as_ref().map_or_else(String::new, |d| {
+        let who = d.user.as_ref().map_or("", |u| u.id.as_str());
+        format!("{who}@{}", d.at)
+    })
 }
 
 fn run_of<H>(d: &Deps<'_, H>, issue_id: &str) -> Option<(Run, RunRecord)> {
@@ -554,6 +575,7 @@ impl Reconciler {
         let runs_dir = d.ctx.runs_dir();
         let paused = d.ctx.state_dir().join("paused").exists();
         let mut declined = std::collections::BTreeMap::new();
+        let mut ignored = std::collections::BTreeMap::new();
         for issue in &delegated.issues {
             let key = crate::run::run_key(workspace, &issue.identifier);
             let run = Run::load(&runs_dir, &key).ok();
@@ -564,14 +586,26 @@ impl Reconciler {
             // Only a claim or a restart takes a delegation: a running run
             // keeps going whoever opens another session on its issue.
             if !active {
-                let delegators = d
-                    .config
-                    .team(workspace, &issue.team)
+                let team = d.config.team(workspace, &issue.team);
+                let ignore = team.as_ref().is_ok_and(|team| {
+                    team.foreign_delegations == crate::config::ForeignDelegations::Ignore
+                });
+                let delegators = team
                     .map(|team| team.delegators().to_vec())
                     .unwrap_or_default();
                 match delegation(&key, issue, &delegators) {
                     Delegation::Allowed => {}
                     Delegation::Answered => continue,
+                    // Another ticker sharing the app may own this delegation:
+                    // never answer its session, just note it once.
+                    Delegation::Declined(_) if ignore => {
+                        let mark = delegation_mark(issue);
+                        if self.ignored.get(&key) != Some(&mark) {
+                            tell_ignored(d, &key, issue);
+                        }
+                        ignored.insert(key, mark);
+                        continue;
+                    }
                     Delegation::Declined(decline) => {
                         if self.declined.get(&key) != Some(&decline) {
                             tell_declined(d, &key, issue).await;
@@ -610,6 +644,9 @@ impl Reconciler {
         self.declined
             .retain(|key, _| crate::run::split_key(key).0 != workspace);
         self.declined.extend(declined);
+        self.ignored
+            .retain(|key, _| crate::run::split_key(key).0 != workspace);
+        self.ignored.extend(ignored);
     }
 
     /// A detached or closed run whose issue is delegated again, in a list

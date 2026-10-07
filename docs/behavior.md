@@ -91,6 +91,7 @@ File: `<config_dir>/config.toml`. Unknown keys are refused in every table. The k
 | `workspaces.<name>.teams.<key>.allowed_user_ids` | list | `[]` | whose replies in that team's sessions reach the coordinator |
 | `workspaces.<name>.teams.<key>.routing` | name | required | a table under `routing`: ``workspaces.<name>.teams.<key>.routing: there is no routing.<routing>``; see [Routing](#routing) |
 | `workspaces.<name>.teams.<key>.allowed_delegator_ids` | list | `allowed_user_ids` | whose delegations of that team's issues the ticker takes (see [Intake and claim](#intake-and-claim)) |
+| `workspaces.<name>.teams.<key>.foreign_delegations` | `decline` or `ignore` | `decline` | what happens to a delegation by someone outside the delegators: answered with the decline, or left alone for another ticker sharing the app (see [Intake and claim](#intake-and-claim)) |
 | `workspaces.<name>.teams.<key>.review_state` | string | `In Review` | not blank: `workspaces.<name>.teams.<key>.review_state is empty`; where `finish` moves that team's issues |
 | `herdr.session` | string | unset: Herdr's default session | |
 | `limits.max_runs` | u32 | `2` | the three limits must satisfy `max_runs >= 1`, `max_workers_per_run >= 1`, `max_agents >= 2`: `limits must allow one run with one worker` |
@@ -593,6 +594,8 @@ A decline is told once per delegation, in the log and a Herdr notification title
 | not told | `Linear does not tell who delegated it` |
 
 The reconciler hands the declines with a session to the Linear task, which sends the response `This agent does not take issues delegated by this user. Ask someone allowed to delegate it.` once per session and delegation. The response ends the session and becomes its latest activity, so later polls, across restarts too, see it answered. A session's `endedAt` and `updatedAt` stay at its first completion, so they cannot tell. `src/ticker/scenarios.rs:an_issue_delegated_by_someone_not_allowed_is_declined_once`, `src/ticker/scenarios.rs:an_issue_no_person_is_known_to_have_delegated_is_not_picked_up`, `src/ticker/scenarios.rs:a_closed_run_delegated_again_by_someone_not_allowed_stays_closed`, `src/ticker/scenarios.rs:a_closed_run_delegated_again_by_someone_allowed_continues`, `src/ticker/scenarios.rs:the_latest_delegation_decides_who_delegated`
+
+**`foreign_delegations = "ignore"`.** For a team with this setting, every "otherwise" row above is left alone instead of declined. There is no run, no response, no notification, and nothing for the Linear task to send. The log gets one line per delegation, `<KEY>: left alone: <the case text above>`, which is repeated after a ticker restart. This is for several tickers that share one OAuth app, for example one machine per person, each listing only its own person in `allowed_delegator_ids`. A delegation then reaches only the ticker of the person who made it, and the others keep away from its session. Answering would end the session that ticker is using. A delegation that no ticker serves stays unanswered. `src/ticker/scenarios.rs:a_team_that_ignores_foreign_delegations_leaves_their_sessions_alone`
 
 A run that is active is not checked: its issue keeps going whoever opens another session on it, for example by mentioning the agent.
 

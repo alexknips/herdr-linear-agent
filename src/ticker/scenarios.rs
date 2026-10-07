@@ -671,6 +671,47 @@ async fn an_issue_delegated_by_someone_not_allowed_is_declined_once() {
 }
 
 #[tokio::test]
+async fn a_team_that_ignores_foreign_delegations_leaves_their_sessions_alone() {
+    // One ticker per person, all sharing the app: each takes its own person's
+    // delegations and never answers anyone else's session.
+    let mut world = World::with(|c| {
+        c.replace(
+            "[workspaces.acme.teams.DATA]",
+            "[workspaces.acme.teams.DATA]\nforeign_delegations = \"ignore\"",
+        )
+    });
+    world.delegate_by(KEY, "stranger", "Someone else's", None);
+    for _ in 0..3 {
+        world.settle().await;
+        world.later(5);
+    }
+    world.restart_ticker();
+    world.settle().await;
+
+    assert_eq!((world.runs(), world.herdr.starts().len()), (0, 0));
+    assert!(world.bodies(KEY, "response").is_empty(), "no decline");
+    assert!(world.herdr.notifications().is_empty());
+    let why =
+        "delegated by Person stranger (stranger), who is not in allowed_delegator_ids of team DATA";
+    let log = world.log_text();
+    assert_eq!(
+        log.matches(&format!("acme/DATA-1: left alone: {why}\n"))
+            .count(),
+        // Logged once per ticker: the restarted one starts with an empty memory.
+        2,
+        "{log}"
+    );
+
+    // Delegated again by someone this ticker serves: picked up as usual.
+    world.later(5);
+    world.fake().redelegate_by("DATA-1", "user-1");
+    world.later(5);
+    world.settle().await;
+    assert_eq!(world.record(KEY).status, Status::Active);
+    assert_eq!(world.bodies(KEY, "thought")[0], "Picked up DATA-1.");
+}
+
+#[tokio::test]
 async fn the_latest_delegation_decides_who_delegated() {
     let mut world = World::sample();
     world.delegate(KEY, "Handed on", None);

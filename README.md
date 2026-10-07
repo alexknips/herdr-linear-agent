@@ -52,6 +52,7 @@ client_id = "your-oauth-client-id"       # the OAuth application of this workspa
 [workspaces.acme.teams.DATA]             # a team to pick issues from, by team key
 allowed_user_ids = ["linear-user-uuid"]  # whose replies reach the coordinator
 # allowed_delegator_ids = ["linear-user-uuid"]  # whose delegations are taken (default: allowed_user_ids)
+# foreign_delegations = "decline"        # or "ignore": leave other people's delegations to another ticker
 review_state = "In Review"               # where `finish` moves the issue (default)
 routing = "default"                      # the routing of this team's issues, a table under [routing] (required)
 
@@ -105,6 +106,8 @@ workers = ["standard", "deep"]           # the profiles a coordinator may start 
 **Workspaces and teams.** Each workspace polls Linear with its own OAuth application, token and app user. Runs are named `<workspace>/<ISSUE-KEY>`, for example `acme/DATA-1`, so the same issue key in two workspaces makes two runs; the name is what agents pass to `herdr-linear-agent` commands, and the workspace is part of agent names (`acme-data-1-coordinator`), branches (`herdr-linear-agent/acme/data-1/w1-...`) and brief folders. A team's `allowed_user_ids`, `allowed_delegator_ids` and `review_state` apply to that team's issues only. A run whose team was removed from the config keeps running, relays nobody's replies and moves to `In Review` on `finish`.
 
 **Who may delegate.** The ticker takes an issue only when a person in the team's `allowed_delegator_ids` delegated it; see [Security notes](#security-notes), and [Finding user IDs](#finding-user-ids) for the IDs. Without the key, the team's `allowed_user_ids` may delegate. Set it apart when someone should start runs without their replies counting as instructions, or the other way round.
+
+**One app, one machine per person.** Several people can share one OAuth app, each with a ticker on their own machine. Give each machine a team with `foreign_delegations = "ignore"`, and list only that machine's person in `allowed_delegator_ids`. A delegation is then taken by its delegator's machine, and the other machines leave its session alone. With the default, `decline`, they would answer it with the decline, and that ends the session the right machine works in.
 
 ### Postmortems
 

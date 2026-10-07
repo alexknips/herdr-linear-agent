@@ -221,6 +221,10 @@ pub struct Reconciler {
     /// the decline its session gets, or `None` when no session tells who
     /// delegated. Each is logged once.
     pub(super) declined: BTreeMap<String, Option<Decline>>,
+    /// Per run key, the delegation left alone in the latest delegated list
+    /// (`foreign_delegations = "ignore"`), by delegator and time. Each is
+    /// logged once and never answered.
+    pub(super) ignored: BTreeMap<String, String>,
     /// Transcript copies still running, each giving its failures to log.
     pub(super) keeping: Vec<tokio::task::JoinHandle<Vec<String>>>,
     /// Postmortems being written, by run key.
@@ -367,6 +371,7 @@ impl Reconciler {
             queued: false,
             queries: Vec::new(),
             declined: BTreeMap::new(),
+            ignored: BTreeMap::new(),
             keeping: Vec::new(),
             writing: BTreeMap::new(),
         })
