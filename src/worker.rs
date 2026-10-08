@@ -360,10 +360,10 @@ pub fn compose_brief(input: &BriefInput) -> String {
 }
 
 /// Coordinators and workers of active runs that count against `max_agents`.
-pub fn agent_count(runs: &[Run]) -> usize {
+pub fn agent_count(runs: &[Run], count_finished: bool) -> usize {
     runs.iter()
         .filter_map(|run| run.record().ok().map(|r| (run, r)))
-        .filter(|(_, r)| r.status == Status::Active)
+        .filter(|(_, r)| r.status == Status::Active && (count_finished || !r.finished))
         .map(|(run, r)| {
             usize::from(matches!(
                 r.coordinator.status,
@@ -1103,7 +1103,7 @@ mod tests {
         .unwrap();
         runs.add("DATA-3", Status::Active, AgentStatus::Stopped);
         runs.add("DATA-4", Status::Active, AgentStatus::Pending);
-        assert_eq!(agent_count(&Run::list(&runs.dir())), 4);
+        assert_eq!(agent_count(&Run::list(&runs.dir()), true), 4);
     }
 
     #[test]

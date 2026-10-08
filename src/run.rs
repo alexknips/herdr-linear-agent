@@ -307,6 +307,9 @@ pub struct RunRecord {
     pub postmortem_due: Option<crate::postmortem::Stage>,
     /// The workflow state the issue was in when the run closed.
     pub closed_state: String,
+    /// Every pull request merged and the agents were stopped; the next reply
+    /// resumes the coordinator.
+    pub asleep: bool,
 }
 
 #[derive(Debug, Clone)]

@@ -221,6 +221,15 @@ impl Reconciler {
             self.changed_at.insert(record.issue_id.clone(), read_at);
             return self.close_run(d, snap, run, &issue.state_name, now).await;
         }
+        if record.finished
+            && !record.asleep
+            && d.config
+                .team(&record.workspace, &record.team_key)
+                .is_ok_and(|team| team.stop_agents_when_merged)
+            && self.all_merged(d, run, now).await
+        {
+            return self.put_to_sleep(d, snap, run, record, now).await;
+        }
         if level.app_user.is_some() && issue.delegate_id != level.app_user {
             self.changed_at.insert(record.issue_id.clone(), read_at);
             return self.detach_run(d, run).await;
@@ -370,6 +379,11 @@ impl Reconciler {
                     r.reply_generation = r.reply_generation.saturating_add(1);
                     r.stopped = false;
                     r.finished = false;
+                    // Asleep after the merge: the reply wakes the coordinator.
+                    if r.asleep {
+                        r.asleep = false;
+                        r.coordinator.repend();
+                    }
                     if resume {
                         r.coordinator.recovery = crate::run::Recovery::None;
                     }
@@ -453,17 +467,16 @@ impl Reconciler {
         stopped
     }
 
-    /// The issue was completed or canceled: copy the reports home, stop the
-    /// agents and close their workspaces. Checkouts and branches stay.
-    async fn close_run<H: Herdr>(
+    /// Stops the run's agents and closes their workspaces; reports are copied
+    /// home. Checkouts and branches stay.
+    async fn stop_agents<H: Herdr>(
         &mut self,
         d: &Deps<'_, H>,
         snap: Option<&Snapshot>,
         run: &Run,
-        state: &str,
+        record: &RunRecord,
         now: Timestamp,
     ) -> Result<()> {
-        let record = run.record()?;
         self.interrupt_agents(d, snap, run).await;
         // The live workspace, or the recorded one; without a snapshot every
         // open agent's recorded workspace.
@@ -484,13 +497,15 @@ impl Reconciler {
             let live = worker::live_state(agent, snapshot, now, &d.ctx.state_dir(), d.socket);
             live.pane_exists.then(|| agent.workspace_id.clone())
         };
-        let mut workspaces = Vec::new();
+        let mut workspaces: Vec<String> = Vec::new();
         for w in worker::list(run) {
             let _ = worker::copy_report_home(run, &w);
             workspaces.extend(workspace_of(&w.agent));
             update_worker(run, &w.id, |w| w.agent.status = AgentStatus::Stopped).await?;
         }
         workspaces.extend(workspace_of(&record.coordinator));
+        workspaces.sort();
+        workspaces.dedup();
         for workspace in workspaces {
             if let Err(error) = d
                 .herdr
@@ -503,6 +518,96 @@ impl Reconciler {
                 ));
             }
         }
+        Ok(())
+    }
+
+    /// Whether every worker's pull request of a finished run is merged,
+    /// asked of `gh` at most every few minutes per run. A run without a
+    /// pull request never is.
+    async fn all_merged<H: Herdr>(&mut self, d: &Deps<'_, H>, run: &Run, now: Timestamp) -> bool {
+        const EVERY: jiff::SignedDuration = jiff::SignedDuration::from_mins(5);
+        if self
+            .merge_checked
+            .get(&run.key)
+            .is_some_and(|at| now.duration_since(*at) < EVERY)
+        {
+            return false;
+        }
+        self.merge_checked.insert(run.key.clone(), now);
+        let urls: Vec<String> = worker::list(run)
+            .into_iter()
+            .map(|w| w.pr_url)
+            .filter(|url| !url.is_empty())
+            .collect();
+        if urls.is_empty() {
+            return false;
+        }
+        for url in urls {
+            let cmd = crate::process::Cmd::new("gh", Duration::from_secs(20))
+                .args(["pr", "view", &url, "--json", "state", "--jq", ".state"]);
+            match d.ctx.runner.run(&cmd).await {
+                Ok(out) if out.success() && out.stdout.trim() == "MERGED" => {}
+                Ok(out) if !out.success() => {
+                    d.log.line(&format!(
+                        "{}: gh pr view {url}: {}",
+                        run.key,
+                        out.error_text()
+                    ));
+                    return false;
+                }
+                Ok(_) => return false,
+                Err(error) => {
+                    d.log
+                        .line(&format!("{}: gh pr view {url}: {error:#}", run.key));
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// Every pull request of a finished run is merged: stop its agents but
+    /// keep the run open, since QA may still send it back. The next reply
+    /// resumes the coordinator in its session.
+    async fn put_to_sleep<H: Herdr>(
+        &mut self,
+        d: &Deps<'_, H>,
+        snap: Option<&Snapshot>,
+        run: &Run,
+        record: &RunRecord,
+        now: Timestamp,
+    ) -> Result<()> {
+        self.interrupt_agents(d, snap, run).await;
+        self.stop_agents(d, snap, run, record, now).await?;
+        self.update_and_push(run, |r| {
+            r.asleep = true;
+            r.coordinator.status = AgentStatus::Stopped;
+            // A finished run's session takes only a response.
+            vec![Op::activity(Activity::new(Content::Response {
+                body: "Every pull request is merged, so the agents are stopped. Reply here to bring the coordinator back; the run closes when the issue is done.".into(),
+            }))]
+        })
+        .await?;
+        d.log.line(&format!(
+            "{}: asleep (every pull request is merged)",
+            run.key
+        ));
+        self.keep_transcripts(d, run);
+        Ok(())
+    }
+
+    /// The issue was completed or canceled: copy the reports home, stop the
+    /// agents and close their workspaces. Checkouts and branches stay.
+    async fn close_run<H: Herdr>(
+        &mut self,
+        d: &Deps<'_, H>,
+        snap: Option<&Snapshot>,
+        run: &Run,
+        state: &str,
+        now: Timestamp,
+    ) -> Result<()> {
+        let record = run.record()?;
+        self.stop_agents(d, snap, run, &record, now).await?;
         // Linear shows the session working until a response ends it.
         let body = format!("The issue is {state}; this run is closed.");
         let closed_state = state.to_string();
@@ -625,12 +730,18 @@ impl Reconciler {
                 continue;
             }
             let runs = Run::list(&runs_dir);
+            // A finished run waits on a person; unless the limits say so it
+            // leaves its slot to the next issue.
+            let counted = d.config.limits.count_finished_runs;
             let active = runs
                 .iter()
-                .filter(|r| r.record().is_ok_and(|r| r.status == Status::Active))
+                .filter(|r| {
+                    r.record()
+                        .is_ok_and(|r| r.status == Status::Active && (counted || !r.finished))
+                })
                 .count();
             if active >= d.config.limits.max_runs as usize
-                || worker::agent_count(&runs) + 1 > d.config.limits.max_agents as usize
+                || worker::agent_count(&runs, counted) + 1 > d.config.limits.max_agents as usize
             {
                 break;
             }

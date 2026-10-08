@@ -366,7 +366,7 @@ fn check_room(workers: &[Worker], repo: &str, limits: Limits) -> Result<()> {
 }
 
 fn check_agents(ctx: &Ctx, limits: Limits) -> Result<()> {
-    let count = worker::agent_count(&Run::list(&ctx.runs_dir()));
+    let count = worker::agent_count(&Run::list(&ctx.runs_dir()), limits.count_finished_runs);
     if count + 1 > limits.max_agents as usize {
         bail!("the limit of {} agents is reached", limits.max_agents);
     }

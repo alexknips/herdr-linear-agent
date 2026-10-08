@@ -194,6 +194,8 @@ pub struct Reconciler {
     pub(super) missing_since: BTreeMap<String, Timestamp>,
     /// Per run, the hash of the unseen inbox ids last nudged about.
     pub(super) nudged: BTreeMap<String, String>,
+    /// Per finished run, when its pull requests were last checked for a merge.
+    pub(super) merge_checked: BTreeMap<String, Timestamp>,
     /// Per pane, the token last reported and when.
     pub(super) reported: BTreeMap<String, (String, Timestamp)>,
     /// Per issue, when its run last changed status, as the time of the fact
@@ -358,6 +360,7 @@ impl Reconciler {
             seen_panes: BTreeSet::new(),
             missing_since: BTreeMap::new(),
             nudged: BTreeMap::new(),
+            merge_checked: BTreeMap::new(),
             reported: BTreeMap::new(),
             changed_at: BTreeMap::new(),
             intake_read: BTreeMap::new(),

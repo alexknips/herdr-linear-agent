@@ -79,6 +79,12 @@ pub struct Team {
     /// The workflow state an issue moves to on `finish`.
     #[serde(default = "default_review_state")]
     pub review_state: String,
+    /// Stop a finished run's agents once every worker's pull request is
+    /// merged (checked with `gh`). The run stays open: workspaces' checkouts,
+    /// reports and sessions are kept, and the next reply resumes the
+    /// coordinator. Only a completed or canceled issue closes the run.
+    #[serde(default)]
+    pub stop_agents_when_merged: bool,
     /// The routing of this team's issues: a table under `routing`.
     pub routing: String,
 }
@@ -132,6 +138,9 @@ pub struct Limits {
     pub max_runs: u32,
     pub max_workers_per_run: u32,
     pub max_agents: u32,
+    /// Whether finished runs (moved to review, waiting on a person) count
+    /// toward `max_runs` and `max_agents`.
+    pub count_finished_runs: bool,
     /// After this many hours a run asks a person whether to continue.
     pub ask_to_continue_after_hours: u64,
     /// How long a routing agent may take, unless its profile says.
@@ -146,6 +155,7 @@ impl Default for Limits {
             max_runs: 2,
             max_workers_per_run: 4,
             max_agents: 8,
+            count_finished_runs: true,
             ask_to_continue_after_hours: 8,
             routing_agent_timeout_seconds: 120,
             postmortem_agent_timeout_seconds: 300,

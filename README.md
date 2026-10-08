@@ -54,6 +54,7 @@ allowed_user_ids = ["linear-user-uuid"]  # whose replies reach the coordinator
 # allowed_delegator_ids = ["linear-user-uuid"]  # whose delegations are taken (default: allowed_user_ids)
 # foreign_delegations = "decline"        # or "ignore": leave other people's delegations to another ticker
 review_state = "In Review"               # where `finish` moves the issue (default)
+# stop_agents_when_merged = false        # stop a finished run's agents once all its PRs are merged; a reply wakes it
 routing = "default"                      # the routing of this team's issues, a table under [routing] (required)
 
 [workspaces.acme.teams.OPS]              # each team has its own allowed users, review state and routing
@@ -75,6 +76,7 @@ session = "default"                      # the Herdr session runs start in; omit
 max_runs = 2
 max_workers_per_run = 4
 max_agents = 8
+count_finished_runs = true               # false: a run waiting in review leaves its slot to the next issue
 ask_to_continue_after_hours = 8          # after this many hours a run asks whether to go on
 routing_agent_timeout_seconds = 120      # how long a routing agent may take, unless its profile says
 postmortem_agent_timeout_seconds = 300   # how long a postmortem agent may take, unless its profile says

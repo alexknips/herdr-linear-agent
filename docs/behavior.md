@@ -93,10 +93,12 @@ File: `<config_dir>/config.toml`. Unknown keys are refused in every table. The k
 | `workspaces.<name>.teams.<key>.allowed_delegator_ids` | list | `allowed_user_ids` | whose delegations of that team's issues the ticker takes (see [Intake and claim](#intake-and-claim)) |
 | `workspaces.<name>.teams.<key>.foreign_delegations` | `decline` or `ignore` | `decline` | what happens to a delegation by someone outside the delegators: answered with the decline, or left alone for another ticker sharing the app (see [Intake and claim](#intake-and-claim)) |
 | `workspaces.<name>.teams.<key>.review_state` | string | `In Review` | not blank: `workspaces.<name>.teams.<key>.review_state is empty`; where `finish` moves that team's issues |
+| `workspaces.<name>.teams.<key>.stop_agents_when_merged` | bool | `false` | stop a finished run's agents once every worker's pull request is merged; the run stays open (see [Asleep after the merge](#asleep-after-the-merge)) |
 | `herdr.session` | string | unset: Herdr's default session | |
 | `limits.max_runs` | u32 | `2` | the three limits must satisfy `max_runs >= 1`, `max_workers_per_run >= 1`, `max_agents >= 2`: `limits must allow one run with one worker` |
 | `limits.max_workers_per_run` | u32 | `4` | |
 | `limits.max_agents` | u32 | `8` | |
+| `limits.count_finished_runs` | bool | `true` | whether finished runs, waiting in review, count toward `max_runs` and `max_agents`; a reply that reopens one counts it again, even past the limits |
 | `limits.ask_to_continue_after_hours` | u64 | `8` | at least 1: `limits.ask_to_continue_after_hours must be at least 1`; see [Heartbeat and run timeout](#heartbeat-and-run-timeout) |
 | `limits.routing_agent_timeout_seconds` | u64 | `120` | 1 to 3600: `limits.routing_agent_timeout_seconds must be between 1 and 3600`; a routing agent's profile's `timeout_seconds` overrides it |
 | `limits.postmortem_agent_timeout_seconds` | u64 | `300` | 1 to 3600: `limits.postmortem_agent_timeout_seconds must be between 1 and 3600`; a postmortem profile's `timeout_seconds` overrides it |
@@ -1217,3 +1219,11 @@ The inputs did not pin these. Each line is the rule the rewrite follows. A rule 
 19. Run records, worker records and outbox files written by the current build must stay readable, so a ticker can be upgraded in place. Inbox items and progress records in another format are skipped, with one log line each.
 20. The batched run read is split so that each query's measured `X-Complexity` stays under 5,000, half the per-query limit. The first read of a batch measures the cost per run, and later batches use that measurement. When the measured cost per run changes, the ticker logs `Linear run read costs <n> points per run; up to <k> runs per query`, where `<k>` is the batch size the split now uses. The result is recorded in `docs/verification.md` #8.
 21. The PR is the first line of the report that starts with `PR:`. It counts only when it names a GitHub pull request URL.
+
+## Asleep after the merge
+
+A finished run waits on people: review, merge, QA. With `stop_agents_when_merged = true` for its team, the ticker asks `gh pr view <url> --json state` about every worker's pull request, at most every five minutes per run, while it reads the run. When every one is `MERGED` (a run without a pull request never is), it puts the run to sleep: it stops the agents and closes their workspaces as a close does, but the run stays active and finished. The checkouts, branches, reports and the coordinator's session are kept, and the session gets the response `Every pull request is merged, so the agents are stopped. Reply here to bring the coordinator back; the run closes when the issue is done.` A `gh` failure is logged and the run stays awake.
+
+A merge is not proof the work is done, so only a completed or canceled issue closes the run. Until then, the next reply wakes it: the coordinator starts again in its previous session, and it restarts workers as it needs. `src/ticker/scenarios.rs:merged_pull_requests_put_a_finished_run_to_sleep_and_a_reply_wakes_it`
+
+With `count_finished_runs = false`, a finished run, asleep or not, leaves its slot in `max_runs` and `max_agents` to the next delegated issue. `src/ticker/scenarios.rs:a_finished_run_leaves_its_slot_when_finished_runs_do_not_count`

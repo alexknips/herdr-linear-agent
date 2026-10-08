@@ -11,6 +11,7 @@ use crate::herdr::PaneId;
 use crate::linear::api::fake::APP_USER;
 use crate::linear::api::{IssueStatus, RunUpdate};
 use crate::linear::task::{DECLINED, LinearEvent};
+use crate::process::fake::ok;
 use crate::run::{AgentStatus, Recovery, Status, WaitReason};
 use crate::{inbox, worker};
 
@@ -2828,4 +2829,112 @@ async fn only_a_person_editing_the_issue_writes_an_issue_item() {
     world.later(5);
     world.settle().await;
     assert_eq!(issue_items(&world), 2, "an edited description is");
+}
+
+/// A worker with a pull request that reported and went idle, and a
+/// coordinator that called `finish`.
+async fn finished_with_a_pull_request(world: &mut World) {
+    world.running_issue().await;
+    let w = world.start_worker("api").await;
+    world.settle().await;
+    world.report(&w, &format!("PR: {PR}\n## Report\nDone.\n"));
+    world.herdr.set_status("acme-data-1-w1", "idle");
+    world.settle().await;
+    commands::finish(&world.ctx(), &world.session(), KEY, "Done.")
+        .await
+        .unwrap();
+    world.settle().await;
+}
+
+#[tokio::test]
+async fn a_finished_run_leaves_its_slot_when_finished_runs_do_not_count() {
+    let mut world = World::with(|config| {
+        config.replace(
+            "[herdr]",
+            "[limits]\nmax_runs = 1\ncount_finished_runs = false\n\n[herdr]",
+        )
+    });
+    world.running_issue().await;
+    world.delegate("DATA-2", "Two", None);
+    world.settle().await;
+    assert_eq!(world.runs(), 1, "the running run holds the only slot");
+    commands::finish(&world.ctx(), &world.session(), KEY, "Done.")
+        .await
+        .unwrap();
+    world.later(5);
+    world.settle().await;
+    assert_eq!(world.runs(), 2, "the finished run left its slot");
+}
+
+#[tokio::test]
+async fn merged_pull_requests_put_a_finished_run_to_sleep_and_a_reply_wakes_it() {
+    let mut world = World::with(|config| {
+        config.replace(
+            "[workspaces.acme.teams.DATA]",
+            "[workspaces.acme.teams.DATA]\nstop_agents_when_merged = true",
+        )
+    });
+    world.runner.on("gh pr view", ok("OPEN\n"));
+    finished_with_a_pull_request(&mut world).await;
+    world.later(400);
+    world.settle().await;
+    assert!(
+        !world.record(KEY).asleep,
+        "an open pull request keeps it awake"
+    );
+    let asked = world.runner.count(&format!("gh pr view {PR}"));
+    assert!(asked >= 1);
+
+    world.runner.on("gh pr view", ok("MERGED\n"));
+    world.later(60);
+    world.settle().await;
+    assert_eq!(
+        world.runner.count("gh pr view"),
+        asked,
+        "asked again only after a few minutes"
+    );
+    assert!(!world.record(KEY).asleep);
+    world.later(400);
+    world.settle().await;
+    let record = world.record(KEY);
+    assert_eq!(
+        (record.status, record.asleep, record.coordinator.status),
+        (Status::Active, true, AgentStatus::Stopped),
+        "asleep, not closed"
+    );
+    assert_eq!(world.worker(KEY, "w1").agent.status, AgentStatus::Stopped);
+    assert!(
+        !world.herdr.closed().is_empty(),
+        "its workspaces are closed"
+    );
+    assert!(
+        world
+            .bodies(KEY, "response")
+            .iter()
+            .any(|b| b.starts_with("Every pull request is merged")),
+    );
+    let starts = world.herdr.starts().len();
+    world.later(400);
+    world.settle().await;
+    assert_eq!(
+        world.herdr.starts().len(),
+        starts,
+        "nothing restarts by itself"
+    );
+
+    world.message(KEY, "user-1", "QA found a bug: the button is gone.", None);
+    world.later(5);
+    world.settle().await;
+    let woken = world.record(KEY);
+    assert!(!woken.asleep && !woken.finished);
+    assert_eq!(
+        world.herdr.starts().len(),
+        starts + 1,
+        "the coordinator is back"
+    );
+    assert!(
+        ends_with(&last_args(&world), &RESUMED_WITH),
+        "in its session: {:?}",
+        last_args(&world)
+    );
 }
