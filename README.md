@@ -369,6 +369,7 @@ Other kinds are not registered.
 5. Workers report what they are doing (`herdr-linear-agent report --activity`) and write a report (`PR: <url>`, `## Report`, `## Next`). The ticker shows each new activity in the session, posts a worker that waits on someone, its report and its pull requests, copies the report into the run folder, and tells the coordinator through its inbox. After 10 quiet minutes it posts what each worker is doing and for how long.
 6. Replies in the session from allowed users are appended to `conversation.md` and the coordinator is prompted with one fixed line. A stop signal interrupts the run's agents.
 7. `herdr-linear-agent finish` posts the summary and moves the issue to its team's review state once every worker has reported.
+   A host tool such as a pull request reviewer can hand the run back with `herdr-linear-agent inbox add <KEY> --kind review --text-file -`: the finished run opens again, and its coordinator is prompted to pass the changes to the worker or say that a person must review, then finishes again.
 8. When the issue is completed or canceled, the ticker stops the agents, closes their workspaces and ends the session with a short response. Checkouts and branches are kept.
 
 When a pane needs a person (a permission or trust dialog), the ticker says so in the session with the pane to go to, and shows a Herdr notification.

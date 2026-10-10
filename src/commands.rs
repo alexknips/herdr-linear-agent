@@ -114,6 +114,43 @@ pub fn inbox_done(ctx: &Ctx, key: &str, ids: &[String], all: bool) -> Result<()>
     Ok(())
 }
 
+/// Writes an item from outside the run (the PR reviewer, a relay) and hands
+/// the ticket back to its coordinator: a finished run is open again, an
+/// asleep one wakes, and the ticker prompts the coordinator about the item.
+/// A run a person stopped keeps the item until they reply.
+pub fn inbox_add(ctx: &Ctx, key: &str, kind: &str, text: &str) -> Result<()> {
+    non_empty(text, "text")?;
+    let run = Run::load(&ctx.runs_dir(), key)?;
+    let lock = run.lock()?;
+    if run.record()?.status != Status::Active {
+        bail!("run {key} is closed; nothing more is done for it");
+    }
+    let id = inbox::write_held(&run, &lock, kind, kind, text.trim())?;
+    let now = files::now();
+    let record = run.update_held(&lock, move |r| {
+        if r.stopped {
+            return;
+        }
+        r.finished = false;
+        // The reopened run gets a fresh time window, as a reply to the timeout question does.
+        r.timeout_since = now;
+        if r.asleep || r.coordinator.status == AgentStatus::Stopped {
+            r.asleep = false;
+            r.coordinator.repend();
+        }
+    })?;
+    drop(lock);
+    ticker::poke(&ctx.state_dir());
+    if record.stopped {
+        println!(
+            "{id}: written; the run is stopped, so the coordinator reads it after the next reply"
+        );
+    } else {
+        println!("{id}: written; the coordinator is prompted");
+    }
+    Ok(())
+}
+
 /// `--all` leaves the items written after the last `context`; the message
 /// says how many, so the coordinator reads them before it ends its turn.
 fn done_message(run: &Run, moved: usize) -> String {

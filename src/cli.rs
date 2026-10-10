@@ -115,6 +115,17 @@ enum InboxCommand {
         #[arg(long)]
         all: bool,
     },
+    /// Hand the run an item from outside it, such as a PR review verdict:
+    /// a finished run opens again and its coordinator is prompted.
+    Add {
+        key: String,
+        /// What the item is, for example `review`.
+        #[arg(long)]
+        kind: String,
+        /// The text; `-` reads standard input.
+        #[arg(long)]
+        text_file: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -239,6 +250,14 @@ pub async fn run() -> Result<()> {
         Command::Inbox {
             command: InboxCommand::Done { key, ids, all },
         } => commands::inbox_done(&ctx, &key, &ids, all),
+        Command::Inbox {
+            command:
+                InboxCommand::Add {
+                    key,
+                    kind,
+                    text_file,
+                },
+        } => commands::inbox_add(&ctx, &key, &kind, &read_text_arg(&text_file)?),
         Command::Plan {
             command: PlanCommand::Set { key, file },
         } => commands::plan_set(&ctx, &key, &read_text_arg(&file)?).await,

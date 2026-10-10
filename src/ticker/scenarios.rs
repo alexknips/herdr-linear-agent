@@ -2938,3 +2938,52 @@ async fn merged_pull_requests_put_a_finished_run_to_sleep_and_a_reply_wakes_it()
         last_args(&world)
     );
 }
+
+#[tokio::test]
+async fn a_review_item_hands_a_finished_run_back_to_its_coordinator() {
+    let mut world = World::sample();
+    let coordinator = world.running_issue().await;
+    let w = world.start_worker("api").await;
+    world.settle().await;
+    world.report(&w, &format!("PR: {PR}\n## Report\nDone.\n"));
+    world.herdr.set_status("acme-data-1-w1", "idle");
+    world.settle().await;
+    commands::finish(&world.ctx(), &world.session(), KEY, "Done.")
+        .await
+        .unwrap();
+    world.settle().await;
+    // Started long ago: without a fresh window the reopened run would hit the 8-hour timeout.
+    world
+        .run(KEY)
+        .update(|r| r.timeout_since = "2020-01-01T00:00:00Z".into())
+        .unwrap();
+    let nudges = count(&to(&world, &coordinator), NUDGE_INBOX);
+
+    commands::inbox_add(
+        &world.ctx(),
+        KEY,
+        "review",
+        "The automated review of PR 7 asks for changes: a limit drops rows.",
+    )
+    .unwrap();
+    let record = world.record(KEY);
+    assert!(!record.finished, "the run is open again");
+    assert!(
+        world
+            .inbox(KEY)
+            .iter()
+            .any(|s| s.starts_with("The automated review of PR 7")),
+        "context shows the item"
+    );
+    world.later(120);
+    world.settle().await;
+    assert_eq!(
+        count(&to(&world, &coordinator), NUDGE_INBOX),
+        nudges + 1,
+        "the idle coordinator is prompted about it"
+    );
+    assert!(
+        world.record(KEY).awaiting_reply.is_none(),
+        "a fresh time window: no timeout question for an old run"
+    );
+}

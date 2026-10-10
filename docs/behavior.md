@@ -1226,4 +1226,8 @@ A finished run waits on people: review, merge, QA. With `stop_agents_when_merged
 
 A merge is not proof the work is done, so only a completed or canceled issue closes the run. Until then, the next reply wakes it: the coordinator starts again in its previous session, and it restarts workers as it needs. `src/ticker/scenarios.rs:merged_pull_requests_put_a_finished_run_to_sleep_and_a_reply_wakes_it`
 
+## Items from outside the run
+
+`inbox add <KEY> --kind <kind> --text-file -` is for tools on the host, such as a pull request reviewer; it is not on the coordinator's allow-list. Under the run lock it writes the inbox item and hands the ticket back to the coordinator, as a reply does: a finished run is open again (`finished = false`), an asleep one wakes and its coordinator is placed again in its previous session, and `timeout_since` starts a fresh window, so an old run does not ask to continue at once. The ticker then nudges the idle coordinator about the unseen item. A run a person stopped only gets the item; it is read after their next reply. A closed run refuses it. The coordinator sheet tells it to act on a `review` item: pass the changes to the worker, or `say` that a person must review, then `finish` again. `src/ticker/scenarios.rs:a_review_item_hands_a_finished_run_back_to_its_coordinator`
+
 With `count_finished_runs = false`, a finished run, asleep or not, leaves its slot in `max_runs` and `max_agents` to the next delegated issue. `src/ticker/scenarios.rs:a_finished_run_leaves_its_slot_when_finished_runs_do_not_count`
