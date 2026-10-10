@@ -15,7 +15,7 @@ use crate::linear::api::{Activity, Content};
 use crate::outbox::{self, Op, StateTarget};
 use crate::paths::Ctx;
 use crate::process::{Cmd, Runner};
-use crate::run::{AgentStatus, Run, RunRecord, Status};
+use crate::run::{AgentStatus, Run, RunRecord, Status, WaitReason};
 use crate::worker::{self, Group, Worker};
 use crate::{files, inbox, names, ticker};
 
@@ -132,8 +132,16 @@ pub fn inbox_add(ctx: &Ctx, key: &str, kind: &str, text: &str) -> Result<()> {
             return;
         }
         r.finished = false;
-        // The reopened run gets a fresh time window, as a reply to the timeout question does.
+        // The reopened run gets a fresh time window, as a reply to the timeout question does,
+        // so a time-limit question still open is settled. A coordinator's own question stays.
         r.timeout_since = now;
+        r.timeout_asked = false;
+        if r.awaiting_reply
+            .as_ref()
+            .is_some_and(|w| w.reason == WaitReason::RunTimeout)
+        {
+            r.cleared_wait_id = r.awaiting_reply.take().unwrap().activity_id;
+        }
         if r.asleep || r.coordinator.status == AgentStatus::Stopped {
             r.asleep = false;
             r.coordinator.repend();

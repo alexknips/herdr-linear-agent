@@ -2953,9 +2953,17 @@ async fn a_review_item_hands_a_finished_run_back_to_its_coordinator() {
         .unwrap();
     world.settle().await;
     // Started long ago: without a fresh window the reopened run would hit the 8-hour timeout.
+    // A time-limit question left open (queued after the finish, never posted) must not block the nudge.
     world
         .run(KEY)
-        .update(|r| r.timeout_since = "2020-01-01T00:00:00Z".into())
+        .update(|r| {
+            r.timeout_since = "2020-01-01T00:00:00Z".into();
+            r.awaiting_reply = Some(crate::run::AwaitingReply {
+                activity_id: String::new(),
+                asked_at: "2020-01-02T00:00:00Z".into(),
+                reason: crate::run::WaitReason::RunTimeout,
+            });
+        })
         .unwrap();
     let nudges = count(&to(&world, &coordinator), NUDGE_INBOX);
 
