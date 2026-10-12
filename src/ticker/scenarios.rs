@@ -1122,6 +1122,9 @@ async fn a_stop_holds_every_prompt_until_the_next_reply() {
 async fn quiet_runs_get_a_heartbeat_and_long_ones_ask_to_go_on() {
     let mut world = World::with(limit("ask_to_continue_after_hours", 1));
     let pane = world.running_issue().await;
+    world
+        .herdr
+        .set_status(&world.record(KEY).coordinator.agent_name, "working");
     world.later(10 * 60);
     world.settle().await;
     let ephemeral: Vec<Value> = world
@@ -2993,5 +2996,40 @@ async fn a_review_item_hands_a_finished_run_back_to_its_coordinator() {
     assert!(
         world.record(KEY).awaiting_reply.is_none(),
         "a fresh time window: no timeout question for an old run"
+    );
+}
+
+#[tokio::test]
+async fn the_time_limit_counts_only_while_an_agent_works() {
+    let mut world = World::with(limit("ask_to_continue_after_hours", 1));
+    world.running_issue().await;
+    world
+        .herdr
+        .set_status(&world.record(KEY).coordinator.agent_name, "idle");
+    world.settle().await;
+    // Hours waiting on a merge or a review: nobody works, so nobody is asked whether to go on.
+    world.later(3 * 3600);
+    world.settle().await;
+    assert!(
+        world.record(KEY).awaiting_reply.is_none(),
+        "an idle run is not asked"
+    );
+
+    world
+        .herdr
+        .set_status(&world.record(KEY).coordinator.agent_name, "working");
+    world.settle().await;
+    world.later(30 * 60);
+    world.settle().await;
+    assert!(
+        world.record(KEY).awaiting_reply.is_none(),
+        "the idle hours did not count"
+    );
+    world.later(40 * 60);
+    world.settle().await;
+    assert_eq!(
+        world.record(KEY).awaiting_reply.as_ref().map(|w| w.reason),
+        Some(WaitReason::RunTimeout),
+        "over an hour of work: asked"
     );
 }

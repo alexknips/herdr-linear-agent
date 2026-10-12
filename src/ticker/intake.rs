@@ -390,12 +390,14 @@ impl Reconciler {
                     if let Some(wait) = r.awaiting_reply.take() {
                         if wait.reason == WaitReason::RunTimeout {
                             r.timeout_since = restart_window.clone();
+                            r.timeout_paused_since.clear();
                         }
                         r.cleared_wait_id = wait.activity_id;
                     }
                     if r.timeout_asked {
                         r.timeout_asked = false;
                         r.timeout_since = restart_window;
+                        r.timeout_paused_since.clear();
                     }
                     if r.coordinator_lost && resume {
                         r.coordinator_lost = false;

@@ -760,8 +760,8 @@ impl Reconciler {
     }
 
     /// An ephemeral thought after 10 minutes without an activity says what
-    /// each open worker is doing, and for how long; past `ask_to_continue_after_hours` a person is asked
-    /// whether to go on. Neither goes out without a session or while stopped.
+    /// each open worker is doing, and for how long; past `ask_to_continue_after_hours` of working
+    /// time a person is asked whether to go on. Neither goes out without a session or while stopped.
     pub(super) async fn heartbeat<H: Herdr>(
         &mut self,
         d: &Deps<'_, H>,
@@ -769,7 +769,7 @@ impl Reconciler {
         run: &Run,
         now: Timestamp,
     ) -> Result<()> {
-        let record = run.record()?;
+        let mut record = run.record()?;
         if record.session_id.is_empty()
             || record.stopped
             || record.finished
@@ -777,9 +777,28 @@ impl Reconciler {
         {
             return Ok(());
         }
+        // The time limit counts working time: while no agent works, its clock is paused.
+        let working = record.coordinator.status == AgentStatus::Open
+            && record.coordinator.last_state == "working"
+            || worker::list(run)
+                .iter()
+                .any(|w| w.agent.status == AgentStatus::Open && w.agent.last_state == "working");
+        let paused = !record.timeout_paused_since.is_empty();
+        if working == paused {
+            let at = now.to_string();
+            record = run.update(move |r| {
+                if working {
+                    r.timeout_since = resumed(&r.timeout_since, &r.timeout_paused_since, &at);
+                    r.timeout_paused_since.clear();
+                } else {
+                    r.timeout_paused_since = at;
+                }
+            })?;
+        }
         let hours = d.config.limits.ask_to_continue_after_hours;
         let limit = i64::try_from(hours.saturating_mul(3600)).unwrap_or(i64::MAX);
-        let timeout_due = files::seconds_since(&record.timeout_since, now) >= limit;
+        let timeout_due = record.timeout_paused_since.is_empty()
+            && files::seconds_since(&record.timeout_since, now) >= limit;
         let quiet = since(&record.last_activity, now).is_some_and(|d| d >= HEARTBEAT);
         // A heartbeat already flushed whose `ActivitySent` has not arrived
         // must not be followed by a second one.
@@ -895,4 +914,16 @@ impl Reconciler {
         }
         Ok(())
     }
+}
+
+/// `since` moved later by the pause from `paused` to `now`, so the paused time does not count.
+fn resumed(since: &str, paused: &str, now: &str) -> String {
+    let (Ok(since_at), Ok(paused_at), Ok(now_at)) = (
+        since.parse::<Timestamp>(),
+        paused.parse::<Timestamp>(),
+        now.parse::<Timestamp>(),
+    ) else {
+        return since.to_string();
+    };
+    (since_at + now_at.duration_since(paused_at)).to_string()
 }

@@ -77,7 +77,7 @@ max_runs = 2
 max_workers_per_run = 4
 max_agents = 8
 count_finished_runs = true               # false: a run waiting in review leaves its slot to the next issue
-ask_to_continue_after_hours = 8          # after this many hours a run asks whether to go on
+ask_to_continue_after_hours = 8          # after this many working hours a run asks whether to go on
 routing_agent_timeout_seconds = 120      # how long a routing agent may take, unless its profile says
 postmortem_agent_timeout_seconds = 300   # how long a postmortem agent may take, unless its profile says
 

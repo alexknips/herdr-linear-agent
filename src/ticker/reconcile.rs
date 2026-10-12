@@ -737,7 +737,7 @@ impl Reconciler {
             }
             if !record.session_id.is_empty() && !record.stopped {
                 times.extend(after(&record.last_activity, HEARTBEAT));
-                if record.awaiting_reply.is_none() {
+                if record.awaiting_reply.is_none() && record.timeout_paused_since.is_empty() {
                     times.extend(after(&record.timeout_since, timeout));
                 }
             }

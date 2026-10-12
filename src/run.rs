@@ -280,6 +280,9 @@ pub struct RunRecord {
     pub external_urls: Vec<ExternalUrl>,
     /// When the run timeout was last reset (the start, or a reply to the timeout question).
     pub timeout_since: String,
+    /// Since when no agent of the run has been working: the run timeout counts working time
+    /// only, so a run waiting on a merge or a review is not asked whether to go on.
+    pub timeout_paused_since: String,
     /// The run timeout question was asked and not answered yet.
     /// Compatibility input for records written before `awaiting_reply`.
     pub timeout_asked: bool,

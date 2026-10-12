@@ -135,6 +135,7 @@ pub fn inbox_add(ctx: &Ctx, key: &str, kind: &str, text: &str) -> Result<()> {
         // The reopened run gets a fresh time window, as a reply to the timeout question does,
         // so a time-limit question still open is settled. A coordinator's own question stays.
         r.timeout_since = now;
+        r.timeout_paused_since.clear();
         r.timeout_asked = false;
         if r.awaiting_reply
             .as_ref()

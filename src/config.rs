@@ -141,7 +141,7 @@ pub struct Limits {
     /// Whether finished runs (moved to review, waiting on a person) count
     /// toward `max_runs` and `max_agents`.
     pub count_finished_runs: bool,
-    /// After this many hours a run asks a person whether to continue.
+    /// After this many hours of work (some agent of the run working) a run asks a person whether to continue.
     pub ask_to_continue_after_hours: u64,
     /// How long a routing agent may take, unless its profile says.
     pub routing_agent_timeout_seconds: u64,
