@@ -229,6 +229,40 @@ pub async fn ask(ctx: &Ctx<'_>, key: &str, text: &str, options: &[(String, Strin
     Ok(())
 }
 
+/// Withdraws the coordinator's open question, when new input answered or
+/// overtook it, and says why in the Linear session. A later reply to it is
+/// an ordinary reply. Only the coordinator's own question can be withdrawn.
+pub async fn withdraw(ctx: &Ctx<'_>, key: &str, why: &str) -> Result<()> {
+    non_empty(why, "reason")?;
+    let (_, run, _) = load_active(ctx, key).await?;
+    let lock = run.lock()?;
+    let record = run.record()?;
+    if !record
+        .awaiting_reply
+        .as_ref()
+        .is_some_and(|w| w.reason == WaitReason::CoordinatorQuestion)
+    {
+        bail!("run {key} has no open question of yours to withdraw");
+    }
+    run.update_held(&lock, |r| {
+        if let Some(wait) = r.awaiting_reply.take() {
+            r.cleared_wait_id = wait.activity_id;
+            r.reply_generation = r.reply_generation.saturating_add(1);
+        }
+    })?;
+    outbox::push_held(
+        &run,
+        &lock,
+        Op::activity(Activity::new(Content::Thought {
+            body: format!("Question withdrawn: {}", why.trim()),
+        })),
+    )?;
+    drop(lock);
+    ticker::poke(&ctx.state_dir());
+    println!("the question is withdrawn; carry on");
+    Ok(())
+}
+
 /// Posts the final summary and moves the issue to review, once every worker
 /// has reported and none is working or waiting.
 pub async fn finish<H: Herdr>(

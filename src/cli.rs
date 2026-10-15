@@ -65,8 +65,11 @@ enum Command {
         #[command(flatten)]
         text: TextArgs,
         /// A choice, as `label=value`; repeatable.
-        #[arg(long = "option", value_parser = parse_option)]
+        #[arg(long = "option", value_parser = parse_option, conflicts_with = "withdraw")]
         options: Vec<(String, String)>,
+        /// Withdraw the open question instead; the text says why.
+        #[arg(long)]
+        withdraw: bool,
     },
     /// Post the final summary and move the issue to review.
     Finish(TextArgs),
@@ -264,7 +267,12 @@ pub async fn run() -> Result<()> {
         Command::Say(args) => {
             commands::say(&ctx, &args.key, &read_text_arg(&args.text_file)?).await
         }
-        Command::Ask { text, options } => {
+        Command::Ask {
+            text,
+            withdraw: true,
+            ..
+        } => commands::withdraw(&ctx, &text.key, &read_text_arg(&text.text_file)?).await,
+        Command::Ask { text, options, .. } => {
             commands::ask(&ctx, &text.key, &read_text_arg(&text.text_file)?, &options).await
         }
         Command::Finish(args) => {

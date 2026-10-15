@@ -167,6 +167,7 @@ pub fn launch_prompt(key: &str, resume: bool) -> String {
 pub const NUDGE_REPLY: &str =
     "[herdr-linear-agent ticker] There is a new reply in Linear. Run context.";
 pub const NUDGE_INBOX: &str = "[herdr-linear-agent ticker] There are new inbox items. Run context.";
+pub const NUDGE_WHILE_ASKING: &str = "[herdr-linear-agent ticker] There are new inbox items while your question waits for an answer. Run context. If they answer or overtake the question, withdraw it with `ask --withdraw` before you act on them.";
 
 /// A Herdr snapshot and what reading a worker's live state needs besides.
 pub struct View<'a> {

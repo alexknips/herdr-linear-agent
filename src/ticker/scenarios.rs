@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 
 use super::world::World;
 use crate::commands::{self, WorkerStart};
-use crate::coordinator::{NUDGE_INBOX, NUDGE_REPLY};
+use crate::coordinator::{NUDGE_INBOX, NUDGE_REPLY, NUDGE_WHILE_ASKING};
 use crate::herdr::PaneId;
 use crate::linear::api::fake::APP_USER;
 use crate::linear::api::{IssueStatus, RunUpdate};
@@ -2996,6 +2996,131 @@ async fn a_review_item_hands_a_finished_run_back_to_its_coordinator() {
     assert!(
         world.record(KEY).awaiting_reply.is_none(),
         "a fresh time window: no timeout question for an old run"
+    );
+}
+
+#[tokio::test]
+async fn an_open_question_does_not_hold_back_a_review_and_can_be_withdrawn() {
+    let mut world = World::sample();
+    let coordinator = world.running_issue().await;
+    world.settle().await;
+    commands::ask(&world.ctx(), KEY, "Icons or a border?", &[])
+        .await
+        .unwrap();
+    world.settle().await;
+    assert!(world.record(KEY).awaiting_reply.is_some());
+
+    commands::inbox_add(
+        &world.ctx(),
+        KEY,
+        "review",
+        "New review comments on PR 7: use a border, rebase onto main.",
+    )
+    .unwrap();
+    world.later(120);
+    world.settle().await;
+    assert_eq!(
+        count(&to(&world, &coordinator), NUDGE_WHILE_ASKING),
+        1,
+        "the review reaches the coordinator while its question waits"
+    );
+    assert!(
+        world.record(KEY).awaiting_reply.is_some(),
+        "the question stays until the coordinator withdraws it"
+    );
+
+    commands::withdraw(&world.ctx(), KEY, "the review decides it: a border.")
+        .await
+        .unwrap();
+    world.settle().await;
+    assert!(world.record(KEY).awaiting_reply.is_none());
+    assert!(
+        world
+            .bodies(KEY, "thought")
+            .iter()
+            .any(|b| b == "Question withdrawn: the review decides it: a border."),
+        "{:?}",
+        world.bodies(KEY, "thought")
+    );
+    assert!(
+        commands::withdraw(&world.ctx(), KEY, "again")
+            .await
+            .is_err(),
+        "nothing left to withdraw"
+    );
+
+    // A time-limit question is the person's to answer: it cannot be withdrawn.
+    world
+        .run(KEY)
+        .update(|r| {
+            r.awaiting_reply = Some(crate::run::AwaitingReply {
+                activity_id: String::new(),
+                asked_at: "2020-01-02T00:00:00Z".into(),
+                reason: crate::run::WaitReason::RunTimeout,
+            });
+        })
+        .unwrap();
+    assert!(
+        commands::withdraw(&world.ctx(), KEY, "go on")
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn a_merged_run_sleeps_even_unfinished_and_its_question_is_settled() {
+    let mut world = World::with(|config| {
+        config.replace(
+            "[workspaces.acme.teams.DATA]",
+            "[workspaces.acme.teams.DATA]\nstop_agents_when_merged = true",
+        )
+    });
+    world.runner.on("gh pr view", ok("MERGED\n"));
+    world.running_issue().await;
+    let w1 = world.start_worker("api").await;
+    let w2 = world.start_worker("web").await;
+    world.settle().await;
+    world.report(&w1, &format!("PR: {PR}\n## Report\nDone.\n"));
+    world.herdr.set_status("acme-data-1-w1", "idle");
+    world.settle().await;
+    // The coordinator never ran `finish`; the time limit asked whether to go on.
+    world
+        .run(KEY)
+        .update(|r| {
+            r.awaiting_reply = Some(crate::run::AwaitingReply {
+                activity_id: String::new(),
+                asked_at: "2020-01-02T00:00:00Z".into(),
+                reason: crate::run::WaitReason::RunTimeout,
+            });
+        })
+        .unwrap();
+    world.later(400);
+    world.settle().await;
+    assert!(
+        !world.record(KEY).asleep,
+        "a worker without a pull request keeps an unfinished run awake"
+    );
+
+    world.report(&w2, &format!("PR: {PR}\n## Report\nDone.\n"));
+    world.herdr.set_status("acme-data-1-w2", "idle");
+    world.settle().await;
+    world.later(400);
+    world.settle().await;
+    let record = world.record(KEY);
+    assert_eq!(
+        (record.status, record.asleep, record.finished),
+        (Status::Active, true, true),
+        "asleep and out of its slot, not closed"
+    );
+    assert!(
+        record.awaiting_reply.is_none(),
+        "the merge settles the question"
+    );
+    assert!(
+        world
+            .bodies(KEY, "response")
+            .iter()
+            .any(|b| b.starts_with("Every pull request is merged")),
     );
 }
 

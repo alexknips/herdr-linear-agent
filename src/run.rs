@@ -313,6 +313,8 @@ pub struct RunRecord {
     /// Every pull request merged and the agents were stopped; the next reply
     /// resumes the coordinator.
     pub asleep: bool,
+    /// It has been asleep once: woken again, it sleeps only after `finish`.
+    pub slept: bool,
 }
 
 #[derive(Debug, Clone)]

@@ -107,6 +107,17 @@ fn delegation_mark(issue: &IssueRef) -> String {
     })
 }
 
+/// A finished run waits on the merge. An unfinished one ends with it too when
+/// every worker opened a pull request and the coordinator is not working: the
+/// coordinator may never have run `finish` (a time-limit question left open).
+/// That happens once: a run woken after the merge sleeps only after `finish`.
+fn merge_can_end(run: &Run, record: &RunRecord) -> bool {
+    record.finished
+        || (!record.slept
+            && record.coordinator.last_state != "working"
+            && worker::list(run).iter().all(|w| !w.pr_url.is_empty()))
+}
+
 fn run_of<H>(d: &Deps<'_, H>, issue_id: &str) -> Option<(Run, RunRecord)> {
     Run::list(&d.ctx.runs_dir()).into_iter().find_map(|run| {
         let record = run.record().ok()?;
@@ -221,8 +232,8 @@ impl Reconciler {
             self.changed_at.insert(record.issue_id.clone(), read_at);
             return self.close_run(d, snap, run, &issue.state_name, now).await;
         }
-        if record.finished
-            && !record.asleep
+        if !record.asleep
+            && merge_can_end(run, record)
             && d.config
                 .team(&record.workspace, &record.team_key)
                 .is_ok_and(|team| team.stop_agents_when_merged)
@@ -568,7 +579,7 @@ impl Reconciler {
         true
     }
 
-    /// Every pull request of a finished run is merged: stop its agents but
+    /// Every pull request of a run is merged: stop its agents but
     /// keep the run open, since QA may still send it back. The next reply
     /// resumes the coordinator in its session.
     async fn put_to_sleep<H: Herdr>(
@@ -583,7 +594,15 @@ impl Reconciler {
         self.stop_agents(d, snap, run, record, now).await?;
         self.update_and_push(run, |r| {
             r.asleep = true;
+            r.slept = true;
+            r.finished = true;
             r.coordinator.status = AgentStatus::Stopped;
+            // The merge settles a question still open, the coordinator's or the time limit's.
+            if let Some(wait) = r.awaiting_reply.take() {
+                r.cleared_wait_id = wait.activity_id;
+                r.reply_generation = r.reply_generation.saturating_add(1);
+            }
+            r.timeout_asked = false;
             // A finished run's session takes only a response.
             vec![Op::activity(Activity::new(Content::Response {
                 body: "Every pull request is merged, so the agents are stopped. Reply here to bring the coordinator back; the run closes when the issue is done.".into(),

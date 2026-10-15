@@ -861,7 +861,8 @@ impl Reconciler {
         Ok(())
     }
 
-    /// Prompts an idle coordinator once per set of unseen inbox items.
+    /// Prompts an idle coordinator once per set of unseen inbox items, also
+    /// while its own question waits for an answer.
     pub(super) async fn nudge<H: Herdr>(
         &mut self,
         d: &Deps<'_, H>,
@@ -876,7 +877,12 @@ impl Reconciler {
             || record.coordinator_lost
             || c.prompt_pending
             || record.stopped
-            || record.awaiting_reply.is_some()
+            // The coordinator's own question does not hold back new input:
+            // it may answer or overtake the question. A time limit does.
+            || record
+                .awaiting_reply
+                .as_ref()
+                .is_some_and(|w| w.reason != WaitReason::CoordinatorQuestion)
             || record.finished
         {
             return Ok(());
@@ -906,6 +912,8 @@ impl Reconciler {
         }
         let text = if unseen.iter().any(|i| i.kind == "reply") {
             coordinator::NUDGE_REPLY
+        } else if record.awaiting_reply.is_some() {
+            coordinator::NUDGE_WHILE_ASKING
         } else {
             coordinator::NUDGE_INBOX
         };
