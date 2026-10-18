@@ -18,7 +18,7 @@ pub use super::api::LinearApi;
 use super::credentials::{CredentialError, CredentialManager};
 use super::transport::{
     CONNECT_TIMEOUT, GRAPHQL_ENDPOINT, MAX_RESPONSE_BYTES, REQUEST_TIMEOUT, RateHeaders, decode,
-    json_content_type, verified,
+    json_content_type, user_verified, verified,
 };
 use super::{ApiError, VerifiedReadOutcome};
 
@@ -53,6 +53,29 @@ impl Lease for CredentialManager {
     }
 }
 
+/// A lease backed by a personal Linear API key from the `LINEAR_API_KEY`
+/// environment variable. Always ready for both reads and writes; no keyring
+/// or OAuth flow is involved.
+struct ApiKeyLease {
+    token: Zeroizing<String>,
+}
+
+impl Lease for ApiKeyLease {
+    fn read(
+        &mut self,
+        callback: &mut dyn FnMut(&str) -> Result<VerifiedReadOutcome<Value>, ApiError>,
+    ) -> Result<Value, ApiError> {
+        Ok(callback(&self.token)?.into_parts().1)
+    }
+
+    fn write(
+        &mut self,
+        callback: &mut dyn FnMut(&str) -> Result<Value, ApiError>,
+    ) -> Result<Value, ApiError> {
+        callback(&self.token)
+    }
+}
+
 type Job = Box<dyn FnOnce(&mut dyn Lease) + Send>;
 
 /// The production client: HTTPS to Linear with the Keychain-held token.
@@ -62,11 +85,15 @@ pub struct Client {
     jobs: std::sync::mpsc::Sender<Job>,
     /// The rate-limit headers of the responses not taken yet.
     headers: Arc<Mutex<Vec<RateHeaders>>>,
+    /// When `true`, reads use `user_verified` instead of `verified` so that
+    /// a personal API key (whose viewer has `app: false`) is accepted.
+    api_key_mode: bool,
 }
 
 impl Client {
     /// Builds the client of the workspace called `name` with the production
-    /// credential manager.
+    /// credential manager, or with a `LINEAR_API_KEY` environment variable
+    /// when no keyring credential is available.
     // Tests cannot reach the Keychain; they build the client with a test lease.
     #[cfg_attr(test, allow(dead_code))]
     pub async fn production(
@@ -74,6 +101,18 @@ impl Client {
         workspace: &crate::config::Workspace,
         state_dir: &std::path::Path,
     ) -> Result<Client, ApiError> {
+        // When LINEAR_API_KEY is set and non-empty, use it directly instead of
+        // requiring an interactive OAuth browser flow. This is the expected path
+        // inside Kubernetes pods where the key is mounted as a Secret.
+        if let Ok(key) = std::env::var("LINEAR_API_KEY") {
+            if !key.is_empty() {
+                eprintln!(
+                    "herdr-linear-agent: using LINEAR_API_KEY environment variable \
+                     for workspace `{name}` (OAuth keyring bypassed)"
+                );
+                return Self::with_api_key(key).await;
+            }
+        }
         let account = name.to_owned();
         let client_id = workspace.client_id.clone();
         let callback_port = workspace.callback_port;
@@ -83,6 +122,25 @@ impl Client {
             GRAPHQL_ENDPOINT,
         )
         .await
+    }
+
+    /// Builds the client using a personal Linear API key. Reads use
+    /// `user_verified` (accepts any viewer with a valid ID) instead of the
+    /// app-actor `verified` check.
+    async fn with_api_key(key: String) -> Result<Client, ApiError> {
+        let client = Self::with_lease(
+            move || {
+                Ok(ApiKeyLease {
+                    token: Zeroizing::new(key),
+                })
+            },
+            GRAPHQL_ENDPOINT,
+        )
+        .await?;
+        Ok(Client {
+            api_key_mode: true,
+            ..client
+        })
     }
 
     /// Starts the thread that owns the lease `make` builds; the credential
@@ -130,6 +188,7 @@ impl Client {
             endpoint,
             jobs,
             headers: Arc::default(),
+            api_key_mode: false,
         })
     }
 
@@ -149,6 +208,7 @@ impl Client {
         let http = self.http.clone();
         let endpoint = self.endpoint;
         let headers = self.headers.clone();
+        let api_key_mode = self.api_key_mode;
         let runtime = tokio::runtime::Handle::current();
         let (answer, answered) = oneshot::channel();
         let job: Job = Box::new(move |lease| {
@@ -156,6 +216,8 @@ impl Client {
                 |token: &str| runtime.block_on(post(&http, endpoint, token, &body, &headers));
             let result = if write {
                 lease.write(&mut |token| send(token))
+            } else if api_key_mode {
+                lease.read(&mut |token| user_verified(send(token)?))
             } else {
                 lease.read(&mut |token| verified(send(token)?))
             };

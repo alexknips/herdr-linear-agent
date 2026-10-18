@@ -183,6 +183,21 @@ pub(crate) fn verified(data: Value) -> Result<VerifiedReadOutcome<Value>, ApiErr
     ))
 }
 
+/// Accepts a read's data when its viewer has a valid ID, without requiring
+/// the app-actor check. Used for personal API key authentication where
+/// `viewer.app` is `false`.
+pub(crate) fn user_verified(data: Value) -> Result<VerifiedReadOutcome<Value>, ApiError> {
+    let viewer = &data["viewer"];
+    let id = viewer["id"]
+        .as_str()
+        .filter(|id| !id.trim().is_empty() && id.len() <= 4096)
+        .ok_or(ApiError::ActorIdentityMismatch)?;
+    Ok(VerifiedReadOutcome::with_value(
+        Zeroizing::new(id.to_owned()),
+        data.clone(),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -346,6 +361,32 @@ mod tests {
         );
         assert_eq!(
             verified(json!({})).unwrap_err(),
+            ApiError::ActorIdentityMismatch
+        );
+    }
+
+    #[test]
+    fn user_verified_accepts_any_viewer_with_a_valid_id() {
+        // A personal API key viewer: app is false, but has a valid id.
+        let data = json!({"viewer":{"id":"user-42","app":false,"isMe":true},"x":2});
+        let (viewer, value) = user_verified(data).unwrap().into_parts();
+        assert_eq!(viewer.as_str(), "user-42");
+        assert_eq!(value["x"], 2);
+
+        // An app viewer also passes user_verified.
+        let data = json!({"viewer":{"id":"app-1","app":true,"isMe":true},"x":3});
+        let (viewer, value) = user_verified(data).unwrap().into_parts();
+        assert_eq!(viewer.as_str(), "app-1");
+        assert_eq!(value["x"], 3);
+
+        // No viewer id at all is still rejected.
+        assert_eq!(
+            user_verified(json!({})).unwrap_err(),
+            ApiError::ActorIdentityMismatch
+        );
+        // Empty id is rejected.
+        assert_eq!(
+            user_verified(json!({"viewer":{"id":"  "}})).unwrap_err(),
             ApiError::ActorIdentityMismatch
         );
     }
