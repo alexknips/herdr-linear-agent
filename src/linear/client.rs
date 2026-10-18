@@ -212,8 +212,9 @@ impl Client {
         let runtime = tokio::runtime::Handle::current();
         let (answer, answered) = oneshot::channel();
         let job: Job = Box::new(move |lease| {
-            let send =
-                |token: &str| runtime.block_on(post(&http, endpoint, token, &body, &headers));
+            let send = |token: &str| {
+                runtime.block_on(post(&http, endpoint, token, &body, &headers, !api_key_mode))
+            };
             let result = if write {
                 lease.write(&mut |token| send(token))
             } else if api_key_mode {
@@ -252,11 +253,14 @@ async fn post(
     token: &str,
     body: &[u8],
     headers: &Mutex<Vec<RateHeaders>>,
+    bearer: bool,
 ) -> Result<Value, ApiError> {
     use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderValue};
 
     let mut authorization = Zeroizing::new(Vec::with_capacity(7 + token.len()));
-    authorization.extend_from_slice(b"Bearer ");
+    if bearer {
+        authorization.extend_from_slice(b"Bearer ");
+    }
     authorization.extend_from_slice(token.as_bytes());
     let mut authorization =
         HeaderValue::from_bytes(&authorization).map_err(|_| ApiError::Configuration)?;
