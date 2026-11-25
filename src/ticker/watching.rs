@@ -383,6 +383,18 @@ impl Reconciler {
             if record.stopped || record.finished || record.status != crate::run::Status::Active {
                 next.recovery = Recovery::None;
             }
+            // The agent is back in its pane during the backoff of a retry:
+            // nothing is left to start, and a later loss gets a fresh backoff.
+            if live.agent.is_some()
+                && let Recovery::RetryWait {
+                    attempt, session, ..
+                } = &next.recovery
+            {
+                next.recovery = Recovery::Recovered {
+                    attempts: attempt.saturating_sub(1),
+                    session: session.clone(),
+                };
+            }
             let mut stale_notice = false;
             let active =
                 record.status == crate::run::Status::Active && !record.stopped && !record.finished;

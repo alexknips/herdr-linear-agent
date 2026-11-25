@@ -231,22 +231,23 @@ pub async fn ask(ctx: &Ctx<'_>, key: &str, text: &str, options: &[(String, Strin
     Ok(())
 }
 
-/// `run resume`: starts a coordinator that was given up on, or whose pane is
-/// gone, again, as a reply in the Linear session does: its previous session
-/// when it has one, otherwise a new coordinator. Prints what it did.
+/// `run resume`: starts a coordinator the ticker gave up on again, as a reply
+/// in the Linear session does: its previous session when it has one,
+/// otherwise a new coordinator. Prints what it did.
 ///
-/// It acts only when there is something to recover: `coordinator_lost`, a
-/// stale or waiting recovery, a coordinator that failed or stopped, or, when
-/// Herdr answers, a coordinator whose pane is gone. On a running coordinator,
-/// a coordinator being started or a finished run it leaves the run alone and
-/// succeeds, so a janitor can call it on every run. A stopped run is refused:
-/// a stop is a person's decision, and a reply un-stops it.
-pub async fn run_resume<H: Herdr>(
-    ctx: &Ctx<'_>,
-    session: Option<&Session<H>>,
-    key: &str,
-) -> Result<String> {
+/// It acts only on a run that was given up on: `coordinator_lost`, a `stale`
+/// recovery, an open `coordinator_lost` question of an older version, or a
+/// coordinator that failed or stopped. A coordinator that is merely gone or
+/// waiting for its automatic retry is the ticker's to start (its
+/// per-minute limit and pane grace apply), so the command leaves it alone
+/// and succeeds. A stopped run is refused: a stop is a person's decision,
+/// and a reply un-stops it.
+///
+/// The decision is made on the record read under the run lock, in the same
+/// critical section as the change.
+pub fn run_resume(ctx: &Ctx, key: &str) -> Result<String> {
     let run = Run::load(&ctx.runs_dir(), key)?;
+    let lock = run.lock()?;
     let record = run.record()?;
     if record.status != Status::Active {
         bail!("run {key} is closed; nothing more is done for it");
@@ -257,42 +258,32 @@ pub async fn run_resume<H: Herdr>(
         );
     }
     let c = &record.coordinator;
-    let snapshot = match session {
-        Some(session) => session.herdr.snapshot().await.ok(),
-        None => None,
-    };
-    let gone = snapshot.as_ref().zip(session).is_some_and(|(snapshot, s)| {
-        let live = worker::live_state(
-            c,
-            snapshot,
-            jiff::Timestamp::now(),
-            &ctx.state_dir(),
-            &s.socket,
-        );
-        c.status == AgentStatus::Open && !live.pane_exists && live.agent.is_none()
-    });
-    let waiting = matches!(
-        c.recovery,
-        crate::run::Recovery::Stale { .. } | crate::run::Recovery::RetryWait { .. }
-    );
     let old_question = record
         .awaiting_reply
         .as_ref()
         .is_some_and(|w| w.reason == WaitReason::CoordinatorLost);
-    let broken = record.coordinator_lost
+    let given_up = record.coordinator_lost
         || old_question
+        || matches!(c.recovery, crate::run::Recovery::Stale { .. })
         || matches!(c.status, AgentStatus::Failed | AgentStatus::Stopped);
     if record.finished && !record.coordinator_lost {
         return Ok(format!(
             "{key}: the run is finished; nothing to resume (a reply or an inbox item reopens it)"
         ));
     }
-    if !(broken || waiting || gone) {
-        return Ok(format!(
-            "{key}: the coordinator is running; nothing to resume"
-        ));
+    if !given_up {
+        let progress = matches!(
+            c.recovery,
+            crate::run::Recovery::RetryWait { .. }
+                | crate::run::Recovery::Starting { .. }
+                | crate::run::Recovery::Suspected { .. }
+        ) || c.status == AgentStatus::Pending;
+        return Ok(if progress {
+            format!("{key}: recovery is in progress; nothing to resume")
+        } else {
+            format!("{key}: the coordinator is running; nothing to resume")
+        });
     }
-    let lock = run.lock()?;
     let how = c.resume_session();
     run.update_held(&lock, |r| {
         r.coordinator_lost = false;

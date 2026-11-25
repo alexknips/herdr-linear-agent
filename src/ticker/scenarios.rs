@@ -2964,14 +2964,8 @@ async fn a_coordinator_lost_again_and_again_is_given_up_on_and_run_resume_brings
     );
     assert!(crate::actions::status_text(&world.ctx()).contains("coordinator gone"));
 
-    assert!(
-        commands::run_resume(&world.ctx(), Some(&world.session()), "acme/DATA-9")
-            .await
-            .is_err()
-    );
-    let said = commands::run_resume(&world.ctx(), Some(&world.session()), KEY)
-        .await
-        .unwrap();
+    assert!(commands::run_resume(&world.ctx(), "acme/DATA-9").is_err());
+    let said = commands::run_resume(&world.ctx(), KEY).unwrap();
     assert!(said.contains("resuming its session"), "{said}");
     world.settle().await;
     let record = world.record(KEY);
@@ -3013,9 +3007,7 @@ async fn a_coordinator_that_ran_for_hours_is_still_given_up_on_when_it_keeps_los
     assert!(no_resume_request(&world));
 
     // A coordinator that then runs for a while starts the count anew.
-    commands::run_resume(&world.ctx(), Some(&world.session()), KEY)
-        .await
-        .unwrap();
+    commands::run_resume(&world.ctx(), KEY).unwrap();
     world.settle().await;
     assert_eq!(world.record(KEY).coordinator_recoveries, 0);
     world.later(600);
@@ -3082,24 +3074,12 @@ async fn run_resume_leaves_a_healthy_coordinator_alone() {
     let pane = world.running_issue().await;
     let before = world.record(KEY);
     let prompts = to(&world, &pane);
-    let session = world.session();
 
-    let said = commands::run_resume(&world.ctx(), Some(&session), KEY)
-        .await
-        .unwrap();
+    let said = commands::run_resume(&world.ctx(), KEY).unwrap();
     assert_eq!(
         said,
         "acme/DATA-1: the coordinator is running; nothing to resume"
     );
-    // Without Herdr the record alone is read, and it is healthy too.
-    let said = commands::run_resume(
-        &world.ctx(),
-        None::<&crate::commands::Session<crate::herdr::FakeHerdr>>,
-        KEY,
-    )
-    .await
-    .unwrap();
-    assert!(said.contains("nothing to resume"), "{said}");
     world.settle().await;
     let after = world.record(KEY);
     assert_eq!(after.coordinator, before.coordinator);
@@ -3108,9 +3088,7 @@ async fn run_resume_leaves_a_healthy_coordinator_alone() {
 
     // A person's stop is refused; a finished run is left alone.
     world.run(KEY).update(|r| r.stopped = true).unwrap();
-    let refused = commands::run_resume(&world.ctx(), Some(&session), KEY)
-        .await
-        .unwrap_err();
+    let refused = commands::run_resume(&world.ctx(), KEY).unwrap_err();
     assert!(refused.to_string().contains("stopped"), "{refused}");
     world
         .run(KEY)
@@ -3120,26 +3098,106 @@ async fn run_resume_leaves_a_healthy_coordinator_alone() {
         })
         .unwrap();
     lose_coordinator(&world, KEY);
-    let said = commands::run_resume(&world.ctx(), Some(&session), KEY)
-        .await
-        .unwrap();
+    let said = commands::run_resume(&world.ctx(), KEY).unwrap();
     assert!(said.contains("finished"), "{said}");
     world.settle().await;
     assert_eq!(world.herdr.starts().len(), 1);
 }
 
 #[tokio::test]
-async fn run_resume_recovers_a_coordinator_whose_pane_is_gone() {
+async fn run_resume_leaves_lost_coordinators_to_the_rate_limited_queue() {
+    let mut world = World::with(limit("max_runs", 5));
+    let keys: Vec<String> = (1..=5).map(|n| format!("acme/DATA-{n}")).collect();
+    for key in &keys {
+        world.delegate(key, "Fix the login", Some(2.0));
+    }
+    world.settle().await;
+    for key in &keys {
+        lose_coordinator(&world, key);
+    }
+    world.settle().await;
+    // A janitor calls it on every run, before and after the retries are due.
+    let call_all = |world: &World| {
+        for key in &keys {
+            let said = commands::run_resume(&world.ctx(), key).unwrap();
+            assert!(said.ends_with("nothing to resume"), "{said}");
+        }
+    };
+    call_all(&world);
+    let said = commands::run_resume(&world.ctx(), "acme/DATA-3").unwrap();
+    assert!(said.contains("recovery is in progress"), "{said}");
+    world.later(20);
+    world.settle().await;
+    call_all(&world);
+    world.settle().await;
+    assert_eq!(world.herdr.starts().len(), 7, "two a minute, not five");
+    world.later(30);
+    world.settle().await;
+    call_all(&world);
+    world.settle().await;
+    assert_eq!(world.herdr.starts().len(), 7, "the minute is not over");
+    world.later(31);
+    world.settle().await;
+    assert_eq!(world.herdr.starts().len(), 9);
+}
+
+#[tokio::test]
+async fn run_resume_does_not_revive_a_pane_that_is_only_gone() {
     let mut world = World::sample();
     world.running_issue().await;
     lose_coordinator(&world, KEY);
-    let said = commands::run_resume(&world.ctx(), Some(&world.session()), KEY)
-        .await
-        .unwrap();
-    assert!(said.contains("started again"), "{said}");
+    let said = commands::run_resume(&world.ctx(), KEY).unwrap();
+    assert!(said.contains("nothing to resume"), "{said}");
     world.settle().await;
-    assert_eq!(world.herdr.starts().len(), 2);
-    assert!(ends_with(&last_args(&world), &RESUMED_WITH));
+    assert_eq!(world.herdr.starts().len(), 1, "the ticker's grace applies");
+}
+
+#[tokio::test]
+async fn a_retry_waiting_for_its_backoff_is_cleared_when_the_agent_is_seen_again() {
+    let mut world = World::sample();
+    world.running_issue().await;
+    let due_at = (world.now() + jiff::SignedDuration::from_secs(60)).to_string();
+    world
+        .run(KEY)
+        .update(move |r| {
+            r.coordinator.recovery = Recovery::RetryWait {
+                attempt: 2,
+                due_at,
+                session: "sess-acme-data-1-coordinator".into(),
+            };
+        })
+        .unwrap();
+    // The pane is there with its agent: nothing is left to start.
+    world.settle().await;
+    let record = world.record(KEY);
+    assert!(
+        matches!(
+            record.coordinator.recovery,
+            Recovery::Recovered { attempts: 1, .. }
+        ),
+        "{:?}",
+        record.coordinator.recovery
+    );
+    assert!(
+        !crate::actions::status_text(&world.ctx()).contains("recovering"),
+        "{}",
+        crate::actions::status_text(&world.ctx())
+    );
+    world.later(120);
+    world.settle().await;
+    assert_eq!(
+        world.herdr.starts().len(),
+        1,
+        "no start when the retry was due"
+    );
+
+    // A later loss gets a fresh backoff.
+    lose_coordinator(&world, KEY);
+    world.settle().await;
+    assert!(matches!(
+        world.record(KEY).coordinator.recovery,
+        Recovery::RetryWait { attempt: 1, .. }
+    ));
 }
 
 #[tokio::test]

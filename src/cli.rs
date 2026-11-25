@@ -298,12 +298,7 @@ pub async fn run() -> Result<()> {
         Command::Run {
             command: RunCommand::Resume { key },
         } => {
-            // Without Herdr the record alone says what is lost.
-            let session = Session::configured(&ctx).await.ok();
-            println!(
-                "{}",
-                commands::run_resume(&ctx, session.as_ref(), &key).await?
-            );
+            println!("{}", commands::run_resume(&ctx, &key)?);
             Ok(())
         }
         Command::Report(args) => {
