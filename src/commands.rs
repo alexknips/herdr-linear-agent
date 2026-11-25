@@ -266,9 +266,28 @@ pub fn run_resume(ctx: &Ctx, key: &str) -> Result<String> {
         || old_question
         || matches!(c.recovery, crate::run::Recovery::Stale { .. })
         || matches!(c.status, AgentStatus::Failed | AgentStatus::Stopped);
-    if record.finished && !record.coordinator_lost {
+    if record.finished {
+        // The ticker leaves a finished run's coordinator alone, so nothing is
+        // started; only a lost flag an older version left is cleared.
+        if !(record.coordinator_lost || old_question) {
+            return Ok(format!(
+                "{key}: the run is finished; nothing to resume (a reply or an inbox item reopens it)"
+            ));
+        }
+        run.update_held(&lock, |r| {
+            r.coordinator_lost = false;
+            r.coordinator_recoveries = 0;
+            if let Some(wait) = r
+                .awaiting_reply
+                .take_if(|w| w.reason == WaitReason::CoordinatorLost)
+            {
+                r.cleared_wait_id = wait.activity_id;
+            }
+        })?;
+        drop(lock);
+        ticker::poke(&ctx.state_dir());
         return Ok(format!(
-            "{key}: the run is finished; nothing to resume (a reply or an inbox item reopens it)"
+            "{key}: the run is finished, so its coordinator is not started; only its lost flag was cleared (a reply or an inbox item reopens the run)"
         ));
     }
     if !given_up {

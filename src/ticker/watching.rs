@@ -147,13 +147,34 @@ impl Reconciler {
             .awaiting_reply
             .as_ref()
             .is_some_and(|w| w.reason == WaitReason::CoordinatorLost);
-        if c.status != AgentStatus::Open
-            || record.status != crate::run::Status::Active
+        if record.status != crate::run::Status::Active
             || record.stopped
-            || record.finished
             || !(asked || record.coordinator_lost)
-            || !self.judged(d, snapshot, c, now)
         {
+            return Ok(());
+        }
+        // A finished run's coordinator is left alone: it only stops reading
+        // as broken, and a question of an older version is settled.
+        if record.finished {
+            self.update_and_push(run, |r| {
+                if let Some(wait) = r
+                    .awaiting_reply
+                    .take_if(|w| w.reason == WaitReason::CoordinatorLost)
+                {
+                    r.cleared_wait_id = wait.activity_id;
+                }
+                r.coordinator_lost = false;
+                r.coordinator_recoveries = 0;
+                Vec::new()
+            })
+            .await?;
+            d.log.line(&format!(
+                "{}: finished and lost by an older version; the flag is cleared",
+                run.key
+            ));
+            return Ok(());
+        }
+        if c.status != AgentStatus::Open || !self.judged(d, snapshot, c, now) {
             return Ok(());
         }
         let live = self.live(d, snapshot, c, now);

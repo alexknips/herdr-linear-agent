@@ -3200,6 +3200,74 @@ async fn a_retry_waiting_for_its_backoff_is_cleared_when_the_agent_is_seen_again
     ));
 }
 
+/// A finished run an older version left lost, asking for a `resume` reply.
+fn finished_and_lost(world: &World) {
+    world
+        .run(KEY)
+        .update(|r| {
+            r.finished = true;
+            r.coordinator_lost = true;
+            r.awaiting_reply = Some(crate::run::AwaitingReply {
+                activity_id: "old-question".into(),
+                asked_at: "2026-10-20T09:00:00Z".into(),
+                reason: WaitReason::CoordinatorLost,
+            });
+        })
+        .unwrap();
+}
+
+#[tokio::test]
+async fn run_resume_on_a_finished_lost_run_clears_the_flag_and_starts_nothing() {
+    let mut world = World::sample();
+    world.running_issue().await;
+    lose_coordinator(&world, KEY);
+    finished_and_lost(&world);
+    let before = world.record(KEY).coordinator;
+    let said = commands::run_resume(&world.ctx(), KEY).unwrap();
+    assert!(said.contains("only its lost flag was cleared"), "{said}");
+    world.settle().await;
+    world.later(120);
+    world.settle().await;
+    let record = world.record(KEY);
+    assert!(record.finished, "still finished");
+    assert!(!record.coordinator_lost);
+    assert!(record.awaiting_reply.is_none());
+    assert_eq!(record.cleared_wait_id, "old-question");
+    assert_eq!(
+        (
+            record.coordinator.status,
+            record.coordinator.pane_id.as_str(),
+            record.coordinator.resume
+        ),
+        (AgentStatus::Open, before.pane_id.as_str(), false),
+        "the coordinator is not re-pended"
+    );
+    assert_eq!(world.herdr.starts().len(), 1);
+}
+
+#[tokio::test]
+async fn a_finished_run_an_older_version_left_lost_reads_as_finished_not_broken() {
+    let mut world = World::sample();
+    world.running_issue().await;
+    lose_coordinator(&world, KEY);
+    finished_and_lost(&world);
+    world.settle().await;
+    world.later(120);
+    world.settle().await;
+    let record = world.record(KEY);
+    assert!(record.finished);
+    assert!(!record.coordinator_lost, "not broken");
+    assert!(record.awaiting_reply.is_none());
+    assert_eq!(record.cleared_wait_id, "old-question");
+    assert_eq!(
+        world.herdr.starts().len(),
+        1,
+        "a finished run is left alone"
+    );
+    assert!(world.bodies(KEY, "elicitation").is_empty());
+    assert!(!crate::actions::status_text(&world.ctx()).contains("coordinator gone"));
+}
+
 #[tokio::test]
 async fn a_run_an_older_version_left_asking_to_resume_is_recovered_and_its_question_cleared() {
     let mut world = World::sample();
