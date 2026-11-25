@@ -143,8 +143,10 @@ pub fn inbox_add(ctx: &Ctx, key: &str, kind: &str, text: &str) -> Result<()> {
         {
             r.cleared_wait_id = r.awaiting_reply.take().unwrap().activity_id;
         }
-        if r.asleep || r.coordinator.status == AgentStatus::Stopped {
+        if r.asleep || r.coordinator.status == AgentStatus::Stopped || r.coordinator_lost {
             r.asleep = false;
+            r.coordinator_lost = false;
+            r.coordinator_recoveries = 0;
             r.coordinator.repend();
         }
     })?;
@@ -227,6 +229,45 @@ pub async fn ask(ctx: &Ctx<'_>, key: &str, text: &str, options: &[(String, Strin
         "the question is queued for the Linear session; end your turn, the answer arrives in your inbox"
     );
     Ok(())
+}
+
+/// `run resume`: starts a coordinator that was given up on (or whose pane is
+/// gone) again, as a reply in the Linear session does: its previous session
+/// when it has one, otherwise a new coordinator. Prints what it did.
+pub fn run_resume(ctx: &Ctx, key: &str) -> Result<String> {
+    let run = Run::load(&ctx.runs_dir(), key)?;
+    let lock = run.lock()?;
+    let record = run.record()?;
+    if record.status != Status::Active {
+        bail!("run {key} is closed; nothing more is done for it");
+    }
+    let how = record.coordinator.resume_session();
+    let cleared = record
+        .awaiting_reply
+        .as_ref()
+        .is_some_and(|w| w.reason == WaitReason::CoordinatorLost);
+    run.update_held(&lock, |r| {
+        r.coordinator_lost = false;
+        r.coordinator_recoveries = 0;
+        if let Some(wait) = r
+            .awaiting_reply
+            .take_if(|w| w.reason == WaitReason::CoordinatorLost)
+        {
+            r.cleared_wait_id = wait.activity_id;
+        }
+        // Repended: placed anew, and resumed when it has a session.
+        r.coordinator.repend();
+    })?;
+    drop(lock);
+    ticker::poke(&ctx.state_dir());
+    let cleared = if cleared {
+        " The old question to reply `resume` is cleared."
+    } else {
+        ""
+    };
+    Ok(format!(
+        "{key}: the coordinator is started again ({how}).{cleared}"
+    ))
 }
 
 /// Withdraws the coordinator's open question, when new input answered or

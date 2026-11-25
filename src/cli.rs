@@ -80,6 +80,11 @@ enum Command {
     },
     /// Report a worker's progress from its own pane.
     Report(ReportArgs),
+    /// Manage a run from a terminal.
+    Run {
+        #[command(subcommand)]
+        command: RunCommand,
+    },
     /// Tools for checking the plugin against a real Herdr.
     #[command(hide = true)]
     Debug {
@@ -128,6 +133,15 @@ enum InboxCommand {
         /// The text; `-` reads standard input.
         #[arg(long)]
         text_file: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum RunCommand {
+    /// Start a lost coordinator again, as a reply in the Linear session does.
+    Resume {
+        /// The run key, for example `acme/DATA-1`.
+        key: String,
     },
 }
 
@@ -281,6 +295,12 @@ pub async fn run() -> Result<()> {
             commands::finish(&ctx, &session, &args.key, &text).await
         }
         Command::Worker { command } => worker(&ctx, command).await,
+        Command::Run {
+            command: RunCommand::Resume { key },
+        } => {
+            println!("{}", commands::run_resume(&ctx, &key)?);
+            Ok(())
+        }
         Command::Report(args) => {
             progress::report(&env, args.percent.filter(|_| !args.unknown), &args.activity).await
         }

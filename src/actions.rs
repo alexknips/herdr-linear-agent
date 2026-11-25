@@ -12,7 +12,7 @@ use crate::linear::credentials::{self, CredentialManager, CredentialStatus};
 use crate::linear::transport::RateHeaders;
 use crate::paths::Ctx;
 use crate::process::Cmd;
-use crate::run::{AgentStatus, Run, Status};
+use crate::run::{AgentStatus, Recovery, Run, Status};
 use crate::{ticker, worker};
 
 const TITLE: &str = "herdr-linear-agent";
@@ -246,6 +246,11 @@ pub fn status_text(ctx: &Ctx) -> String {
         let finished = if record.finished { ", finished" } else { "" };
         let coordinator = match record.coordinator.status {
             AgentStatus::Open if record.coordinator_lost => "coordinator gone".to_string(),
+            AgentStatus::Open
+                if matches!(record.coordinator.recovery, Recovery::RetryWait { .. }) =>
+            {
+                "coordinator recovering".to_string()
+            }
             AgentStatus::Open => format!(
                 "coordinator {}",
                 if record.coordinator.last_state.is_empty() {

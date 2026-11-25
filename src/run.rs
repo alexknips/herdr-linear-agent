@@ -227,6 +227,15 @@ impl AgentRecord {
         self.last_attempt_at.clear();
     }
 
+    /// What a start after `repend` does, for the log.
+    pub fn resume_session(&self) -> &'static str {
+        if self.agent_session.is_empty() {
+            "a new session"
+        } else {
+            "resuming its session"
+        }
+    }
+
     /// Pending again, to be placed anew and resumed when it has a session.
     pub fn repend(&mut self) {
         self.recovery = Recovery::None;
@@ -295,8 +304,12 @@ pub struct RunRecord {
     /// Advances only for a newly accepted allowed prompt; it distinguishes
     /// a pending question from one answered while its write was uncertain.
     pub reply_generation: u64,
-    /// The coordinator's pane is gone and a resume question was asked.
+    /// The coordinator is given up on: automatic recovery of a lost pane or
+    /// agent used all its attempts. A reply or `run resume` starts it again.
     pub coordinator_lost: bool,
+    /// How many times the ticker started the coordinator again after its
+    /// pane was gone, since it last ran for a while. Bounds the recovery.
+    pub coordinator_recoveries: u8,
     /// A person pressed stop: no prompt or heartbeat goes out until they
     /// reply again. Inbox items are still written.
     pub stopped: bool,
