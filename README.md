@@ -78,6 +78,7 @@ max_workers_per_run = 4
 max_agents = 8
 count_finished_runs = true               # false: a run waiting in review leaves its slot to the next issue
 ask_to_continue_after_hours = 8          # after this many working hours a run asks whether to go on
+coordinator_recovery_per_minute = 2      # lost coordinators started again per minute (1 to 60), so a Herdr restart does not start them all at once
 routing_agent_timeout_seconds = 120      # how long a routing agent may take, unless its profile says
 postmortem_agent_timeout_seconds = 300   # how long a postmortem agent may take, unless its profile says
 
@@ -374,7 +375,9 @@ Other kinds are not registered.
 
 When a pane needs a person (a permission or trust dialog), the ticker says so in the session with the pane to go to, and shows a Herdr notification.
 
-If an agent process exits while its Herdr pane remains open, the ticker confirms the pane is still empty for 30 seconds, then can resume that agent in the same pane and native session. It waits 15, 30 and 60 seconds before up to three automatic resume starts (in addition to the original launch); the attempt budget survives successful resumes and ticker restarts. A pane occupied by another agent is left alone. A missing native session or exhausted budget marks recovery stale; the coordinator receives an explicit `resume` action, and a worker's coordinator inbox gets a manual restart item.
+If an agent process exits while its Herdr pane remains open, the ticker confirms the pane is still empty for 30 seconds, then can resume that agent in the same pane and native session. It waits 15, 30 and 60 seconds before up to three automatic resume starts (in addition to the original launch); the attempt budget survives successful resumes and ticker restarts. A pane occupied by another agent is left alone. A missing native session or exhausted budget marks recovery stale; a stale coordinator marks the run lost (`coordinator_lost`, which the hub shows as broken) and a worker's coordinator inbox gets a manual restart item.
+
+After a Herdr or machine restart the coordinators' panes are gone. The ticker starts each coordinator again on its own, in a new pane, with its previous session when it has one (otherwise a new coordinator that reads the run folder), waiting 15, 30 and 60 seconds before up to three starts. It starts at most `limits.coordinator_recovery_per_minute` (default 2) per minute, oldest lost first, so many runs do not start at once; nothing is posted in Linear. A finished run whose coordinator is gone is left alone until a reply or an inbox item (such as `review`) reopens it. When the starts are used up the run is marked lost and a Herdr notification says so; any reply in the Linear session, or `herdr-linear-agent run resume <workspace>/<ISSUE-KEY>` in a terminal, starts the coordinator again; the command acts only on a run that was given up on (a coordinator that is merely gone is the ticker's to start, at its rate), and refuses a stopped run. The reply is in its inbox. (`herdr-linear-agent action resume` is another thing: it un-pauses intake.)
 
 ## Actions
 

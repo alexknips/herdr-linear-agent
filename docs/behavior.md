@@ -100,6 +100,7 @@ File: `<config_dir>/config.toml`. Unknown keys are refused in every table. The k
 | `limits.max_agents` | u32 | `8` | |
 | `limits.count_finished_runs` | bool | `true` | whether finished runs, waiting in review, count toward `max_runs` and `max_agents`; a reply that reopens one counts it again, even past the limits |
 | `limits.ask_to_continue_after_hours` | u64 | `8` | at least 1: `limits.ask_to_continue_after_hours must be at least 1`; see [Heartbeat and run timeout](#heartbeat-and-run-timeout) |
+| `limits.coordinator_recovery_per_minute` | u32 | `2` | 1 to 60: `limits.coordinator_recovery_per_minute must be between 1 and 60`; how many coordinators whose pane is gone are started again per minute, see [Coordinator](#coordinator) |
 | `limits.routing_agent_timeout_seconds` | u64 | `120` | 1 to 3600: `limits.routing_agent_timeout_seconds must be between 1 and 3600`; a routing agent's profile's `timeout_seconds` overrides it |
 | `limits.postmortem_agent_timeout_seconds` | u64 | `300` | 1 to 3600: `limits.postmortem_agent_timeout_seconds must be between 1 and 3600`; a postmortem profile's `timeout_seconds` overrides it |
 | `notifications.herdr` | bool | `true` | |
@@ -218,10 +219,11 @@ Run record (`run.json`), every field defaulted when missing:
 | `external_urls` | list of `{label, url}` |
 | `timeout_since` | start of the run timeout window |
 | `timeout_asked` | compatibility field for old records; new timeout waits use `awaiting_reply` |
-| `awaiting_reply` | optional `{activity_id, asked_at, reason}` for the one Linear question currently waiting on a person (`coordinator_question`, `run_timeout`, or `coordinator_lost`) |
+| `awaiting_reply` | optional `{activity_id, asked_at, reason}` for the one Linear question currently waiting on a person (`coordinator_question` or `run_timeout`; `coordinator_lost` only in records of older versions, which the ticker clears and recovers) |
 | `cleared_wait_id` | the last cleared question id; prevents a refused request still awaiting archival from restoring its wait after a crash |
 | `reply_generation` | local counter incremented only for a newly accepted allowed prompt; queued questions carry its value so restart recovery cannot reopen an answered question, without comparing Linear and local clocks |
-| `coordinator_lost` | the coordinator's pane is gone and the resume question was asked |
+| `coordinator_lost` | automatic recovery gave up on the coordinator (`coordinator.recovery` is `stale`): the run is broken until a reply or `herdr-linear-agent run resume <KEY>`. The hub reads it as broken |
+| `coordinator_recoveries` | how many times the ticker started the coordinator again after its pane was gone; reset when the restarted coordinator has run 5 minutes since its last start (`coordinator.started_at`), and by a reply or `run resume` |
 | `stopped` | a person pressed stop; no prompt or heartbeat goes out until they reply |
 | `interrupt` | `stop` or `detach`: Escape keys still owed to the run's agents, sent by the first pass with a snapshot |
 | `announce_pending` | the claim's `Picked up <ISSUE>.` thought is not queued yet; missing in an older record, which reads as announced |
@@ -652,7 +654,7 @@ Checkouts and branches are never removed.
   1. Append it to `conversation.md`.
   2. Write an inbox item (kind `reply`, subject `reply`): `A new reply from user <user id> is in conversation.md.`
   3. Set `stopped = false`. When `timeout_asked`, clear it and set `timeout_since = now`.
-  4. When `coordinator_lost` and the trimmed body equals `resume` case-insensitively: clear `coordinator_lost`, set the coordinator `pending`, `resume = agent_session non-empty`, `launch_attempts = 0`.
+  4. When `coordinator_lost`, whatever the body says: clear `coordinator_lost`, set `coordinator_recoveries = 0`, `coordinator.repend()` (`recovery = none`, the coordinator `pending`, `resume = agent_session non-empty`, `launch_attempts = 0`). The reply is in the inbox and `conversation.md` for the new coordinator. `tests/scenarios:any_reply_resumes_a_coordinator_that_was_given_up_on`
 
 The Linear task may read with the query of an earlier pass, so a prompt created at or before the record's current `prompt_cursor` is dropped. Each prompt, ignored ones included, moves `prompt_cursor` to its `createdAt` in the critical section that records it (the conversation entry and the record fields, the ignored-prompts entry, or the stop and its pending interrupt); a reply's inbox item is written just before. A prompt is relayed once. `tests/scenarios:replies_are_relayed_only_from_allowed_users_and_stop_interrupts`, `tests/scenarios:a_prompt_read_again_with_an_old_cursor_is_relayed_once`
 
@@ -687,7 +689,7 @@ A blocked status for 29 s does not count: a quickly answered prompt never shows.
 <who> needs someone in Herdr: it is waiting on a dialog in pane `<pane id>` (session `<herdr.session or default>`, run <KEY> <title>). Answer it there.
 ```
 
-`<KEY> <title>` is the workspace label: the run key, a space, and the title without control characters, at most 60 characters. `<who>` is `The coordinator` or `Worker <id> (<repo>)`. It is sent once per episode (`blocked_reported`). `tests/scenarios:a_dialog_in_a_pane_is_reported_once_and_a_lost_coordinator_can_be_resumed`
+`<KEY> <title>` is the workspace label: the run key, a space, and the title without control characters, at most 60 characters. `<who>` is `The coordinator` or `Worker <id> (<repo>)`. It is sent once per episode (`blocked_reported`). `tests/scenarios:a_dialog_is_reported_in_progress_and_a_gone_coordinator_is_recovered`
 
 Notifications (`notify`) are shown only when `notifications.herdr` is true.
 
@@ -697,11 +699,20 @@ For an `open` coordinator:
 
 1. Track it.
 2. When it needs a person and was not reported: ask for a person (`The coordinator`) and set `blocked_reported`.
-3. When its pane is gone and it is not already lost: queue the elicitation `The coordinator's pane for <KEY> is gone. <how>` with option `Resume`=`resume`, and show the notification `<KEY> coordinator is gone` with body `<how>`. `<how>` is `Reply \`resume\` to start it again with its previous session.` when the session id is non-empty and the kind has resume arguments, else `Reply \`resume\` to start a new coordinator.` Set `coordinator_lost`. The ticker never restarts it by itself. When the recorded coordinator is seen in its pane again, `coordinator_lost` clears, so nudges resume. `tests/scenarios:a_coordinator_seen_again_in_its_pane_is_no_longer_lost_and_gets_its_reply`
+3. When its pane is gone (no agent of the record anywhere and the pane missing from a whole snapshot) on an active run that is neither `stopped` nor `finished`: it gets the same bounded recovery as an agent that disappears from a surviving pane, except that it is started in a new pane. `recovery` becomes `retry_wait` with a delay of 15 s, 30 s and 60 s for the first, second and third attempt (the session is looked up in the transcripts when `agent_session` is empty). When the delay is over, the coordinator is `repend()`ed, which resumes the previous session when `agent_session` is resumable and starts a new coordinator otherwise, and `coordinator_recoveries` grows by one. Nothing is posted to Linear and no notification is shown. `tests/scenarios:a_gone_coordinator_pane_is_recovered_with_no_reply_and_no_question_in_linear`
+   - **Rate.** The due recoveries of one pass are queued oldest lost first (`last_state_change`, else `started_at`, else now, then the run key) and started only while fewer than `limits.coordinator_recovery_per_minute` were started in the last minute (in memory, per ticker process). The others wait for a later pass. `tests/scenarios:lost_coordinators_are_started_a_few_at_a_time`
+   - **Given up.** After three recoveries without the coordinator running for 5 minutes since a start in between (`tests/scenarios:a_coordinator_that_ran_for_hours_is_still_given_up_on_when_it_keeps_losing_its_pane`), `recovery` becomes `stale` and `coordinator_lost` is set; the run reads as broken in the hub and `status` shows `coordinator gone`. No question is queued in Linear. The notification `<KEY> coordinator recovery stopped` says to run `herdr-linear-agent run resume <KEY>`; a reply in the Linear session resumes it too (see [Relay of Linear prompts](#relay-of-linear-prompts)). The same happens to a surviving-pane recovery that used up its attempts. `tests/scenarios:a_coordinator_lost_again_and_again_is_given_up_on_and_run_resume_brings_it_back`, `tests/scenarios:stale_recovery_marks_the_run_lost_without_asking_in_linear`
+   - **Finished runs** are left alone: no recovery, nothing flagged. A reply or an inbox item that reopens the run (`finished = false`) lets the next pass recover its coordinator. `tests/scenarios:a_finished_run_with_a_gone_coordinator_pane_is_left_alone_until_reopened`
+   - **Finished runs left lost by an older version** only stop reading as broken: `coordinator_lost`, `coordinator_recoveries` and an open `coordinator_lost` question are cleared (`cleared_wait_id`, nothing posted), and the coordinator is not re-pended. `tests/scenarios:a_finished_run_an_older_version_left_lost_reads_as_finished_not_broken`
+   - **Older versions.** A run an older build left with `coordinator_lost` set, its pane gone and no `stale` recovery has `coordinator_lost` and `coordinator_recoveries` reset and is recovered like the others. An open `coordinator_lost` question is cleared (`cleared_wait_id`); any other open question (the coordinator's own, the time limit's) stays open. `tests/scenarios:a_run_an_older_version_left_asking_to_resume_is_recovered_and_its_question_cleared`, `tests/scenarios:a_lost_flag_an_older_version_left_with_a_coordinator_question_open_is_recovered`, `tests/scenarios:a_lost_flag_an_older_version_left_with_no_question_is_recovered`
+   - When the recorded coordinator is seen in its pane again during a retry's backoff, the `retry_wait` becomes `recovered`, so a later loss gets a fresh backoff and `status` stops saying `recovering`. `tests/scenarios:a_retry_waiting_for_its_backoff_is_cleared_when_the_agent_is_seen_again`
+   - When the recorded coordinator is seen in its pane again, `coordinator_lost` clears, so nudges resume. `tests/scenarios:a_coordinator_seen_again_in_its_pane_is_no_longer_lost_and_gets_its_reply`
 4. When the pane exists: report pane metadata with display `<KEY> · coordinator` and state `needs you` (when it needs a person), else the agent status, else `starting`.
 5. Save the record when it changed.
 
-After a `resume` reply the coordinator is started again with `--resume <session>` and its launch prompt is the restart line. `tests/scenarios:a_dialog_in_a_pane_is_reported_once_and_a_lost_coordinator_can_be_resumed`
+A recovered coordinator is started with `--resume <session>` and its launch prompt is the restart line. `tests/scenarios:a_dialog_is_reported_in_progress_and_a_gone_coordinator_is_recovered`
+
+`herdr-linear-agent run resume <KEY>` does by hand what a reply does for a coordinator that was given up on, and only for one: `coordinator_lost`, a `stale` recovery, an old `coordinator_lost` question, or a failed or stopped coordinator. The decision is made on the record read under the run lock, in the same critical section as the change: `coordinator_lost = false`, `coordinator_recoveries = 0`, `recovery = none`, the old question cleared, `repend()`. A coordinator that is merely gone or waits for its automatic retry (`retry_wait`, `suspected`, `starting`, pending) is left to the ticker, whose per-minute limit and pane grace apply: the command changes nothing, prints `<KEY>: recovery is in progress; nothing to resume` and exits 0. A running coordinator likewise prints that there is nothing to resume. On a finished run it does not re-pend the coordinator (the ticker leaves finished runs alone): it clears `coordinator_lost` and an old `coordinator_lost` question, says so, and otherwise prints that the run is finished; `tests/scenarios:run_resume_on_a_finished_lost_run_clears_the_flag_and_starts_nothing`. A `stopped` run is refused (a person's decision; a reply un-stops it), as is an unknown or closed run. It does not touch the intake pause (`action resume`) and does not need Herdr. `tests/scenarios:run_resume_leaves_a_healthy_coordinator_alone`, `tests/scenarios:run_resume_leaves_lost_coordinators_to_the_rate_limited_queue`, `tests/scenarios:run_resume_does_not_revive_a_pane_that_is_only_gone`
 
 ### Worker groups
 
@@ -747,7 +758,7 @@ For every worker that is `open` or `failed`, except an `open` worker without a p
 8. When the pane exists: report pane metadata with display `<KEY> · <id> <title>` and state the group label.
 9. Save the record when it changed, keeping its `created` and `updated`.
 
-Pinned: the report with a PR gives the inbox summary containing `w1 (api) has a new report`, the home copy `workers/w1.md`, the actions `Start worker` then `Pull request`, the thought `w1 (api) reported:` with `Done.`, the external URL `https://github.com/acme/api/pull/7`. `tests/scenarios:a_worker_runs_in_a_worktree_and_its_report_and_pr_reach_linear`. A blocked worker gives one elicitation containing its pane id, a Herdr notification, and an inbox item containing `Waiting on you`. `tests/scenarios:a_dialog_in_a_pane_is_reported_once_and_a_lost_coordinator_can_be_resumed`
+Pinned: the report with a PR gives the inbox summary containing `w1 (api) has a new report`, the home copy `workers/w1.md`, the actions `Start worker` then `Pull request`, the thought `w1 (api) reported:` with `Done.`, the external URL `https://github.com/acme/api/pull/7`. `tests/scenarios:a_worker_runs_in_a_worktree_and_its_report_and_pr_reach_linear`. A blocked worker gives one elicitation containing its pane id, a Herdr notification, and an inbox item containing `Waiting on you`. `tests/scenarios:a_dialog_is_reported_in_progress_and_a_gone_coordinator_is_recovered`
 
 ### Pane metadata tokens
 
@@ -793,7 +804,7 @@ For each `open` agent of the run with `prompt_pending` (coordinator first, then 
 - `claude_trust.trust(env, dirs)`: the config is `$CLAUDE_CONFIG_DIR/.claude.json` when set, else `~/.claude.json`. A missing file is left missing; a file whose top level is not an object is left alone. For each non-empty folder, set `projects.<folder>.hasTrustDialogAccepted = true` when it is not already true, keeping every other key, the key order and the file mode (0600 when unknown). Write through `.claude.json.herdr-linear-agent.<pid>.tmp` and a rename. Returns whether the file changed. `src/claude_trust.rs:trust_is_added_once_and_everything_else_is_kept`, `src/claude_trust.rs:a_missing_or_unexpected_config_is_left_alone`
 - Outcome:
   - Success: the agent is running; the prompt is still pending.
-  - Error `agent_not_ready`: the agent exists in the pane but is not ready (a trust or permission dialog); keep `open` and `prompt_pending`; the needs-a-person rules take over. `tests/scenarios:a_dialog_in_a_pane_is_reported_once_and_a_lost_coordinator_can_be_resumed`
+  - Error `agent_not_ready`: the agent exists in the pane but is not ready (a trust or permission dialog); keep `open` and `prompt_pending`; the needs-a-person rules take over. `tests/scenarios:a_dialog_is_reported_in_progress_and_a_gone_coordinator_is_recovered`
   - Any other error: increase `launch_attempts`. After 3 attempts, set `failed` with `error` = the message and queue an error activity (see decision 6).
   - Attempts are spaced: after an unsuccessful attempt the next one waits 15 s, doubling with every counted attempt (`last_attempt_at`). `NotSent` (Herdr down), for a placement or a start, waits a fixed 15 s whatever the count, does not count, and is kept in memory only. `tests/scenarios:a_start_herdr_never_received_waits_fifteen_seconds_whatever_the_attempts`
 
@@ -807,7 +818,7 @@ When `prompt_pending` and our agent is in the pane and ready for input (idle or 
 | resumed coordinator | `[herdr-linear-agent ticker] You were restarted as the coordinator of <KEY>. Run context.` |
 | worker | `Read .herdr-linear-agent/<workspace>-<ISSUE>-<id>/brief.md and do what it says.` |
 
-`tests/worker:ids_branches_briefs_and_pr_lines`, `tests/scenarios:a_worker_runs_in_a_worktree_and_its_report_and_pr_reach_linear`, `tests/scenarios:a_dialog_in_a_pane_is_reported_once_and_a_lost_coordinator_can_be_resumed`
+`tests/worker:ids_branches_briefs_and_pr_lines`, `tests/scenarios:a_worker_runs_in_a_worktree_and_its_report_and_pr_reach_linear`, `tests/scenarios:a_dialog_is_reported_in_progress_and_a_gone_coordinator_is_recovered`
 
 While the run is `stopped` or `timeout_asked`, no prompt goes to the coordinator. `tests/scenarios:quiet_runs_get_a_heartbeat_and_long_runs_ask_to_continue`, `tests/scenarios:a_stop_holds_prompts_until_the_next_reply`
 
@@ -898,7 +909,7 @@ After the runs, the task answers each decline it has not answered yet with a `re
 | worker Waiting on you | action `Worker waiting` |
 | worker's new report | thought with the report's `## Report` section |
 | dialog in a pane | elicitation (and notification) |
-| coordinator pane gone | elicitation with `Resume` |
+| coordinator pane gone | nothing (the ticker recovers it); a local notification when recovery gives up |
 | worker pane gone before a report | error activity |
 | launch failed 3 times | error activity |
 | 10 minutes quiet | ephemeral thought naming what each worker does |

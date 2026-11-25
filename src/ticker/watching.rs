@@ -4,16 +4,24 @@ use anyhow::Result;
 use jiff::Timestamp;
 
 use super::reconcile::{
-    COORDINATOR_IDLE, Deps, HEARTBEAT, PANE_GRACE, Reconciler, apply_tracked, error_activity,
-    inbox_item, since, update_worker,
+    COORDINATOR_IDLE, Deps, HEARTBEAT, PANE_GRACE, RECOVERY_WINDOW, Reconciler, apply_tracked,
+    error_activity, inbox_item, since, update_run, update_worker,
 };
 use crate::agents;
 use crate::herdr::{Herdr, PaneId, Snapshot};
 use crate::linear::api::{Activity, Content, ExternalUrl};
 use crate::outbox::{self, Op};
-use crate::run::{AgentRecord, AgentStatus, Recovery, Run, WaitReason};
+use crate::run::{AgentRecord, AgentStatus, Recovery, Run, RunRecord, WaitReason};
 use crate::worker::{self, Group, Live, Worker};
 use crate::{coordinator, files, inbox, transcript};
+
+/// A coordinator lost with its pane is started again at most this many times
+/// before the recovery gives up, unless it ran for `RECOVERY_STABLE` between.
+const MAX_COORDINATOR_RECOVERIES: u8 = 3;
+
+/// A restarted coordinator that has run this long is stable: a later loss
+/// starts the count of recoveries anew.
+const RECOVERY_STABLE: jiff::SignedDuration = jiff::SignedDuration::from_secs(5 * 60);
 
 /// Why a worker waits on a person, for its inbox item.
 fn waiting_reason(w: &Worker, live: &Live) -> String {
@@ -122,6 +130,224 @@ impl Reconciler {
         (next, live)
     }
 
+    /// A run an older version left lost (`coordinator_lost`, its pane gone, no
+    /// recovery given up) takes the bounded recovery like any other: the flag
+    /// is cleared, and the older `resume` question with it. A question of a
+    /// person (the coordinator's own, the time limit's) stays open.
+    async fn clear_old_lost_wait<H: Herdr>(
+        &mut self,
+        d: &Deps<'_, H>,
+        snapshot: &Snapshot,
+        run: &Run,
+        now: Timestamp,
+    ) -> Result<()> {
+        let record = run.record()?;
+        let c = &record.coordinator;
+        let asked = record
+            .awaiting_reply
+            .as_ref()
+            .is_some_and(|w| w.reason == WaitReason::CoordinatorLost);
+        if record.status != crate::run::Status::Active
+            || record.stopped
+            || !(asked || record.coordinator_lost)
+        {
+            return Ok(());
+        }
+        // A finished run's coordinator is left alone: it only stops reading
+        // as broken, and a question of an older version is settled.
+        if record.finished {
+            self.update_and_push(run, |r| {
+                if let Some(wait) = r
+                    .awaiting_reply
+                    .take_if(|w| w.reason == WaitReason::CoordinatorLost)
+                {
+                    r.cleared_wait_id = wait.activity_id;
+                }
+                r.coordinator_lost = false;
+                r.coordinator_recoveries = 0;
+                Vec::new()
+            })
+            .await?;
+            d.log.line(&format!(
+                "{}: finished and lost by an older version; the flag is cleared",
+                run.key
+            ));
+            return Ok(());
+        }
+        if c.status != AgentStatus::Open || !self.judged(d, snapshot, c, now) {
+            return Ok(());
+        }
+        let live = self.live(d, snapshot, c, now);
+        // A given-up recovery of this version stays given up; the older
+        // question can be left with an empty pane that still exists.
+        let legacy = if asked {
+            live.agent.is_none()
+        } else {
+            !live.pane_exists && !matches!(c.recovery, Recovery::Stale { .. })
+        };
+        if !legacy {
+            return Ok(());
+        }
+        self.update_and_push(run, |r| {
+            if let Some(wait) = r
+                .awaiting_reply
+                .take_if(|w| w.reason == WaitReason::CoordinatorLost)
+            {
+                r.cleared_wait_id = wait.activity_id;
+                r.coordinator.recovery = Recovery::None;
+            }
+            r.coordinator_lost = false;
+            r.coordinator_recoveries = 0;
+            Vec::new()
+        })
+        .await?;
+        d.log.line(&format!(
+            "{}: lost by an older version; the coordinator is recovered",
+            run.key
+        ));
+        Ok(())
+    }
+
+    /// The coordinator's pane is gone on a run that works: schedules the
+    /// bounded recovery, or when its attempts are used up marks the run lost.
+    /// Returns whether the run was marked lost in this call.
+    async fn plan_lost_recovery<H: Herdr>(
+        &mut self,
+        d: &Deps<'_, H>,
+        run: &Run,
+        record: &RunRecord,
+        next: &mut AgentRecord,
+        now: Timestamp,
+    ) -> Result<bool> {
+        match &next.recovery {
+            // Given up: only a reply or `run resume` starts it again.
+            Recovery::Stale { .. } => return Ok(false),
+            Recovery::RetryWait { due_at, .. } => {
+                if due_at.parse::<Timestamp>().is_ok_and(|at| at > now) {
+                    return Ok(false);
+                }
+                // When it was lost, as near as the record tells: its last state
+                // change, else its last start, else now.
+                let lost_since = [&next.last_state_change, &next.started_at]
+                    .iter()
+                    .find_map(|at| at.parse::<Timestamp>().ok())
+                    .unwrap_or(now);
+                self.recovery_queue.push((lost_since, run.key.clone()));
+                return Ok(false);
+            }
+            _ => {}
+        }
+        let attempts = record.coordinator_recoveries;
+        if attempts >= MAX_COORDINATOR_RECOVERIES {
+            let stale = Recovery::Stale {
+                attempts,
+                reason: "its pane is gone".into(),
+                reported: true,
+            };
+            let (pane, wanted) = (next.pane_id.clone(), stale.clone());
+            let marked = self
+                .update_and_push(run, move |r| {
+                    if r.status == crate::run::Status::Active
+                        && !r.stopped
+                        && !r.finished
+                        && r.coordinator.status == AgentStatus::Open
+                        && r.coordinator.pane_id == pane
+                    {
+                        r.coordinator.recovery = wanted;
+                        r.coordinator_lost = true;
+                    }
+                    Vec::new()
+                })
+                .await?;
+            if marked.coordinator.recovery == stale {
+                next.recovery = stale;
+                return Ok(true);
+            }
+            return Ok(false);
+        }
+        // A kind that picks its own session id is looked up once it is
+        // needed: when the pane is gone, a resume can continue it.
+        if next.agent_session.is_empty()
+            && let Ok(since) = next.started_at.parse::<Timestamp>()
+        {
+            let roots = transcript::Roots::from_env(d.ctx.env);
+            let (kind, cwd) = (next.kind.clone(), next.cwd.clone());
+            let found = tokio::task::spawn_blocking(move || {
+                transcript::session_since(&roots, &kind, &cwd, since)
+            })
+            .await;
+            if let Ok(Some(found)) = found {
+                next.agent_session = found;
+            }
+        }
+        let attempt = attempts + 1;
+        next.recovery = Recovery::RetryWait {
+            attempt,
+            due_at: (now
+                + jiff::SignedDuration::from_secs(match attempt {
+                    1 => 15,
+                    2 => 30,
+                    _ => 60,
+                }))
+            .to_string(),
+            session: next.agent_session.clone(),
+        };
+        Ok(false)
+    }
+
+    /// Starts the coordinators whose pane is gone and whose retry is due:
+    /// the oldest lost first, at most `coordinator_recovery_per_minute` in
+    /// any minute. The others wait for a later pass; nothing is posted to
+    /// Linear for them.
+    pub(super) async fn recover_lost_coordinators<H: Herdr>(
+        &mut self,
+        d: &Deps<'_, H>,
+        now: Timestamp,
+    ) {
+        self.recovery_starts
+            .retain(|at| now.duration_since(*at) < RECOVERY_WINDOW);
+        let mut queue = std::mem::take(&mut self.recovery_queue);
+        queue.sort();
+        let limit = d.config.limits.coordinator_recovery_per_minute as usize;
+        for (_, key) in queue {
+            if self.recovery_starts.len() >= limit {
+                break;
+            }
+            let Ok(run) = Run::load(&d.ctx.runs_dir(), &key) else {
+                continue;
+            };
+            let started = self
+                .guarded(&run, |run, lock| {
+                    let record = run.record()?;
+                    if record.status != crate::run::Status::Active
+                        || record.stopped
+                        || record.finished
+                        || record.coordinator_lost
+                        || record.coordinator.status != AgentStatus::Open
+                        || !matches!(record.coordinator.recovery, Recovery::RetryWait { .. })
+                    {
+                        return Ok((None, Vec::new()));
+                    }
+                    run.update_held(lock, |r| {
+                        r.coordinator.repend();
+                        r.coordinator_recoveries = r.coordinator_recoveries.saturating_add(1);
+                    })?;
+                    Ok((Some(record.coordinator.resume_session()), Vec::new()))
+                })
+                .await;
+            match started {
+                Ok(Some(how)) => {
+                    self.recovery_starts.push_back(now);
+                    d.log.line(&format!(
+                        "{key}: the coordinator's pane is gone; starting it again ({how})"
+                    ));
+                }
+                Ok(None) => {}
+                Err(error) => d.fail(&key, &error),
+            }
+        }
+    }
+
     /// The elicitation that asks a person to answer a dialog in a Herdr
     /// pane, and the notification that goes with it.
     fn person_needed<H>(
@@ -147,6 +373,7 @@ impl Reconciler {
         run: &Run,
         now: Timestamp,
     ) -> Result<()> {
+        self.clear_old_lost_wait(d, snapshot, run, now).await?;
         let record = run.record()?;
         let label = coordinator::workspace_label(&record);
         let c = &record.coordinator;
@@ -177,7 +404,41 @@ impl Reconciler {
             if record.stopped || record.finished || record.status != crate::run::Status::Active {
                 next.recovery = Recovery::None;
             }
-            let mut stale_notice = None;
+            // The agent is back in its pane during the backoff of a retry:
+            // nothing is left to start, and a later loss gets a fresh backoff.
+            if live.agent.is_some()
+                && let Recovery::RetryWait {
+                    attempt, session, ..
+                } = &next.recovery
+            {
+                next.recovery = Recovery::Recovered {
+                    attempts: attempt.saturating_sub(1),
+                    session: session.clone(),
+                };
+            }
+            let mut stale_notice = false;
+            let active =
+                record.status == crate::run::Status::Active && !record.stopped && !record.finished;
+            // A pane that is gone gets the bounded recovery too: the
+            // coordinator is started again in a new pane, resuming its
+            // session when it has one. A finished run is left alone.
+            if !live.pane_exists && active && self.trusted && live.agent.is_none() {
+                stale_notice = self
+                    .plan_lost_recovery(d, run, &record, &mut next, now)
+                    .await?;
+            } else if live.agent.is_some()
+                && record.coordinator_recoveries > 0
+                && next
+                    .started_at
+                    .parse::<Timestamp>()
+                    .is_ok_and(|at| now.duration_since(at) >= RECOVERY_STABLE)
+            {
+                // It has run for a while since its last start (`started_at`
+                // is set by every start, `prompted_at` is not): a later loss
+                // starts the count anew.
+                update_run(run, |r| r.coordinator_recoveries = 0).await?;
+            }
+            let mut notices = Vec::new();
             if let Recovery::Stale {
                 attempts,
                 reason,
@@ -185,9 +446,6 @@ impl Reconciler {
             } = next.recovery.clone()
             {
                 let expected = next.recovery.clone();
-                let body = format!(
-                    "Automatic resume stopped after {attempts} attempts. {reason}. Reply `resume` when ready."
-                );
                 let reported = self
                     .update_and_push(run, move |r| {
                         if r.status != crate::run::Status::Active
@@ -204,63 +462,31 @@ impl Reconciler {
                             reported: true,
                         };
                         r.coordinator_lost = true;
-                        vec![Op::awaiting_reply(
-                            body,
-                            &[("Resume", "resume")],
-                            WaitReason::CoordinatorLost,
-                        )]
+                        Vec::new()
                     })
                     .await?;
                 if let Recovery::Stale { reported: true, .. } = reported.coordinator.recovery {
                     next.recovery = reported.coordinator.recovery;
-                    stale_notice = Some(format!("{} coordinator recovery stopped", run.key));
+                    stale_notice = true;
                 }
             }
-            let mut ops = Vec::new();
-            let mut notices = Vec::new();
-            if let Some(notice) = stale_notice {
-                notices.push((notice, "Reply `resume` to continue the run.".into()));
+            if stale_notice {
+                notices.push((
+                    format!("{} coordinator recovery stopped", run.key),
+                    format!(
+                        "Automatic recovery used all its attempts. Run `herdr-linear-agent run resume {}` to start it again; a reply in the Linear session does too.",
+                        run.key
+                    ),
+                ));
             }
+            let mut ops = Vec::new();
             if needs && !next.blocked_reported {
                 let (op, notice) = Self::person_needed(d, run, &label, "The coordinator", &next);
                 ops.push(op);
                 notices.push(notice);
                 next.blocked_reported = true;
             }
-            let lost = !live.pane_exists && !record.coordinator_lost;
-            let ask_to_resume = !live.pane_exists
-                && (lost || (record.coordinator_lost && record.awaiting_reply.is_none()));
-            // A kind that picks its own session id is looked up once it is
-            // needed: when the pane is gone, a resume can continue it.
-            if lost
-                && next.agent_session.is_empty()
-                && let Ok(since) = next.started_at.parse::<Timestamp>()
-            {
-                let roots = transcript::Roots::from_env(d.ctx.env);
-                let (kind, cwd) = (next.kind.clone(), next.cwd.clone());
-                let found = tokio::task::spawn_blocking(move || {
-                    transcript::session_since(&roots, &kind, &cwd, since)
-                })
-                .await;
-                if let Ok(Some(found)) = found {
-                    next.agent_session = found;
-                }
-            }
-            if ask_to_resume {
-                let resumable = !next.agent_session.is_empty()
-                    && agents::resume_args(&next.kind, &next.agent_session).is_some();
-                let how = if resumable {
-                    "Reply `resume` to start it again with its previous session."
-                } else {
-                    "Reply `resume` to start a new coordinator."
-                };
-                ops.push(Op::awaiting_reply(
-                    format!("The coordinator's pane for {} is gone. {how}", run.key),
-                    &[("Resume", "resume")],
-                    WaitReason::CoordinatorLost,
-                ));
-                notices.push((format!("{} coordinator is gone", run.key), how.to_string()));
-            } else if live.pane_exists {
+            if live.pane_exists {
                 let state = if needs {
                     "needs you"
                 } else {
@@ -274,12 +500,14 @@ impl Reconciler {
                 && live.agent.is_some()
                 && record.coordinator_lost
                 && !matches!(next.recovery, Recovery::Stale { .. });
-            if next != *c || lost || ask_to_resume || back {
+            if next != *c || back {
                 let before = c.clone();
                 let recovery_stale = matches!(&next.recovery, Recovery::Stale { .. });
                 self.update_and_push(run, move |r| {
                     apply_tracked(&mut r.coordinator, &before, &next);
-                    r.coordinator_lost = (r.coordinator_lost || lost) && !back;
+                    if back {
+                        r.coordinator_lost = false;
+                    }
                     if recovery_stale {
                         r.coordinator_lost = true;
                     }

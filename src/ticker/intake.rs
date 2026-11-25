@@ -377,7 +377,6 @@ impl Reconciler {
                 ),
             )
             .await?;
-            let resume = prompt.body.trim().eq_ignore_ascii_case("resume");
             let restart_window = now.to_string();
             self.guarded(run, move |run, lock| {
                 let current = run.record()?;
@@ -395,9 +394,6 @@ impl Reconciler {
                         r.asleep = false;
                         r.coordinator.repend();
                     }
-                    if resume {
-                        r.coordinator.recovery = crate::run::Recovery::None;
-                    }
                     if let Some(wait) = r.awaiting_reply.take() {
                         if wait.reason == WaitReason::RunTimeout {
                             r.timeout_since = restart_window.clone();
@@ -410,8 +406,11 @@ impl Reconciler {
                         r.timeout_since = restart_window;
                         r.timeout_paused_since.clear();
                     }
-                    if r.coordinator_lost && resume {
+                    // Any reply brings back a coordinator that was given up on;
+                    // the reply is in the inbox for it to read.
+                    if r.coordinator_lost {
                         r.coordinator_lost = false;
+                        r.coordinator_recoveries = 0;
                         r.coordinator.repend();
                     }
                 })?;

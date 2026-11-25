@@ -19,7 +19,7 @@
 //! blocking thread, after the Herdr request they follow; a record read
 //! before an await is never saved whole.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -58,6 +58,8 @@ pub(super) const DETECTION_GRACE: SignedDuration = SignedDuration::from_secs(60)
 /// has been missing this long (Herdr may answer a placement before its pane
 /// list shows the pane).
 pub(super) const PANE_GRACE: SignedDuration = SignedDuration::from_secs(30);
+/// The window of the lost-coordinator start limit.
+pub(super) const RECOVERY_WINDOW: SignedDuration = SignedDuration::from_secs(60);
 const EFFECT_QUEUE: usize = 64;
 
 /// Everything the loop reads from and writes to.
@@ -227,6 +229,12 @@ pub struct Reconciler {
     /// (`foreign_delegations = "ignore"`), by delegator and time. Each is
     /// logged once and never answered.
     pub(super) ignored: BTreeMap<String, String>,
+    /// Coordinators whose pane is gone and whose recovery is due this pass,
+    /// as `(lost since, run key)`; rebuilt every pass and started, oldest
+    /// first, within the per-minute limit.
+    pub(super) recovery_queue: Vec<(Timestamp, String)>,
+    /// When the lost coordinators started in the last minute were started.
+    pub(super) recovery_starts: VecDeque<Timestamp>,
     /// Transcript copies still running, each giving its failures to log.
     pub(super) keeping: Vec<tokio::task::JoinHandle<Vec<String>>>,
     /// Postmortems being written, by run key.
@@ -375,6 +383,8 @@ impl Reconciler {
             queries: Vec::new(),
             declined: BTreeMap::new(),
             ignored: BTreeMap::new(),
+            recovery_queue: Vec::new(),
+            recovery_starts: VecDeque::new(),
             keeping: Vec::new(),
             writing: BTreeMap::new(),
         })
@@ -544,6 +554,7 @@ impl Reconciler {
             self.deliver_interrupts(d, snapshot).await;
         }
         self.prompted.clear();
+        self.recovery_queue.clear();
         for effect in wake.effects {
             self.apply_effect(d, effect, now).await;
         }
@@ -579,6 +590,7 @@ impl Reconciler {
                 ));
             }
         }
+        self.recover_lost_coordinators(d, now).await;
         self.write_failure_notice(d, now).await;
         if let Some(snapshot) = whole {
             let live: Vec<String> = snapshot.panes.keys().map(|p| p.0.clone()).collect();
@@ -742,6 +754,8 @@ impl Reconciler {
                 }
             }
         }
+        // A recovery over the per-minute limit waits for the window to move.
+        times.extend(self.recovery_starts.front().map(|at| *at + RECOVERY_WINDOW));
         times.extend(self.launched.values().map(|(_, at)| *at + DETECTION_GRACE));
         times.extend(self.not_sent.values().map(|at| *at + LAUNCH_SPACING));
         times.extend(self.missing_since.values().map(|at| *at + PANE_GRACE));

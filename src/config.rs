@@ -143,6 +143,9 @@ pub struct Limits {
     pub count_finished_runs: bool,
     /// After this many hours of work (some agent of the run working) a run asks a person whether to continue.
     pub ask_to_continue_after_hours: u64,
+    /// How many coordinators whose pane is gone the ticker starts again per
+    /// minute, so a Herdr restart does not start them all at once.
+    pub coordinator_recovery_per_minute: u32,
     /// How long a routing agent may take, unless its profile says.
     pub routing_agent_timeout_seconds: u64,
     /// How long a postmortem agent may take, unless its profile says.
@@ -157,6 +160,7 @@ impl Default for Limits {
             max_agents: 8,
             count_finished_runs: true,
             ask_to_continue_after_hours: 8,
+            coordinator_recovery_per_minute: 2,
             routing_agent_timeout_seconds: 120,
             postmortem_agent_timeout_seconds: 300,
         }
@@ -375,6 +379,10 @@ impl Config {
         ensure!(
             limits.ask_to_continue_after_hours >= 1,
             "limits.ask_to_continue_after_hours must be at least 1"
+        );
+        ensure!(
+            (1..=60).contains(&limits.coordinator_recovery_per_minute),
+            "limits.coordinator_recovery_per_minute must be between 1 and 60"
         );
         for (key, seconds) in [
             (
@@ -878,6 +886,10 @@ workers = ["standard", "deep"]
         bad(
             "[herdr]",
             "[limits]\nrouting_agent_timeout_seconds = 0\n\n[herdr]",
+        );
+        bad(
+            "[herdr]",
+            "[limits]\ncoordinator_recovery_per_minute = 0\n\n[herdr]",
         );
         // The size-based routing is gone.
         bad(

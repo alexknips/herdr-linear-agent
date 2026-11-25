@@ -143,8 +143,10 @@ pub fn inbox_add(ctx: &Ctx, key: &str, kind: &str, text: &str) -> Result<()> {
         {
             r.cleared_wait_id = r.awaiting_reply.take().unwrap().activity_id;
         }
-        if r.asleep || r.coordinator.status == AgentStatus::Stopped {
+        if r.asleep || r.coordinator.status == AgentStatus::Stopped || r.coordinator_lost {
             r.asleep = false;
+            r.coordinator_lost = false;
+            r.coordinator_recoveries = 0;
             r.coordinator.repend();
         }
     })?;
@@ -227,6 +229,103 @@ pub async fn ask(ctx: &Ctx<'_>, key: &str, text: &str, options: &[(String, Strin
         "the question is queued for the Linear session; end your turn, the answer arrives in your inbox"
     );
     Ok(())
+}
+
+/// `run resume`: starts a coordinator the ticker gave up on again, as a reply
+/// in the Linear session does: its previous session when it has one,
+/// otherwise a new coordinator. Prints what it did.
+///
+/// It acts only on a run that was given up on: `coordinator_lost`, a `stale`
+/// recovery, an open `coordinator_lost` question of an older version, or a
+/// coordinator that failed or stopped. A coordinator that is merely gone or
+/// waiting for its automatic retry is the ticker's to start (its
+/// per-minute limit and pane grace apply), so the command leaves it alone
+/// and succeeds. A stopped run is refused: a stop is a person's decision,
+/// and a reply un-stops it.
+///
+/// The decision is made on the record read under the run lock, in the same
+/// critical section as the change.
+pub fn run_resume(ctx: &Ctx, key: &str) -> Result<String> {
+    let run = Run::load(&ctx.runs_dir(), key)?;
+    let lock = run.lock()?;
+    let record = run.record()?;
+    if record.status != Status::Active {
+        bail!("run {key} is closed; nothing more is done for it");
+    }
+    if record.stopped {
+        bail!(
+            "run {key} is stopped, which a person decided; a reply in the Linear session continues it"
+        );
+    }
+    let c = &record.coordinator;
+    let old_question = record
+        .awaiting_reply
+        .as_ref()
+        .is_some_and(|w| w.reason == WaitReason::CoordinatorLost);
+    let given_up = record.coordinator_lost
+        || old_question
+        || matches!(c.recovery, crate::run::Recovery::Stale { .. })
+        || matches!(c.status, AgentStatus::Failed | AgentStatus::Stopped);
+    if record.finished {
+        // The ticker leaves a finished run's coordinator alone, so nothing is
+        // started; only a lost flag an older version left is cleared.
+        if !(record.coordinator_lost || old_question) {
+            return Ok(format!(
+                "{key}: the run is finished; nothing to resume (a reply or an inbox item reopens it)"
+            ));
+        }
+        run.update_held(&lock, |r| {
+            r.coordinator_lost = false;
+            r.coordinator_recoveries = 0;
+            if let Some(wait) = r
+                .awaiting_reply
+                .take_if(|w| w.reason == WaitReason::CoordinatorLost)
+            {
+                r.cleared_wait_id = wait.activity_id;
+            }
+        })?;
+        drop(lock);
+        ticker::poke(&ctx.state_dir());
+        return Ok(format!(
+            "{key}: the run is finished, so its coordinator is not started; only its lost flag was cleared (a reply or an inbox item reopens the run)"
+        ));
+    }
+    if !given_up {
+        let progress = matches!(
+            c.recovery,
+            crate::run::Recovery::RetryWait { .. }
+                | crate::run::Recovery::Starting { .. }
+                | crate::run::Recovery::Suspected { .. }
+        ) || c.status == AgentStatus::Pending;
+        return Ok(if progress {
+            format!("{key}: recovery is in progress; nothing to resume")
+        } else {
+            format!("{key}: the coordinator is running; nothing to resume")
+        });
+    }
+    let how = c.resume_session();
+    run.update_held(&lock, |r| {
+        r.coordinator_lost = false;
+        r.coordinator_recoveries = 0;
+        if let Some(wait) = r
+            .awaiting_reply
+            .take_if(|w| w.reason == WaitReason::CoordinatorLost)
+        {
+            r.cleared_wait_id = wait.activity_id;
+        }
+        // Repended: placed anew, and resumed when it has a session.
+        r.coordinator.repend();
+    })?;
+    drop(lock);
+    ticker::poke(&ctx.state_dir());
+    let cleared = if old_question {
+        " The old question to reply `resume` is cleared."
+    } else {
+        ""
+    };
+    Ok(format!(
+        "{key}: the coordinator is started again ({how}).{cleared}"
+    ))
 }
 
 /// Withdraws the coordinator's open question, when new input answered or

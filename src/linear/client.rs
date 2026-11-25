@@ -104,14 +104,14 @@ impl Client {
         // When LINEAR_API_KEY is set and non-empty, use it directly instead of
         // requiring an interactive OAuth browser flow. This is the expected path
         // inside Kubernetes pods where the key is mounted as a Secret.
-        if let Ok(key) = std::env::var("LINEAR_API_KEY") {
-            if !key.is_empty() {
-                eprintln!(
-                    "herdr-linear-agent: using LINEAR_API_KEY environment variable \
-                     for workspace `{name}` (OAuth keyring bypassed)"
-                );
-                return Self::with_api_key(key).await;
-            }
+        if let Ok(key) = std::env::var("LINEAR_API_KEY")
+            && !key.is_empty()
+        {
+            eprintln!(
+                "herdr-linear-agent: using LINEAR_API_KEY environment variable \
+                 for workspace `{name}` (OAuth keyring bypassed)"
+            );
+            return Self::with_api_key(key).await;
         }
         let account = name.to_owned();
         let client_id = workspace.client_id.clone();
