@@ -205,7 +205,12 @@ impl Reconciler {
                 if due_at.parse::<Timestamp>().is_ok_and(|at| at > now) {
                     return Ok(false);
                 }
-                let lost_since = next.last_state_change.parse().unwrap_or(now);
+                // When it was lost, as near as the record tells: its last state
+                // change, else its last start, else now.
+                let lost_since = [&next.last_state_change, &next.started_at]
+                    .iter()
+                    .find_map(|at| at.parse::<Timestamp>().ok())
+                    .unwrap_or(now);
                 self.recovery_queue.push((lost_since, run.key.clone()));
                 return Ok(false);
             }

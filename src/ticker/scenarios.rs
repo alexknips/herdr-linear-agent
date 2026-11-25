@@ -2964,8 +2964,14 @@ async fn a_coordinator_lost_again_and_again_is_given_up_on_and_run_resume_brings
     );
     assert!(crate::actions::status_text(&world.ctx()).contains("coordinator gone"));
 
-    assert!(commands::run_resume(&world.ctx(), "acme/DATA-9").is_err());
-    let said = commands::run_resume(&world.ctx(), KEY).unwrap();
+    assert!(
+        commands::run_resume(&world.ctx(), Some(&world.session()), "acme/DATA-9")
+            .await
+            .is_err()
+    );
+    let said = commands::run_resume(&world.ctx(), Some(&world.session()), KEY)
+        .await
+        .unwrap();
     assert!(said.contains("resuming its session"), "{said}");
     world.settle().await;
     let record = world.record(KEY);
@@ -3007,7 +3013,9 @@ async fn a_coordinator_that_ran_for_hours_is_still_given_up_on_when_it_keeps_los
     assert!(no_resume_request(&world));
 
     // A coordinator that then runs for a while starts the count anew.
-    commands::run_resume(&world.ctx(), KEY).unwrap();
+    commands::run_resume(&world.ctx(), Some(&world.session()), KEY)
+        .await
+        .unwrap();
     world.settle().await;
     assert_eq!(world.record(KEY).coordinator_recoveries, 0);
     world.later(600);
@@ -3066,6 +3074,72 @@ async fn a_lost_flag_an_older_version_left_with_no_question_is_recovered() {
     assert_eq!(world.herdr.starts().len(), 2);
     assert!(ends_with(&last_args(&world), &RESUMED_WITH));
     assert!(world.bodies(KEY, "elicitation").is_empty());
+}
+
+#[tokio::test]
+async fn run_resume_leaves_a_healthy_coordinator_alone() {
+    let mut world = World::sample();
+    let pane = world.running_issue().await;
+    let before = world.record(KEY);
+    let prompts = to(&world, &pane);
+    let session = world.session();
+
+    let said = commands::run_resume(&world.ctx(), Some(&session), KEY)
+        .await
+        .unwrap();
+    assert_eq!(
+        said,
+        "acme/DATA-1: the coordinator is running; nothing to resume"
+    );
+    // Without Herdr the record alone is read, and it is healthy too.
+    let said = commands::run_resume(
+        &world.ctx(),
+        None::<&crate::commands::Session<crate::herdr::FakeHerdr>>,
+        KEY,
+    )
+    .await
+    .unwrap();
+    assert!(said.contains("nothing to resume"), "{said}");
+    world.settle().await;
+    let after = world.record(KEY);
+    assert_eq!(after.coordinator, before.coordinator);
+    assert_eq!(world.herdr.starts().len(), 1, "no second start");
+    assert_eq!(to(&world, &pane), prompts, "no restart prompt");
+
+    // A person's stop is refused; a finished run is left alone.
+    world.run(KEY).update(|r| r.stopped = true).unwrap();
+    let refused = commands::run_resume(&world.ctx(), Some(&session), KEY)
+        .await
+        .unwrap_err();
+    assert!(refused.to_string().contains("stopped"), "{refused}");
+    world
+        .run(KEY)
+        .update(|r| {
+            r.stopped = false;
+            r.finished = true;
+        })
+        .unwrap();
+    lose_coordinator(&world, KEY);
+    let said = commands::run_resume(&world.ctx(), Some(&session), KEY)
+        .await
+        .unwrap();
+    assert!(said.contains("finished"), "{said}");
+    world.settle().await;
+    assert_eq!(world.herdr.starts().len(), 1);
+}
+
+#[tokio::test]
+async fn run_resume_recovers_a_coordinator_whose_pane_is_gone() {
+    let mut world = World::sample();
+    world.running_issue().await;
+    lose_coordinator(&world, KEY);
+    let said = commands::run_resume(&world.ctx(), Some(&world.session()), KEY)
+        .await
+        .unwrap();
+    assert!(said.contains("started again"), "{said}");
+    world.settle().await;
+    assert_eq!(world.herdr.starts().len(), 2);
+    assert!(ends_with(&last_args(&world), &RESUMED_WITH));
 }
 
 #[tokio::test]

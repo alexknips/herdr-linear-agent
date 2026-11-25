@@ -231,21 +231,69 @@ pub async fn ask(ctx: &Ctx<'_>, key: &str, text: &str, options: &[(String, Strin
     Ok(())
 }
 
-/// `run resume`: starts a coordinator that was given up on (or whose pane is
-/// gone) again, as a reply in the Linear session does: its previous session
+/// `run resume`: starts a coordinator that was given up on, or whose pane is
+/// gone, again, as a reply in the Linear session does: its previous session
 /// when it has one, otherwise a new coordinator. Prints what it did.
-pub fn run_resume(ctx: &Ctx, key: &str) -> Result<String> {
+///
+/// It acts only when there is something to recover: `coordinator_lost`, a
+/// stale or waiting recovery, a coordinator that failed or stopped, or, when
+/// Herdr answers, a coordinator whose pane is gone. On a running coordinator,
+/// a coordinator being started or a finished run it leaves the run alone and
+/// succeeds, so a janitor can call it on every run. A stopped run is refused:
+/// a stop is a person's decision, and a reply un-stops it.
+pub async fn run_resume<H: Herdr>(
+    ctx: &Ctx<'_>,
+    session: Option<&Session<H>>,
+    key: &str,
+) -> Result<String> {
     let run = Run::load(&ctx.runs_dir(), key)?;
-    let lock = run.lock()?;
     let record = run.record()?;
     if record.status != Status::Active {
         bail!("run {key} is closed; nothing more is done for it");
     }
-    let how = record.coordinator.resume_session();
-    let cleared = record
+    if record.stopped {
+        bail!(
+            "run {key} is stopped, which a person decided; a reply in the Linear session continues it"
+        );
+    }
+    let c = &record.coordinator;
+    let snapshot = match session {
+        Some(session) => session.herdr.snapshot().await.ok(),
+        None => None,
+    };
+    let gone = snapshot.as_ref().zip(session).is_some_and(|(snapshot, s)| {
+        let live = worker::live_state(
+            c,
+            snapshot,
+            jiff::Timestamp::now(),
+            &ctx.state_dir(),
+            &s.socket,
+        );
+        c.status == AgentStatus::Open && !live.pane_exists && live.agent.is_none()
+    });
+    let waiting = matches!(
+        c.recovery,
+        crate::run::Recovery::Stale { .. } | crate::run::Recovery::RetryWait { .. }
+    );
+    let old_question = record
         .awaiting_reply
         .as_ref()
         .is_some_and(|w| w.reason == WaitReason::CoordinatorLost);
+    let broken = record.coordinator_lost
+        || old_question
+        || matches!(c.status, AgentStatus::Failed | AgentStatus::Stopped);
+    if record.finished && !record.coordinator_lost {
+        return Ok(format!(
+            "{key}: the run is finished; nothing to resume (a reply or an inbox item reopens it)"
+        ));
+    }
+    if !(broken || waiting || gone) {
+        return Ok(format!(
+            "{key}: the coordinator is running; nothing to resume"
+        ));
+    }
+    let lock = run.lock()?;
+    let how = c.resume_session();
     run.update_held(&lock, |r| {
         r.coordinator_lost = false;
         r.coordinator_recoveries = 0;
@@ -260,7 +308,7 @@ pub fn run_resume(ctx: &Ctx, key: &str) -> Result<String> {
     })?;
     drop(lock);
     ticker::poke(&ctx.state_dir());
-    let cleared = if cleared {
+    let cleared = if old_question {
         " The old question to reply `resume` is cleared."
     } else {
         ""
