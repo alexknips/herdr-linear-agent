@@ -130,9 +130,10 @@ impl Reconciler {
         (next, live)
     }
 
-    /// A run an older version left asking for a `resume` reply (the
-    /// coordinator's pane gone, `coordinator_lost`): the question is cleared
-    /// and the lost coordinator takes the bounded recovery like any other.
+    /// A run an older version left lost (`coordinator_lost`, its pane gone, no
+    /// recovery given up) takes the bounded recovery like any other: the flag
+    /// is cleared, and the older `resume` question with it. A question of a
+    /// person (the coordinator's own, the time limit's) stays open.
     async fn clear_old_lost_wait<H: Herdr>(
         &mut self,
         d: &Deps<'_, H>,
@@ -146,14 +147,24 @@ impl Reconciler {
             .awaiting_reply
             .as_ref()
             .is_some_and(|w| w.reason == WaitReason::CoordinatorLost);
-        if !asked
-            || c.status != AgentStatus::Open
+        if c.status != AgentStatus::Open
             || record.status != crate::run::Status::Active
             || record.stopped
             || record.finished
+            || !(asked || record.coordinator_lost)
             || !self.judged(d, snapshot, c, now)
-            || self.live(d, snapshot, c, now).agent.is_some()
         {
+            return Ok(());
+        }
+        let live = self.live(d, snapshot, c, now);
+        // A given-up recovery of this version stays given up; the older
+        // question can be left with an empty pane that still exists.
+        let legacy = if asked {
+            live.agent.is_none()
+        } else {
+            !live.pane_exists && !matches!(c.recovery, Recovery::Stale { .. })
+        };
+        if !legacy {
             return Ok(());
         }
         self.update_and_push(run, |r| {
@@ -162,15 +173,15 @@ impl Reconciler {
                 .take_if(|w| w.reason == WaitReason::CoordinatorLost)
             {
                 r.cleared_wait_id = wait.activity_id;
-                r.coordinator_lost = false;
-                r.coordinator_recoveries = 0;
                 r.coordinator.recovery = Recovery::None;
             }
+            r.coordinator_lost = false;
+            r.coordinator_recoveries = 0;
             Vec::new()
         })
         .await?;
         d.log.line(&format!(
-            "{}: cleared the resume question of an older version; the coordinator is recovered",
+            "{}: lost by an older version; the coordinator is recovered",
             run.key
         ));
         Ok(())
@@ -379,10 +390,14 @@ impl Reconciler {
                     .await?;
             } else if live.agent.is_some()
                 && record.coordinator_recoveries > 0
-                && now.duration_since(next.prompted_at.parse::<Timestamp>().unwrap_or(now))
-                    >= RECOVERY_STABLE
+                && next
+                    .started_at
+                    .parse::<Timestamp>()
+                    .is_ok_and(|at| now.duration_since(at) >= RECOVERY_STABLE)
             {
-                // It has run for a while: a later loss starts the count anew.
+                // It has run for a while since its last start (`started_at`
+                // is set by every start, `prompted_at` is not): a later loss
+                // starts the count anew.
                 update_run(run, |r| r.coordinator_recoveries = 0).await?;
             }
             let mut notices = Vec::new();

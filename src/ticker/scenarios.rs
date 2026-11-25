@@ -2979,6 +2979,96 @@ async fn a_coordinator_lost_again_and_again_is_given_up_on_and_run_resume_brings
 }
 
 #[tokio::test]
+async fn a_coordinator_that_ran_for_hours_is_still_given_up_on_when_it_keeps_losing_its_pane() {
+    let mut world = World::sample();
+    world.running_issue().await;
+    world.later(3600);
+    world.settle().await;
+    for (attempt, wait) in [(1, 20), (2, 40), (3, 70)] {
+        lose_coordinator(&world, KEY);
+        world.settle().await;
+        world.later(wait);
+        world.settle().await;
+        assert_eq!(world.herdr.starts().len(), 1 + attempt, "attempt {attempt}");
+    }
+    assert_eq!(world.record(KEY).coordinator_recoveries, 3);
+    lose_coordinator(&world, KEY);
+    world.settle().await;
+    world.later(300);
+    world.settle().await;
+    let record = world.record(KEY);
+    assert_eq!(world.herdr.starts().len(), 4, "no fourth start");
+    assert!(record.coordinator_lost);
+    assert!(matches!(
+        record.coordinator.recovery,
+        Recovery::Stale { reported: true, .. }
+    ));
+    assert!(world.bodies(KEY, "elicitation").is_empty());
+    assert!(no_resume_request(&world));
+
+    // A coordinator that then runs for a while starts the count anew.
+    commands::run_resume(&world.ctx(), KEY).unwrap();
+    world.settle().await;
+    assert_eq!(world.record(KEY).coordinator_recoveries, 0);
+    world.later(600);
+    world.settle().await;
+    lose_coordinator(&world, KEY);
+    world.settle().await;
+    world.later(20);
+    world.settle().await;
+    assert_eq!(world.record(KEY).coordinator_recoveries, 1);
+    assert!(!world.record(KEY).coordinator_lost);
+}
+
+#[tokio::test]
+async fn a_lost_flag_an_older_version_left_with_a_coordinator_question_open_is_recovered() {
+    let mut world = World::sample();
+    world.running_issue().await;
+    commands::ask(&world.ctx(), KEY, "Should I proceed?", &[])
+        .await
+        .unwrap();
+    world.settle().await;
+    lose_coordinator(&world, KEY);
+    world
+        .run(KEY)
+        .update(|r| r.coordinator_lost = true)
+        .unwrap();
+    world.settle().await;
+    world.later(20);
+    world.settle().await;
+    let record = world.record(KEY);
+    assert!(!record.coordinator_lost);
+    assert_eq!(world.herdr.starts().len(), 2);
+    assert!(ends_with(&last_args(&world), &RESUMED_WITH));
+    assert_eq!(
+        record.awaiting_reply.unwrap().reason,
+        WaitReason::CoordinatorQuestion,
+        "the person's question stays open"
+    );
+    assert_eq!(world.bodies(KEY, "elicitation"), ["Should I proceed?"]);
+}
+
+#[tokio::test]
+async fn a_lost_flag_an_older_version_left_with_no_question_is_recovered() {
+    let mut world = World::sample();
+    world.running_issue().await;
+    lose_coordinator(&world, KEY);
+    world
+        .run(KEY)
+        .update(|r| r.coordinator_lost = true)
+        .unwrap();
+    world.settle().await;
+    world.later(20);
+    world.settle().await;
+    let record = world.record(KEY);
+    assert!(!record.coordinator_lost);
+    assert!(record.awaiting_reply.is_none());
+    assert_eq!(world.herdr.starts().len(), 2);
+    assert!(ends_with(&last_args(&world), &RESUMED_WITH));
+    assert!(world.bodies(KEY, "elicitation").is_empty());
+}
+
+#[tokio::test]
 async fn a_run_an_older_version_left_asking_to_resume_is_recovered_and_its_question_cleared() {
     let mut world = World::sample();
     world.running_issue().await;
